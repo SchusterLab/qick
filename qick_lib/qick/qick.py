@@ -1177,7 +1177,7 @@ class QickSoc(Overlay):
         buff = allocate(shape=length, dtype=np.int64)
         di,dq = self.avg_bufs[ch].transfer_avg(buff,address=address,length=length)
 
-        return di, dq #[np_buffi,np_buffq]
+        return np.array(di), np.array(dq) #[np_buffi,np_buffq]
 
     def start(self):
         """Start the tprocessor"""
