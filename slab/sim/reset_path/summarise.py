@@ -4,6 +4,10 @@ f = 5797.975e6
 for p in sorted(glob.glob('sim_*.txt')):
     rows=[tuple(map(int,re.findall(r'-?\d+',l))) for l in open(p) if l.startswith('RES')]
     a=np.array(rows); slot,g,r=a[:,1],a[:,2],a[:,3]
+    if 'sync1' in p:
+        # with the sync block the release time varies; what matters is where the zero lands in the common period
+        print(p, 'gen zero: %d distinct positions in the common period; ro zero: %d; ro-gen: %d distinct, %s ns'%(len(set(a[:,6])),len(set(a[:,7])),len(set(r-g)),sorted({round(x*tick,3) for x in r-g})))
+        continue
     # repeatability per slot
     rep = all(len(set(g[slot==s]))==1 and len(set(r[slot==s]))==1 for s in set(slot))
     gs=sorted(set(g)); rs=sorted(set(r)); d=(r-g)

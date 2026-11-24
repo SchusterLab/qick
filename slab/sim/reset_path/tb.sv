@@ -18,10 +18,22 @@ module tb;
   reg          wv=0;
   reg  [167:0] wd=0;
 
+  // Optional axis_phrst_sync_v1 in front of each path (USE_SYNC=1).
+  parameter integer USE_SYNC = 0;
+  wire gv, rv; wire [167:0] gd, rd;
+  generate if (USE_SYNC) begin : G_sync
+    axis_phrst_sync_v1 #(.B(168), .PERIOD(28), .PHRST_BIT(156)) g_sync (.aclk(tclk), .aresetn(trstn),
+      .s_axis_tvalid(wv), .s_axis_tdata(wd), .m_axis_tready(1'b1), .m_axis_tvalid(gv), .m_axis_tdata(gd));
+    axis_phrst_sync_v1 #(.B(168), .PERIOD(28), .PHRST_BIT(156)) r_sync (.aclk(tclk), .aresetn(trstn),
+      .s_axis_tvalid(wv), .s_axis_tdata(wd | (168'd1 << 160)), .m_axis_tready(1'b1), .m_axis_tvalid(rv), .m_axis_tdata(rd));
+  end else begin : G_nosync
+    assign gv = wv; assign gd = wd; assign rv = wv; assign rd = wd | (168'd1 << 160);
+  end endgenerate
+
   // ---------------- generator path ----------------
   wire [167:0] g_cdc_d; wire g_cdc_v;
   cdcsync #(.N(1), .B(168)) g_cdc (
-    .s_axis_aresetn(trstn), .s_axis_aclk(tclk), .s0_axis_tvalid(wv), .s0_axis_tdata(wd),
+    .s_axis_aresetn(trstn), .s_axis_aclk(tclk), .s0_axis_tvalid(gv), .s0_axis_tdata(gd),
     .m_axis_aresetn(grstn), .m_axis_aclk(gclk), .m0_axis_tready(1'b1), .m0_axis_tvalid(g_cdc_v), .m0_axis_tdata(g_cdc_d));
   wire [159:0] g_tr_d; wire g_tr_v;
   sg_translator #(.OUT_TYPE(0)) g_tr (.aresetn(grstn), .aclk(gclk), .s_axis_tdata(g_cdc_d), .s_axis_tvalid(g_cdc_v),
@@ -35,7 +47,7 @@ module tb;
 
   // ---------------- readout path ----------------
   wire [167:0] r_mx_d; wire r_mx_v;
-  tmux #(.N(8), .B(168)) r_mux (.aresetn(trstn), .aclk(tclk), .s_axis_tvalid(wv), .s_axis_tdata(wd | (168'd1 << 160)),
+  tmux #(.N(8), .B(168)) r_mux (.aresetn(trstn), .aclk(tclk), .s_axis_tvalid(rv), .s_axis_tdata(rd),
     .m1_axis_tvalid(r_mx_v), .m1_axis_tdata(r_mx_d));
   wire [167:0] r_cdc_d; wire r_cdc_v;
   cdcsync #(.N(2), .B(168)) r_cdc (
@@ -63,7 +75,7 @@ module tb;
       wv = 1; tw = $time - 1;
       @(posedge tclk); #1; wv = 0;
       repeat (SPACING-2) @(posedge tclk);
-      $display("RES %0d slot %0d  gen %0d  ro %0d  n %0d %0d", i, ((tw/1560) % 28), tg-tw, tr-tw, gn, rn);
+      $display("RES %0d slot %0d  gen %0d  ro %0d  n %0d %0d  genmod %0d  romod %0d", i, ((tw/1560) % 28), tg-tw, tr-tw, gn, rn, tg % 43680, tr % 43680);
     end
     $finish;
   end

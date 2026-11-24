@@ -189,6 +189,28 @@ Ranked by cost:
    registers, so software can confirm the alignment without an RF
    measurement.
 
+## The alignment block (added 2026-11-24, simulated, not built)
+
+`firmware/ip/axis_phrst_sync_v1` keeps every clock rate as it is. It sits on
+the tProc clock between a tProc port and the crossing, passes ordinary words
+through, and holds any word with the phase-reset bit until a free-running
+28-cycle counter reads zero (at most 65 ns). Every reset then crosses on the
+same point of the clock pattern.
+
+Simulation, with the block in front of both paths: the generator and readout
+counters are each zeroed at one position in the common period, and readout
+minus generator takes one value, for resets issued on all 28 slots and four
+static clock phases. Without the block: 28 values. The block's own testbench
+checks that reset words leave only on slot zero, that other words pass with
+zero or one cycle of latency, and that order is preserved.
+
+Costs: a pulse that carries a reset starts up to 65 ns late, and any word
+sent to the same port while one is held waits behind it. The value 28 is a
+build parameter, so it is wrong if sample rates are changed in software.
+Gating the tProc's own time zero instead was considered and dropped: the
+tProc time can also be shifted at run time, and the change would be inside
+the processor core.
+
 ## Answers to the five questions
 
 **1. Is the reading right?** Yes for the source. The clocks are confirmed as

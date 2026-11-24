@@ -6,8 +6,9 @@ Every difference between this fork's `main` and `openquantumhardware/qick`
 | Change | Files | Upstream status |
 |---|---|---|
 | Fork documentation and sync script | `slab/`, `CLAUDE.md` | Lab only |
+| Phase-reset alignment block `axis_phrst_sync_v1` (HDL and testbench only; not yet packaged as an IP or used in any project) | `firmware/ip/axis_phrst_sync_v1/` | Not proposed upstream yet |
 
-No library, firmware or demo code differs from upstream yet.
+No existing upstream file is modified.
 
 ## Dropped
 
