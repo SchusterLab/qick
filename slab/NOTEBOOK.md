@@ -3,6 +3,30 @@
 Running log for the lab fork. Newest entry first. Record dead ends as well as
 results, and say where each number came from.
 
+## 2026-11-24: first firmware builds in Vivado 2024.1
+
+Both builds: default implementation strategy, about 3 hours each, bitstream
+written, setup timing missed slightly, hold timing met.
+
+| Design | Worst setup slack | Failing endpoints | Block RAM |
+|---|---|---|---|
+| Stock `qick_tprocv2_216_standard` (plus the PFB type rename) | -0.100 ns (599.04 MHz generator clock) | 568 | 81% |
+| `slab_tprocv2_216` | -0.075 ns (generator and 430.08 MHz tProc clocks) | 903 | 88% |
+
+- The failing paths in the lab build are in the full-speed generators
+  (`axis_signal_gen_v6`), the `axis_cdcsync` crossings and the tProc. None are
+  in the weighted buffers or the new weight-loading path.
+- Whether upstream's 2023.1 build of the stock design meets timing is not
+  known: the shipped bitstream comes with no timing report.
+- The library's `trace_dma` finds `axi_dma_wgt` / `axis_switch_wgt` port n for
+  each of the ten buffers in the lab build's `.hwh`, and reads
+  `TIME_SYNC_PERIOD` = 28 and `N_WGT` = 13. Checked off-board with a stand-in
+  for `pynq`; not loaded on a board.
+- A first attempt hung for two hours: a run left in the "running" state by a
+  failed build makes `launch_runs` start nothing. `reset_run` on every run
+  that is not complete before launching.
+- Next: other implementation strategies to close timing.
+
 ## 2026-11-24: readout phase against frequency (referral from the measurement project)
 
 - Read `ctrl_sg_v6.sv`, `ctrl_dyn_ro_v1.sv`, `axis_cdcsync_v1` and the stock
