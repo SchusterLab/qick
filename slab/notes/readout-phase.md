@@ -153,6 +153,42 @@ Not modelled: the tProc's own output stage (assumed equal for the two ports),
 the register slice before the generator (modelled as one register), the
 oscillators and converters, and clock jitter.
 
+## A design that stays in sync (added 2026-11-24, proposal)
+
+The scrambling comes from two things: sample counters with independent
+origins, and clocks whose relative phase repeats only every 28 tProc cycles.
+Ranked by cost:
+
+1. **Integer-related clocks.** Run the tProc and the readout at 299.52 MHz
+   (half the generator's 599.04 MHz; ADC at 2396.16 MS/s instead of 2457.6).
+   Simulated with the same testbench and unchanged HDL (`TH`, `RH`
+   parameters): every reset lands on a single offset, for three choices of
+   static clock phase. Per-shot resets then give the same phase every shot
+   and every run. Costs: tProc time resolution 3.3 ns instead of 2.3 ns, a
+   different ADC rate, a new bitstream. Not checked: that the converter PLLs
+   accept these rates on the ZCU216, and timing closure.
+
+   | tProc | Readout | Distinct values of readout minus generator |
+   |---|---|---|
+   | 430.08 MHz | 307.2 MHz (stock) | 28 |
+   | 430.08 MHz | 299.52 MHz | 3, one generator clock apart |
+   | 599.04 MHz | 299.52 MHz | 2 |
+   | 299.52 MHz | 299.52 MHz | 1 |
+
+2. **One reset release for all counters.** Bring every generator and readout
+   out of reset from one synchronised event, so the slope is the true
+   electrical delay straight after a bitstream load. This is the one-off
+   alignment done by the firmware. With option 1 it is exact; without it, it
+   has the same 28-value spread as a software alignment.
+3. **Multi-tile synchronisation with SYSREF.** Options 1 and 2 leave the
+   static phase between converter tiles, which changes when a tile restarts
+   or the board power-cycles. Aligning the tiles to SYSREF and zeroing the
+   counters on a SYSREF-derived edge would make the phase reproducible
+   across power cycles. More work: firmware and library.
+4. **A readable check.** Latch every sample counter on a common strobe into
+   registers, so software can confirm the alignment without an RF
+   measurement.
+
 ## Answers to the five questions
 
 **1. Is the reading right?** Yes for the source. The clocks are confirmed as

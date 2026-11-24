@@ -5,11 +5,13 @@ module tb;
   parameter integer GOFF = 7;    // static phase of generator clock, ticks
   parameter integer ROFF = 13;   // static phase of readout clock, ticks
   parameter integer NWR  = 84;
+  parameter integer TH = 780;    // t_clk half period, ticks (780 = 430.08 MHz, 1120 = 299.52 MHz)
+  parameter integer RH = 1092;   // readout clock half period, ticks (1092 = 307.2 MHz, 1120 = 299.52 MHz)
   parameter integer SPACING = 225; // t_clk cycles between writes; 225 = 1 mod 28
   reg tclk=0, gclk=0, rclk=0;
-  initial forever #780 tclk = ~tclk;
+  initial forever #(TH) tclk = ~tclk;
   initial begin #(GOFF); forever #560 gclk = ~gclk; end
-  initial begin #(ROFF); forever #1092 rclk = ~rclk; end
+  initial begin #(ROFF); forever #(RH) rclk = ~rclk; end
   reg trstn=0, grstn=0, rrstn=0;
   initial begin #(1560*40) trstn=1; grstn=1; rrstn=1; end
 
