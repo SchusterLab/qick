@@ -3,6 +3,15 @@
 Running log for the lab fork. Newest entry first. Record dead ends as well as
 results, and say where each number came from.
 
+## 2026-11-24: readout phase against frequency (referral from the measurement project)
+
+- Read `ctrl_sg_v6.sv`, `ctrl_dyn_ro_v1.sv`, `axis_cdcsync_v1` and the stock
+  ZCU216 tProc v2 block design, and analysed stored labdev runs 306 and 314.
+- Findings, evidence and proposed tests are in
+  [notes/readout-phase.md](notes/readout-phase.md).
+- Not done: counting the pipeline stages to predict the residual delay; any
+  measurement on hardware.
+
 ## 2026-11-24: fork brought up to date
 
 - The fork (`SchusterLab/qick`) was last pushed in August 2024 and its `main`
