@@ -20,6 +20,7 @@ module qick_processor # (
    parameter DIVIDER        =  1 ,
    parameter ARITH          =  1 ,
    parameter TIME_READ      =  1 ,
+   parameter TIME_SYNC_PERIOD = 0 ,
    parameter FIFO_DEPTH     =  8 ,
    parameter PMEM_AW        =  8 ,
    parameter DMEM_AW        =  8 ,
@@ -177,7 +178,8 @@ wire [31:0]    core_ds ;
 wire [2:0] time_st_ds, core_st_ds;
 wire [6:0] ctrl_t_ds, ctrl_c_ds;
 qproc_ctrl # (
-   .TIME_READ ( TIME_READ )
+   .TIME_READ ( TIME_READ ) ,
+   .TIME_SYNC_PERIOD ( TIME_SYNC_PERIOD )
 ) QPROC_CTRL (
    .t_clk_i         ( t_clk_i            ),
    .t_rst_ni        ( t_rst_ni           ),

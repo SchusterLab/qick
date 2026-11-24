@@ -58,4 +58,22 @@ The library imports without `pynq`, so programs can be built and compiled on
 any machine from a saved board configuration (`QickConfig("config.json")`).
 Anything that touches the FPGA needs a board.
 
+## Building firmware
+
+The lab machine has Vivado 2024.1 (the newest its licence allows); upstream's
+projects are written for 2023.1. The lab project
+`firmware/projects/slab_tprocv2_216` is set up for 2024.1:
+
+    cd firmware/projects/slab_tprocv2_216
+    python3 make_bd.py                      # only after the stock design changes upstream
+    vivado -mode batch -source proj.tcl     # creates the project in ./top
+
+then launch synthesis and implementation (`launch_runs impl_1 -to_step
+write_bitstream`). On the lab machine Vivado runs in a container that cannot
+see `/home/projects`, so copy `firmware/` (without the other projects) to a
+directory under `/tmp` or `/home/slab` and run
+`/opt/xilinx/vivado-shell vivado ...` there.
+
+The licence covers the ZCU216 part only, not the ZCU111 or RFSoC4x2.
+
 [NOTEBOOK.md](NOTEBOOK.md) is the running log of what was tried and found.

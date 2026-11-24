@@ -60,6 +60,7 @@ proc init_gui { IPINST } {
   set DIVIDER [ipgui::add_param $IPINST -name "DIVIDER" -parent ${Options} -widget checkBox]
   set_property tooltip {32-bit Integer Divider (Quotient - Reminder)} ${DIVIDER}
   ipgui::add_param $IPINST -name "TIME_READ" -parent ${Options} -widget checkBox
+  ipgui::add_param $IPINST -name "TIME_SYNC_PERIOD" -parent ${Options}
 
   #Adding Group
   set External_Peripherals [ipgui::add_group $IPINST -name "External Peripherals" -parent ${Process} -display_name {External Peripherals Interfaces}]
@@ -441,3 +442,17 @@ proc update_MODELPARAM_VALUE.GEN_SYNC { MODELPARAM_VALUE.GEN_SYNC PARAM_VALUE.GE
 	set_property value [get_property value ${PARAM_VALUE.GEN_SYNC}] ${MODELPARAM_VALUE.GEN_SYNC}
 }
 
+
+proc update_PARAM_VALUE.TIME_SYNC_PERIOD { PARAM_VALUE.TIME_SYNC_PERIOD } {
+	# Procedure called to update TIME_SYNC_PERIOD when any of the dependent parameters in the arguments change
+}
+
+proc validate_PARAM_VALUE.TIME_SYNC_PERIOD { PARAM_VALUE.TIME_SYNC_PERIOD } {
+	# Procedure called to validate TIME_SYNC_PERIOD
+	return true
+}
+
+proc update_MODELPARAM_VALUE.TIME_SYNC_PERIOD { MODELPARAM_VALUE.TIME_SYNC_PERIOD PARAM_VALUE.TIME_SYNC_PERIOD } {
+	# Procedure called to set VHDL generic/Verilog parameter value(s) based on TCL parameter value
+	set_property value [get_property value ${PARAM_VALUE.TIME_SYNC_PERIOD}] ${MODELPARAM_VALUE.TIME_SYNC_PERIOD}
+}

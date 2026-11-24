@@ -6,7 +6,9 @@ Every difference between this fork's `main` and `openquantumhardware/qick`
 | Change | Files | Upstream status |
 |---|---|---|
 | Fork documentation and sync script | `slab/`, `CLAUDE.md` | Lab only |
-| tProc time reset aligned to the common period of the clocks: new parameter `TIME_SYNC_PERIOD` on `qproc_ctrl`, default 0 = unchanged behaviour. Not yet passed up through `qick_processor` or the IP packaging, so no build uses it. | `firmware/ip/qick_processor/src/qproc_ctrl.sv` | Not proposed upstream yet |
+| tProc time reset aligned to the common period of the clocks: parameter `TIME_SYNC_PERIOD` on `qproc_ctrl`, `qick_processor`, `axis_qick_processor` and the IP packaging. Default 0 = unchanged behaviour. | `firmware/ip/qick_processor/` | Not proposed upstream yet |
+| PFB readout v4 builds under Vivado 2024.1: type `BOOLEAN_VECTOR` in the generated FFT code renamed `SSR_BOOLEAN_VECTOR` (it clashes with a VHDL-2008 built-in). No functional change. | `firmware/ip/axis_pfb_readout_v4/src/pfb/fft/ssr_fft_8x64/ssr_8x64_entity_declarations.vhd` | Not proposed upstream yet |
+| Lab ZCU216 firmware project: stock tProc v2 design with weighted readout buffers, a weight-loading DMA and switch, and `TIME_SYNC_PERIOD` = 28. Block design is generated from the stock one by `make_bd.py`. | `firmware/projects/slab_tprocv2_216/` | Lab only |
 
 With `TIME_SYNC_PERIOD` at its default the firmware behaves as upstream's.
 

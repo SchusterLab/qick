@@ -179,7 +179,7 @@ use ieee.math_real.all;
 use ieee.math_complex.all;
 
 package COMPLEX_FIXED_PKG is
-  type BOOLEAN_VECTOR is array(NATURAL range <>) of BOOLEAN;
+  type SSR_BOOLEAN_VECTOR is array(NATURAL range <>) of BOOLEAN;
   type INTEGER_VECTOR is array(NATURAL range <>) of INTEGER;
   type REAL_VECTOR is array(NATURAL range <>) of REAL;
 --2008  type UNSIGNED_VECTOR is array(NATURAL range <>) of UNSIGNED;
@@ -1590,11 +1590,11 @@ architecture TEST of CB is
   signal CNTP:UNSIGNED(LOG2(PACKING_FACTOR) downto 0):=(others=>'0');
   signal CNT:UNSIGNED(LOG2(SSR)-1 downto 0):=(others=>'0');
 --2008  signal A:UNSIGNED_VECTOR(0 to I'length):=(others=>(others=>'0'));
---2008  signal EN:BOOLEAN_VECTOR(0 to I'length):=(others=>FALSE);
+--2008  signal EN:SSR_BOOLEAN_VECTOR(0 to I'length):=(others=>FALSE);
 --2008  signal DI:CFIXED_VECTOR(0 to I'length-1)(RE(I(I'low).RE'range),IM(I(I'low).IM'range));
 --2008  signal DO:CFIXED_VECTOR(0 to I'length-1)(RE(I(I'low).RE'range),IM(I(I'low).IM'range)):=(0 to I'length-1=>(RE=>(I(I'low).RE'range=>'0'),IM=>(I(I'low).IM'range=>'0')));
   signal A:UNSIGNED_VECTOR(0 to SSR):=(others=>(others=>'0'));
-  signal EN:BOOLEAN_VECTOR(0 to SSR):=(others=>FALSE);
+  signal EN:SSR_BOOLEAN_VECTOR(0 to SSR):=(others=>FALSE);
   signal II,DI,OO:iCFIXED_VECTOR(0 to SSR-1);
   signal DO:iCFIXED_VECTOR(0 to SSR-1):=(others=>(others=>'0'));
 begin
@@ -1683,7 +1683,7 @@ begin
 --2008       signal S:UNSIGNED_VECTOR(0 to H)(SO'range);
        type TUV is array(0 to H) of UNSIGNED(SO'range);
        signal S:TUV;
-       signal V:BOOLEAN_VECTOR(0 to H-1);
+       signal V:SSR_BOOLEAN_VECTOR(0 to H-1);
      begin
        S(S'low)<=(others=>'0');
        lk:for K in 0 to H-1 generate
@@ -4284,7 +4284,7 @@ begin
 --2008            constant BIT_GROWTH:INTEGER:=MAX(O(O'low).RE'high,O(O'low).IM'high)-MAX(I(I'low).RE'high,I(I'low).IM'high);
             constant BIT_GROWTH:INTEGER:=(O'high+1)/8/2-(I'high+1)/8/2;
             constant X:INTEGER:=work.COMPLEX_FIXED_PKG.MIN(BIT_GROWTH,1); -- ModelSim workaround
-            signal iV:BOOLEAN_VECTOR(0 to 3);
+            signal iV:SSR_BOOLEAN_VECTOR(0 to 3);
 --2008            signal S:UNSIGNED_VECTOR(0 to 3)(SI'range);
             type TUV is array(NATURAL range <>) of UNSIGNED(SI'range);
             signal S:TUV(0 to 3);
@@ -4292,7 +4292,7 @@ begin
             signal P:CFIXED_VECTOR(I'high+8*2*X downto I'low);
             signal VP:BOOLEAN;
             signal SP:UNSIGNED(SI'range);
-            signal oV:BOOLEAN_VECTOR(0 to 1);
+            signal oV:SSR_BOOLEAN_VECTOR(0 to 1);
 --2008            signal oS:UNSIGNED_VECTOR(0 to 1)(SO'range);
             signal oS:TUV(0 to 1);
           begin  
@@ -4633,7 +4633,7 @@ begin
 --2008       signal S:UNSIGNED_VECTOR(0 to H)(SO'range);
        type TUV is array(0 to H) of UNSIGNED(SO'range);
        signal S:TUV;
-       signal V:BOOLEAN_VECTOR(0 to H-1);
+       signal V:SSR_BOOLEAN_VECTOR(0 to H-1);
      begin
        S(S'low)<=(others=>'0');
        lk:for K in 0 to H-1 generate
@@ -4789,7 +4789,7 @@ begin
   i0:if USE_CB or (L2N<=2*L2R) generate
        constant SIZE:INTEGER:=L2N/L2R;    -- floor(LOG2(N)/LOG2(RADIX))
      
-       signal V:BOOLEAN_VECTOR(0 to SIZE-1);
+       signal V:SSR_BOOLEAN_VECTOR(0 to SIZE-1);
 --2008       signal S:UNSIGNED_VECTOR(0 to SIZE-1)(SI'range);
 --2008       signal D:CFIXED_MATRIX(0 to SIZE-1)(I'range)(RE(I(I'low).RE'range),IM(I(I'low).IM'range));
        type UNSIGNED_VECTOR is array(NATURAL range <>) of UNSIGNED(SI'range);
@@ -4815,7 +4815,7 @@ begin
           end generate;
 --Last stage, it becomes a trivial assignment if F=0
        bl:block
-            signal OV:BOOLEAN_VECTOR(0 to H-1);
+            signal OV:SSR_BOOLEAN_VECTOR(0 to H-1);
 --2008            signal OS:UNSIGNED_VECTOR(0 to H-1)(SI'range);
             signal OS:UNSIGNED_VECTOR(0 to H-1);
           begin
@@ -5077,7 +5077,7 @@ architecture TEST of SYSTOLIC_FFT is
 --2008  signal D:CFIXED_MATRIX(0 to SIZE)(I'range)(RE(O(O'low).RE'range),IM(O(O'low).IM'range));
   type CFIXED_MATRIX is array(INTEGER range <>) of CFIXED_VECTOR(O'range); -- unconstrained array of CFIXED_VECTOR
   signal D:CFIXED_MATRIX(0 to SIZE);
-  signal V:BOOLEAN_VECTOR(0 to SIZE);
+  signal V:SSR_BOOLEAN_VECTOR(0 to SIZE);
 --2008  signal S:UNSIGNED_VECTOR(0 to SIZE)(SI'range);
   type UNSIGNED_VECTOR is array(NATURAL range <>) of UNSIGNED(SI'range); --93
   signal S:UNSIGNED_VECTOR(0 to SIZE);
@@ -5562,7 +5562,7 @@ begin
        signal IO:CFIXED_VECTOR(I'range);
        signal V:BOOLEAN;
        signal S:UNSIGNED(SI'range);
-       signal OV:BOOLEAN_VECTOR(0 to H-1);
+       signal OV:SSR_BOOLEAN_VECTOR(0 to H-1);
 --2008       signal OS:UNSIGNED_VECTOR(0 to H-1)(SO'range);
        type UNSIGNED_VECTOR is array(NATURAL range <>) of UNSIGNED(SO'range); --93
        signal OS:UNSIGNED_VECTOR(0 to H-1);
