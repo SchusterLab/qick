@@ -1,3 +1,11 @@
+// Description: 
+// BUFFER block is a FSM that receives an input stream of samples (din), and controls the interface to a memory to capture and store them.
+// Capturing is initiated by an external trigger after the buffer has been enabled. Number of captured samples and address where to store them are configurable.
+// When number of captured samples is reached, it can be triggered again.
+//
+// Parameters: 
+// N: memory depth as 2**N; B: memory data width
+
 // Data is I,Q.
 // I: lower B bits.
 // Q: upper B bits.
@@ -10,6 +18,7 @@ module buffer (
 	trigger_i	,
 
 	// Data input.
+	din_valid_i	,
 	din_i		,
 
 	// Memory interface.
@@ -40,6 +49,7 @@ input				clk;
 
 input				trigger_i;
 
+input				din_valid_i;
 input	[2*B-1:0]	din_i;
 
 output				mem_we_o;
@@ -109,7 +119,7 @@ always @(posedge clk) begin
 					state <= MEMW_ST;
 
 			MEMW_ST:
-				if ( cnt == len_r-1 )
+				if ( cnt == len_r && din_valid_i == 1'b1 )
 					state <= WAIT_TRIGGER_ST;
 
 			WAIT_TRIGGER_ST:
@@ -121,17 +131,20 @@ always @(posedge clk) begin
 		endcase
 
 		// Counter.
-		if ( memw_state == 1'b1 )
-			cnt	<= cnt + 1;
-		else
+		if ( memw_state == 1'b1 ) begin
+			if (din_valid_i == 1'b1)
+				cnt	<= cnt + 1;
+		end
+		else begin
 			cnt <= 0;
+		end
 
 		// Registers.
 		if ( start_state == 1'b1 ) begin
 			addr_r	<= ADDR_REG;
-			len_r	<= LEN_REG;
+			len_r	<= LEN_REG - 1;
 		end
-		else if ( memw_state == 1'b1 ) begin
+		else if ( memw_state == 1'b1 && din_valid_i == 1'b1) begin
 			addr_r	<= addr_r + 1;
 		end
 	end
@@ -161,7 +174,7 @@ always_comb	begin
 end
 
 // Assign outputs.
-assign mem_we_o		= memw_state;
+assign mem_we_o		= memw_state & din_valid_i;
 assign mem_addr_o	= addr_r;
 assign mem_di_o		= din_i;
 

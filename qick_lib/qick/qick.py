@@ -2,903 +2,66 @@
 The lower-level driver for the QICK library. Contains classes for interfacing with the SoC.
 """
 import os
-from pynq import Overlay, DefaultIP, allocate
-try:
-    import xrfclk
-    import xrfdc
-    from pynq import Xlnk
-except:
-    pass
+import mmap
+from pynq.overlay import Overlay
+import xrfclk
+import xrfdc
 import numpy as np
-from pynq import Overlay
-from pynq.lib import AxiGPIO
 import time
-from .parser import *
-from . import bitfile_path
-
-# Some support functions
-def format_buffer(buff):
-    """
-    Return the I and Q values associated with a buffer value. The lower 16 bits correspond to the I value, and the upper 16 bits correspond to the Q value.
-
-    :param buff: Buffer location
-    :type buff: int
-    :returns:
-    - dataI (:py:class:`int`) - I data value
-    - dataQ (:py:class:`int`) - Q data value
-    """
-    data = buff
-    dataI = data & 0xFFFF
-    dataI = dataI.astype(np.int16)
-    dataQ = data >> 16
-    dataQ = dataQ.astype(np.int16)
-    
-    return dataI,dataQ
-
-class SocIp(DefaultIP):
-    """
-    SocIp class
-    """
-    REGISTERS = {}    
-    
-    def __init__(self, description, **kwargs):
-        """
-        Constructor method
-        """
-        #print("SocIp init", description)
-        super().__init__(description)
-        #self.ip = description
-        
-    def write(self, offset, value):
-        """
-        Writes a value to a register specified by an offset
-
-        :param offset: Offset value (register)
-        :type offset: int
-        :param value: value to be written
-        :type value: int
-        """
-        super().write(offset, value)
-        
-    def read(self, offset):
-        """
-        Reads an offset
-
-        :param offset: Offset value
-        :type offset: int
-        """
-        return super().read(offset)
-    
-    def __setattr__(self, a ,v):
-        """
-        Sets the arguments associated with a register
-
-        :param a: Register specified by an offset value
-        :type a: int
-        :param v: value to be written
-        :type v: int
-        :return: Register arguments
-        :rtype: *args object
-        """
-        if a in self.__class__.REGISTERS:
-            super().write(4*self.__class__.REGISTERS[a], int(v))
-        else:
-            return super().__setattr__(a,v)
-    
-    def __getattr__(self, a):
-        """
-        Gets the arguments associated with a register
-
-        :param a: register name
-        :type a: str
-        :return: Register arguments
-        :rtype: *args object
-        """
-        if a in self.__class__.REGISTERS:
-            return super().read(4*self.__class__.REGISTERS[a])
-        else:
-            return super().__getattr__(a)           
-        
-class AxisSignalGenV4(SocIp):
-    """
-    AxisSignalGenV4 class
-
-    AXIS Signal Generator V4 Registers.
-    START_ADDR_REG
-
-    WE_REG
-    * 0 : disable writes.
-    * 1 : enable writes.
-    """
-    bindto = ['user.org:user:axis_signal_gen_v4:1.0']
-    REGISTERS = {'start_addr_reg':0, 'we_reg':1, 'rndq_reg':2}
-    
-    def __init__(self, description, **kwargs):
-        """
-        Constructor method
-        """
-        super().__init__(description)
-        
-        # Default registers.
-        self.start_addr_reg=0
-        self.we_reg=0
-        self.rndq_reg = 10
-
-        # Generics
-        self.N = int(description['parameters']['N'])
-        self.NDDS = int(description['parameters']['N_DDS'])
-
-        # Maximum number of samples
-        self.MAX_LENGTH = 2**self.N*self.NDDS
-
-        # Get the channel number from the IP instance name.
-        self.ch = int(description['fullpath'].split('_')[-1])
-        
-    # Configure this driver with links to the other drivers, and the signal gen channel number.
-    def configure(self, axi_dma, axis_switch):
-        # dma
-        self.dma = axi_dma
-        
-        # Switch
-        self.switch = axis_switch
-        
-    # Load waveforms.
-    def load(self, xin_i, xin_q ,addr=0):
-        """
-        Load waveform into I,Q envelope
-
-        :param xin_i: real part of envelope
-        :type xin_i: list
-        :param xin_q: imaginary part of envelope
-        :type xin_q: list
-        :param addr: starting address
-        :type addr: int
-        """
-        # Check for equal length.
-        if len(xin_i) != len(xin_q):
-            print("%s: I/Q buffers must be the same length." % self.__class__.__name__)
-            return
-        
-        # Check for max length.
-        if len(xin_i) > self.MAX_LENGTH:
-            print("%s: buffer length must be %d samples or less." % (self.__class__.__name__,self.MAX_LENGTH))
-            return
-
-        # Check for even transfer size.
-        if len(xin_i) %2 != 0:
-            raise RuntimeError("Buffer transfer length must be even number.")
-
-        # Check for max length.
-        if np.max(xin_i) > np.iinfo(np.int16).max or np.min(xin_i) < np.iinfo(np.int16).min:
-            raise ValueError("real part of envelope exceeds limits of int16 datatype")
-
-        if np.max(xin_q) > np.iinfo(np.int16).max or np.min(xin_q) < np.iinfo(np.int16).min:
-            raise ValueError("imaginary part of envelope exceeds limits of int16 datatype")
-
-        # Route switch to channel.
-        self.switch.sel(mst=self.ch)
-        
-        #time.sleep(0.050)
-        
-        # Format data.
-        xin_i = xin_i.astype(np.int16)
-        xin_q = xin_q.astype(np.int16)
-        xin = np.zeros(len(xin_i))
-        for i in range(len(xin)):
-            xin[i] = xin_i[i] + (xin_q[i] << 16)
-            
-        xin = xin.astype(np.int32)
-        
-        # Define buffer.
-        self.buff = Xlnk().cma_array(shape=(len(xin)), dtype=np.int32)
-        np.copyto(self.buff, xin)
-        
-        ################
-        ### Load I/Q ###
-        ################
-        # Enable writes.
-        self.wr_enable(addr)
-
-        # DMA data.
-        self.dma.sendchannel.transfer(self.buff)
-        self.dma.sendchannel.wait()
-
-        # Disable writes.
-        self.wr_disable()        
-        
-    def wr_enable(self,addr=0):
-        """
-           Enable WE reg
-        """
-        self.start_addr_reg = addr
-        self.we_reg = 1
-        
-    def wr_disable(self):
-        """
-           Disable WE reg
-        """
-        self.we_reg = 0
-        
-    def rndq(self, sel_):
-        """
-           TODO: remove this function. This functionality was removed from IP block.
-        """
-        self.rndq_reg = sel_
-                
-class AxisReadoutV2(SocIp):
-    """
-    AxisReadoutV2 class
-
-    Registers.
-    FREQ_REG : 32-bit.
-
-    PHASE_REG : 32-bit.
-
-    NSAMP_REG : 16-bit.
-
-    OUTSEL_REG : 2-bit.
-    * 0 : product.
-    * 1 : dds.
-    * 2 : bypass.
-
-    MODE_REG : 1-bit.
-    * 0 : NSAMP.
-    * 1 : Periodic.
-
-    WE_REG : enable/disable to perform register update.
-
-    :param ip: IP address
-    :type ip: str
-    :param fs: sampling frequency in MHz
-    :type fs: float
-    """
-    bindto = ['user.org:user:axis_readout_v2:1.0']
-    REGISTERS = {'freq_reg':0, 'phase_reg':1, 'nsamp_reg':2, 'outsel_reg':3, 'mode_reg': 4, 'we_reg':5}
-    
-    # Bits of DDS.
-    B_DDS = 32
-    
-    def __init__(self, description, **kwargs):
-        """
-        Constructor method
-        """
-        super().__init__(description)
-        
-        # Default registers.
-        self.freq_reg = 0
-        self.phase_reg = 0
-        self.nsamp_reg = 10
-        self.outsel_reg = 0
-        self.mode_reg = 1
-        
-        # Register update.
-        self.update()
-        
-        # Get the channel number from the IP instance name.
-        self.ch = int(description['fullpath'].split('_')[-1])
-
-    # Configure this driver with the sampling frequency.
-    def configure(self, fs):
-        # Sampling frequency.
-        self.fs = fs
-        
-    def update(self):
-        """
-        Update register values
-        """
-        self.we_reg = 1
-        self.we_reg = 0
-        
-    def set_out(self,sel="product"):
-        """
-        Select readout signal output
-
-        :param sel: select mux control
-        :type sel: int
-        """
-        self.outsel_reg={"product":0,"dds":1,"input":2}[sel]
-#         if sel is "product":
-#             self.outsel_reg = 0
-#         elif sel is "dds":
-#             self.outsel_reg = 1
-#         elif sel is "input":
-#             self.outsel_reg = 2
-#         else:
-#             print("AxisReadoutV2: %s output unknown" % sel)
-            
-        # Register update.
-        self.update()
-            
-    def set_freq(self, f):
-        """
-        Set frequency register
-
-        :param f: frequency in MHz
-        :type f: float
-        """
-        # Sanity check.
-        if f<self.fs:
-            df = self.fs/2**self.B_DDS
-            k_i = int(np.round(f/df))
-            self.freq_reg = k_i
-            
-        # Register update.
-        self.update()
-        
-    def set_freq_int(self, f_int):
-        """
-        Set frequency register (integer version)
-
-        :param f_int: frequency value register
-        :type f_int: int
-        """
-        self.freq_reg = f_int
-            
-        # Register update.
-        self.update()        
-        
-class AxisAvgBuffer(SocIp):
-    """
-    AxisAvgBuffer class
-
-    Registers.
-    AVG_START_REG
-    * 0 : Averager Disabled.
-    * 1 : Averager Enabled (started by external trigger).
-
-    AVG_ADDR_REG : start address to write results.
-
-    AVG_LEN_REG : number of samples to be added.
-
-    AVG_DR_START_REG
-    * 0 : do not send any data.
-    * 1 : send data using m0_axis.
-
-    AVG_DR_ADDR_REG : start address to read data.
-
-    AVG_DR_LEN_REG : number of samples to be read.
-
-    BUF_START_REG
-    * 0 : Buffer Disabled.
-    * 1 : Buffer Enabled (started by external trigger).
-
-    BUF_ADDR_REG : start address to write results.
-
-    BUF_LEN_REG : number of samples to be buffered.
-
-    BUF_DR_START_REG
-    * 0 : do not send any data.
-    * 1 : send data using m1_axis.
-
-    BUF_DR_ADDR_REG : start address to read data.
-
-    BUF_DR_LEN_REG : number of samples to be read.
-
-    :param ip: IP address
-    :type ip: str
-    :param axi_dma_avg: dma block for average buffers
-    :type axi_dma_avg: str
-    :param switch_avg: switch block for average buffers
-    :type switch_avg: str
-    :param axi_dma_buf: dma block for raw buffers
-    :type axi_dma_buf: str
-    :param switch_buf: switch block for raw buffers
-    :type switch_buf: str
-    :param channel: readout channel selection
-    :type channel: int
-    """
-    bindto = ['user.org:user:axis_avg_buffer:1.0']
-    REGISTERS = {'avg_start_reg'    : 0, 
-                 'avg_addr_reg'     : 1,
-                 'avg_len_reg'      : 2,
-                 'avg_dr_start_reg' : 3,
-                 'avg_dr_addr_reg'  : 4,
-                 'avg_dr_len_reg'   : 5,
-                 'buf_start_reg'    : 6, 
-                 'buf_addr_reg'     : 7,
-                 'buf_len_reg'      : 8,
-                 'buf_dr_start_reg' : 9,
-                 'buf_dr_addr_reg'  : 10,
-                 'buf_dr_len_reg'   : 11}
-    
-    def __init__(self, description, **kwargs):
-        """
-        Constructor method
-        """
-        super().__init__(description)
-        
-        # Default registers.
-        self.avg_start_reg    = 0
-        self.avg_dr_start_reg = 0
-        self.buf_start_reg    = 0
-        self.buf_dr_start_reg = 0        
-
-        # Generics
-        self.B = int(description['parameters']['B'])
-        self.N_AVG = int(description['parameters']['N_AVG'])
-        self.N_BUF = int(description['parameters']['N_BUF'])
-
-        # Maximum number of samples
-        self.AVG_MAX_LENGTH = 2**self.N_AVG  
-        self.BUF_MAX_LENGTH = 2**self.N_BUF
-
-        # Get the channel number from the IP instance name.
-        self.ch = int(description['fullpath'].split('_')[-1])
-
-    # Configure this driver with links to the other drivers.
-    def configure(self, axi_dma_avg, switch_avg, axi_dma_buf, switch_buf):
-        # DMAs.
-        self.dma_avg = axi_dma_avg
-        self.dma_buf = axi_dma_buf
-        
-        # Switches.
-        self.switch_avg = switch_avg
-        self.switch_buf = switch_buf
-        
-
-    def config(self,address=0,length=100):
-        """
-        Configure both average and raw buffers
-
-        :param addr: Start address of first capture
-        :type addr: int
-        :param length: window size
-        :type length: int
-        """
-        # Configure averaging and buffering to the same address and length.
-        self.config_avg(address=address,length=length)
-        self.config_buf(address=address,length=length)
-        
-    def enable(self):
-        """
-        Enable both average and raw buffers
-        """
-        # Enable both averager and buffer.
-        self.enable_avg()
-        self.enable_buf()
-        
-    def config_avg(self,address=0,length=100):
-        """
-        Configure average buffer data from average and buffering readout block
-
-        :param addr: Start address of first capture
-        :type addr: int
-        :param length: window size
-        :type length: int
-        """
-        # Disable averaging.
-        self.disable_avg()
-        
-        # Set registers.
-        self.avg_addr_reg = address
-        self.avg_len_reg = length
-        
-    def transfer_avg(self,buff,address=0,length=100):
-        """
-        Transfer average buffer data from average and buffering readout block.
-
-        :param buff: DMA buffer to be used for transfer
-        :type buff: list
-        :param addr: starting reading address
-        :type addr: int
-        :param length: number of samples
-        :type length: int
-        :return: I,Q pairs
-        :rtype: list
-        """
-        # Route switch to channel.
-        self.switch_avg.sel(slv=self.ch)        
-        
-        # Set averager data reader address and length.
-        self.avg_dr_addr_reg = address
-        self.avg_dr_len_reg = length
-        
-        # Start send data mode.
-        self.avg_dr_start_reg = 1
-        
-        # DMA data.
-        self.dma_avg.recvchannel.transfer(buff)
-        self.dma_avg.recvchannel.wait()
-
-        if self.dma_avg.recvchannel.transferred != length*8:
-            raise RuntimeError("Requested %d samples but only got %d from DMA" % (length, self.dma_avg.recvchannel.transferred//8))
-
-        # Stop send data mode.
-        self.avg_dr_start_reg = 0
-        
-        # Format: 
-        # -> lower 32 bits: I value.
-        # -> higher 32 bits: Q value.
-        data = buff
-        dataI = data & 0xFFFFFFFF
-        dataI = dataI.astype(np.int32)
-        dataQ = data >> 32
-        dataQ = dataQ.astype(np.int32)
-    
-        return dataI,dataQ        
-        
-    def enable_avg(self):
-        """
-        Enable average buffer capture
-        """
-        self.avg_start_reg = 1
-        
-    def disable_avg(self):
-        """
-        Disable average buffer capture
-        """
-        self.avg_start_reg = 0    
-        
-    def config_buf(self,address=0,length=100):
-        """
-        Configure raw buffer data from average and buffering readout block
-
-        :param addr: Start address of first capture
-        :type addr: int
-        :param length: window size
-        :type length: int
-        """
-        # Disable buffering.
-        self.disable_buf()
-        
-        # Set registers.
-        self.buf_addr_reg = address
-        self.buf_len_reg = length    
-        
-    def transfer_buf(self,buff,address=0,length=100):
-        """
-        Transfer raw buffer data from average and buffering readout block
-
-        :param buff: DMA buffer to be used for transfer
-        :type buff: list
-        :param addr: starting reading address
-        :type addr: int
-        :param length: number of samples
-        :type length: int
-        :return: I,Q pairs
-        :rtype: list
-        """
-        # Route switch to channel.
-        self.switch_buf.sel(slv=self.ch)
-        
-        #time.sleep(0.050)
-        
-        # Set buffer data reader address and length.
-        self.buf_dr_addr_reg = address
-        self.buf_dr_len_reg = length
-        
-        # Start send data mode.
-        self.buf_dr_start_reg = 1
-        
-        # DMA data.
-        self.dma_buf.recvchannel.transfer(buff)
-        self.dma_buf.recvchannel.wait()
-
-        if self.dma_buf.recvchannel.transferred != length*4:
-            raise RuntimeError("Requested %d samples but only got %d from DMA" % (length, self.dma_buf.recvchannel.transferred//4))
-
-        # Stop send data mode.
-        self.buf_dr_start_reg = 0
-        
-        # Format: 
-        # -> lower 16 bits: I value.
-        # -> higher 16 bits: Q value.
-        data = buff
-        dataI = data & 0xFFFF
-        dataI = dataI.astype(np.int16)
-        dataQ = data >> 16
-        dataQ = dataQ.astype(np.int16)
-    
-        return dataI,dataQ
-        
-    def enable_buf(self):
-        """
-        Enable raw buffer capture
-        """
-        self.buf_start_reg = 1
-        
-    def disable_buf(self):
-        """
-        Disable raw buffer capture
-        """
-        self.buf_start_reg = 0         
-        
-class AxisTProc64x32_x8(SocIp):
-    """
-    AxisTProc64x32_x8 class
-
-    AXIS tProcessor registers:
-    START_SRC_REG
-    * 0 : internal start.
-    * 1 : external start.
-
-    START_REG
-    * 0 : stop.
-    * 1 : start.
-
-    MEM_MODE_REG
-    * 0 : AXIS Read (from memory to m0_axis)
-    * 1 : AXIS Write (from s0_axis to memory)
-
-    MEM_START_REG
-    * 0 : Stop.
-    * 1 : Execute operation (AXIS)
-
-    MEM_ADDR_REG : starting memory address for AXIS read/write mode.
-
-    MEM_LEN_REG : number of samples to be transferred in AXIS read/write mode.
-
-    DMEM: The internal data memory is 2^DMEM_N samples, 32 bits each.
-    The memory can be accessed either single read/write from AXI interface. The lower 256 Bytes are reserved for registers.
-    The memory is then accessed in the upper section (beyond 256 bytes). Byte to sample conversion needs to be performed.
-    The other method is to DMA in and out. Here the access is direct, so no conversion is needed.
-    There is an arbiter to ensure data coherency and avoid blocking transactions.
-
-    :param ip: IP address
-    :type ip: str
-    :param mem: memory address
-    :type mem: int
-    :param axi_dma: axi_dma address
-    :type axi_dma: int
-    """
-    bindto = ['user.org:user:axis_tproc64x32_x8:1.0']
-    REGISTERS = {'start_src_reg' : 0, 
-                 'start_reg' : 1, 
-                 'mem_mode_reg' : 2, 
-                 'mem_start_reg' : 3, 
-                 'mem_addr_reg' : 4, 
-                 'mem_len_reg' : 5}
-    
-    # Reserved lower memory section for register access.
-    DMEM_OFFSET = 256 
-    
-    def __init__(self, description):
-        """
-        Constructor method
-        """
-        super().__init__(description)
-        
-        # Default registers.
-        # start_src_reg = 0   : internal start.
-        # start_reg     = 0   : stopped.
-        # mem_mode_reg  = 0   : axis read.
-        # mem_start_reg = 0   : axis operation stopped.
-        # mem_addr_reg  = 0   : start address = 0.
-        # mem_len_reg   = 100 : default length.
-        self.start_src_reg = 0
-        self.start_reg     = 0
-        self.mem_mode_reg  = 0
-        self.mem_start_reg = 0
-        self.mem_addr_reg  = 0
-        self.mem_len_reg   = 100
-
-        # Generics.
-        self.DMEM_N = int(description['parameters']['DMEM_N'])
-        self.PMEM_N = int(description['parameters']['PMEM_N'])
-        
-    # Configure this driver with links to its memory and DMA.
-    def configure(self, mem, axi_dma):
-        # Program memory.
-        self.mem = mem
-
-        # dma
-        self.dma = axi_dma 
-
-    def start_src(self,src=0):
-        """
-        Sets the start source of tProc
-
-        :param src: start source
-        :type src: int
-        """
-        self.start_src_reg = src
-        
-    def start(self):
-        """
-        Start tProc from register
-        """
-        self.start_reg = 1
-        
-    def stop(self):
-        """
-        Stop tProc from register
-        """
-        self.start_reg = 0
-        
-    def load_bin_program(self, binprog):
-        for ii,inst in enumerate(binprog):
-            dec_low = inst & 0xffffffff
-            dec_high = inst >> 32
-            self.mem.write(offset=8*ii,value=int(dec_low))
-            self.mem.write(offset=4*(2*ii+1),value=int(dec_high))
-        
-    def load_qick_program(self, prog, debug= False):
-        """
-        :param prog: the QickProgram to load
-        :type prog: str
-        :param debug: Debug option
-        :type debug: bool
-        """
-        self.load_bin_program(prog.compile(debug=debug))
-        
-    def load_program(self,prog="prog.asm",fmt="asm"):
-        """
-        Loads tProc program. If asm progam, it compiles first
-
-        :param prog: program file name
-        :type prog: string
-        :param fmt: file format
-        :type fmt: string
-        """
-        # Binary file format.
-        if fmt == "bin":
-            # Read binary file from disk.
-            fd = open(prog,"r")
-            
-            # Write memory.
-            addr = 0
-            for line in fd:
-                line.strip("\r\n")
-                dec = int(line,2)
-                dec_low = dec & 0xffffffff
-                dec_high = dec >> 32
-                self.mem.write(offset=addr,value=int(dec_low))
-                addr = addr + 4
-                self.mem.write(offset=addr,value=int(dec_high))
-                addr = addr + 4                
-                
-        # Asm file.
-        elif fmt == "asm":
-            # Compile program.
-            progList = parse_prog(prog)
-        
-            # Load Program Memory.
-            addr = 0
-            for e in progList:
-                dec = int(progList[e],2)
-                #print ("@" + str(addr) + ": " + str(dec))
-                dec_low = dec & 0xffffffff
-                dec_high = dec >> 32
-                self.mem.write(offset=addr,value=int(dec_low))
-                addr = addr + 4
-                self.mem.write(offset=addr,value=int(dec_high))
-                addr = addr + 4   
-                
-    def single_read(self, addr):
-        """
-        Reads one sample of tProc data memory using AXI access
-
-        :param addr: reading address
-        :type addr: int
-        :param data: value to be written
-        :type data: int
-        :return: requested value
-        :rtype: int
-        """
-        # Address should be translated to upper map.
-        addr_temp = 4*addr + self.DMEM_OFFSET
-            
-        # Read data.
-        data = self.read(offset=addr_temp)
-            
-        return data
-    
-    def single_write(self, addr=0, data=0):
-        """
-        Writes one sample of tProc data memory using AXI access
-
-        :param addr: writing address
-        :type addr: int
-        :param data: value to be written
-        :type data: int
-        """
-        # Address should be translated to upper map.
-        addr_temp = 4*addr + self.DMEM_OFFSET
-            
-        # Write data.
-        self.write(offset=addr_temp,value=int(data))
-        
-    def load_dmem(self, buff_in, addr=0):
-        """
-        Writes tProc data memory using DMA
-
-        :param buff_in: Input buffer
-        :type buff_in: int
-        :param addr: Starting destination address
-        :type addr: int
-        """
-        # Length.
-        length = len(buff_in)
-        
-        # Configure dmem arbiter.
-        self.mem_mode_reg = 1
-        self.mem_addr_reg = addr
-        self.mem_len_reg = length
-        
-        # Define buffer.
-        self.buff = Xlnk().cma_array(shape=(length), dtype=np.int32)
-        
-        # Copy buffer.
-        np.copyto(self.buff,buff_in)
-
-        # Start operation on block.
-        self.mem_start_reg = 1
-
-        # DMA data.
-        self.dma.sendchannel.transfer(self.buff)
-        self.dma.sendchannel.wait()
-
-        # Set block back to single mode.
-        self.mem_start_reg = 0
-        
-    def read_dmem(self, addr=0, length=100):
-        """
-        Reads tProc data memory using DMA
-
-        :param addr: Starting address
-        :type addr: int
-        :param length: Number of samples
-        :type length: int
-        :return: List of memory data
-        :rtype: list
-        """
-        # Configure dmem arbiter.
-        self.mem_mode_reg = 0
-        self.mem_addr_reg = addr
-        self.mem_len_reg = length
-        
-        # Define buffer.
-        buff = Xlnk().cma_array(shape=(length), dtype=np.int32)
-        
-        # Start operation on block.
-        self.mem_start_reg = 1
-
-        # DMA data.
-        self.dma.recvchannel.transfer(buff)
-        self.dma.recvchannel.wait()
-
-        # Set block back to single mode.
-        self.mem_start_reg = 0
-        
-        return buff
-    
-class AxisSwitch(SocIp):
+import queue
+import logging
+from collections import OrderedDict, defaultdict
+from fractions import Fraction
+from . import bitfile_path, obtain, get_version
+from .ip import SocIP, QickMetadata
+from .parser import parse_to_bin
+from .streamer import DataStreamer
+from .qick_asm import QickConfig
+from .asm_v1 import QickProgram
+from .asm_v2 import QickProgramV2
+from .drivers.generator import *
+from .drivers.readout import *
+from .drivers.tproc import *
+from .drivers.peripherals import *
+from .drivers.xcom import *
+from .board_utils import read_dac_avtt, set_dac_avtt
+from .helpers import ADCInterruptError
+
+logger = logging.getLogger(__name__)
+
+
+class AxisSwitch(SocIP):
     """
     AxisSwitch class to control Xilinx AXI-Stream switch IP
 
-    :param ip: IP address
-    :type ip: str
     :param nslave: Number of slave interfaces
     :type nslave: int
     :param nmaster: Number of master interfaces
     :type nmaster: int
     """
     bindto = ['xilinx.com:ip:axis_switch:1.1']
-    REGISTERS = {'ctrl': 0x0, 'mix_mux': 0x040}
-    
-    def __init__(self, description, **kwargs):
-        """
-        Constructor method
-        """
-        super().__init__(description)
-        
+
+    def _init_config(self, description):
         # Number of slave interfaces.
         self.NSL = int(description['parameters']['NUM_SI'])
         # Number of master interfaces.
         self.NMI = int(description['parameters']['NUM_MI'])
-        
+
+        self.REGISTERS = {'ctrl': 0x0, 'mix_mux': 0x040}
+
+    def _init_firmware(self):
         # Init axis_switch.
         self.ctrl = 0
         self.disable_ports()
-            
+
     def disable_ports(self):
         """
         Disables ports
         """
         for ii in range(self.NMI):
             offset = self.REGISTERS['mix_mux'] + 4*ii
-            self.write(offset,0x80000000)
-        
+            self.write(offset, 0x80000000)
+
     def sel(self, mst=0, slv=0):
         """
         Digitally connects a master interface with a slave interface
@@ -909,49 +72,869 @@ class AxisSwitch(SocIp):
         :type slv: int
         """
         # Sanity check.
-        if slv>self.NSL-1:
-            print("%s: Slave number %d does not exist in block." % __class__.__name__)
+        if slv > self.NSL-1:
+            print("%s: Slave number %d does not exist in block." %
+                  __class__.__name__)
             return
-        if mst>self.NMI-1:
-            print("%s: Master number %d does not exist in block." % __class__.__name__)
+        if mst > self.NMI-1:
+            print("%s: Master number %d does not exist in block." %
+                  __class__.__name__)
             return
-        
+
         # Disable register update.
         self.ctrl = 0
 
         # Disable all MI ports.
         self.disable_ports()
-        
+
         # MI[mst] -> SI[slv]
         offset = self.REGISTERS['mix_mux'] + 4*mst
-        self.write(offset,slv)
+        self.write(offset, slv)
 
         # Enable register update.
-        self.ctrl = 2     
-        
-class QickSoc(Overlay):
-    """
-    QickSoc class. This class will create all object to access system blocks
+        self.ctrl = 2
 
-    :param bitfile: Name of the bitfile
-    :type bitfile: str
-    :param force_init_clks: Whether the board clocks are re-initialized
-    :type force_init_clks: bool
-    :param ignore_version: Whether version discrepancies between PYNQ build and firmware build are ignored
-    :type ignore_version: bool
+class RFDC(SocIP, xrfdc.RFdc):
     """
-    FREF_PLL = 204.8 # MHz
+    Extends the xrfdc driver.
+    Calling xrfdc functions is slow (typically ~8 ms per call).
+    We therefore cache parameters that need to be set in program initialization, such as Nyquist zone and frequency.
+    """
+    bindto = ["xilinx.com:ip:usp_rf_data_converter:2.3",
+              "xilinx.com:ip:usp_rf_data_converter:2.4",
+              "xilinx.com:ip:usp_rf_data_converter:2.6"]
+
+    # consts from https://github.com/Xilinx/embeddedsw/blob/master/XilinxProcessorIPLib/drivers/rfdc/src/xrfdc.h
+    XRFDC_CAL_BLOCK_OCB1 = 0
+    XRFDC_CAL_BLOCK_OCB2 = 1
+    XRFDC_CAL_BLOCK_GCB  = 2
+    XRFDC_CAL_BLOCK_TSCB = 3
+    XRFDC_GEN3 = 2
+    # name, ID, number of coefficients
+    ADC_CAL_BLOCKS = {'OCB1': (XRFDC_CAL_BLOCK_OCB1, 4),
+                      'OCB2': (XRFDC_CAL_BLOCK_OCB2, 4),
+                      'GCB' : (XRFDC_CAL_BLOCK_GCB,  4),
+                      'TSCB': (XRFDC_CAL_BLOCK_TSCB, 8),
+                      }
+    XRFDC_STEP_I_UA = 43.75 # step size for variable output current (VOP), in uA
+    XRFDC_MIN_I_UA_INT = 1400 # offset for VOP, in uA
+
+    @classmethod
+    def _parse_hwh(cls, ip_params):
+        """Static method to parse the HWH parameters before the firmware is loaded.
+        The RFDC class is initialized after the HWH is read but before the bitstream is loaded to the FPGA;
+        we therefore cannot access the xrfdc driver here (if we do, we may get stale information from the previously loaded bitstream).
+        So, just use the HWH information to get the information we need first (lists of enabled blocks, reference clocks).
+        """
+        cfg = {}
+
+        # which generation RFSoC we are using
+        cfg['ip_type'] = int(ip_params['C_IP_Type'])
+        # quad or dual RF-ADC
+        cfg['hs_adc'] = (ip_params['C_High_Speed_ADC'] == '1')
+
+        # DAC output current mode
+        if cfg['ip_type'] == cls.XRFDC_GEN3 and ip_params['C_DAC_VOP_Mode'] == '1':
+            cfg['dac_power'] = 'VOP'
+        else:
+            cfg['dac_power'] = {'0': '20mA', '1': '32mA'}[ip_params['C_DAC_Output_Current']]
+
+        # dicts of RFDC tiles and channels
+        cfg['tiles'] = {'dac':{}, 'adc':{}}
+        cfg['dacs'] = OrderedDict()
+        cfg['adcs'] = OrderedDict()
+
+        # list the enabled DAC+ADC tiles and blocks, and enumerate the "channel name" and tile/block indices for each block
+        # the channel name is a 2-digit string that gets used in RFDC port and parameter names
+        # the indices are what you need to index into the dac_tiles/adc_tiles structures
+        for tiletype in ['dac', 'adc']:
+            for iTile in range(4):
+                if ip_params['C_%s%d_Enable' % (tiletype.upper(), iTile)] != '1': continue
+                tilecfg = {}
+                cfg['tiles'][tiletype][iTile] = tilecfg
+                # some firmwares (older versions of Vivado?) do not have link coupling params for the DAC
+                if ('C_%s%d_Link_Coupling' % (tiletype.upper(), iTile)) in ip_params:
+                    tilecfg['coupling'] = ['AC', 'DC'][int(ip_params['C_%s%d_Link_Coupling' % (tiletype.upper(), iTile)])]
+                tilecfg['f_ref'] = float(ip_params['C_%s%d_Refclk_Freq' % (tiletype.upper(), iTile)])
+                f_fabric = float(ip_params['C_%s%d_Fabric_Freq' % (tiletype.upper(), iTile)])
+                f_out = float(ip_params['C_%s%d_Outclk_Freq' % (tiletype.upper(), iTile)])
+                fs = float(ip_params['C_%s%d_Sampling_Rate' % (tiletype.upper(), iTile)])*1000
+                tilecfg['fabric_div'] = int(fs/f_fabric)
+                tilecfg['out_div'] = int(f_fabric/f_out)
+                #out_div = Fraction(f_fabric/f_out).limit_denominator()
+                tilecfg['blocks'] = []
+                for block in range(4):
+                    # pack the indices for the tile/block structure "channel name"
+                    chname = "%d%d" % (iTile, block)
+                    if tiletype == 'adc' and cfg['hs_adc']:
+                        if block%2 != 0: continue
+                        iBlock = block//2
+                    else:
+                        iBlock = block
+
+                    # check whether this block is enabled
+                    if ip_params['C_%s_Slice%s_Enable' % (tiletype.upper(), chname)] != 'true': continue
+                    tilecfg['blocks'].append(chname)
+                    cfg[tiletype+'s'][chname] = {'index': [iTile, iBlock]}
+
+        return cfg
+
+    def _init_config(self, description):
+        self._cfg.update(self._parse_hwh(description['parameters']))
+
+        # cached settings for each channel, to minimize unnecessary calls to the xrfdc library
+        # NQZ, rounded NCO frequency, DAC scale
+        self.settings_cache = {}
+        for tiletype in ['dac', 'adc']:
+            self.settings_cache[tiletype] = {}
+            for chname in self[tiletype+'s']:
+                self.settings_cache[tiletype][chname] = {}
+
+    def _get_tile(self, tiletype, iTile):
+        tiles = {'dac':self.dac_tiles, 'adc':self.adc_tiles}[tiletype]
+        return tiles[iTile]
+
+    def _get_block(self, blocktype, blockname):
+        iTile, iBlock = self[blocktype+'s'][blockname]['index']
+        tiles = {'dac':self.dac_tiles, 'adc':self.adc_tiles}[blocktype]
+        return tiles[iTile].blocks[iBlock]
+
+    def _read_freqs(self):
+        for tiletype in ['dac', 'adc']:
+            for iTile, tilecfg in self['tiles'][tiletype].items():
+                #tilecfg.clear()
+                tile = self._get_tile(tiletype, iTile)
+                pllcfg = tile.PLLConfig
+                #tilecfg['f_ref'] = pllcfg['RefClkFreq']
+                tilecfg['ref_div'] = pllcfg['RefClkDivider']
+                tilecfg['fs_mult'] = pllcfg['FeedbackDivider']
+                tilecfg['fs_div'] = pllcfg['RefClkDivider']*pllcfg['OutputDivider']
+                # we could use SampleRate here, but it's the same
+                tilecfg['fs'] = tilecfg['f_ref']*tilecfg['fs_mult']/tilecfg['fs_div']
+                tilecfg['f_fabric'] = tilecfg['fs']/tilecfg['fabric_div']
+                tilecfg['f_out'] = tilecfg['f_fabric']/tilecfg['out_div']
+
+        """
+        # lookup table for deciding whether the AXI-S interface uses IQ or real data
+        # this only covers the cases we actually use in our generators/ROs
+        mixer2iq = {}
+        mixer2iq['dac'] = {
+            (xrfdc.MIXER_TYPE_FINE,   xrfdc.MIXER_MODE_C2R): 2,
+            (xrfdc.MIXER_TYPE_COARSE, xrfdc.MIXER_MODE_R2R): 1,
+        }
+        mixer2iq['adc'] = {
+            (xrfdc.MIXER_TYPE_COARSE, xrfdc.MIXER_MODE_R2C): 2,
+            (xrfdc.MIXER_TYPE_COARSE, xrfdc.MIXER_MODE_R2R): 1,
+        }
+        fabric_divs = {k:{iTile:[] for iTile in v.keys()} for k,v in self['tiles'].items()}
+        """
+        for tiletype in ['dac', 'adc']:
+            for chname, chcfg in self[tiletype+'s'].items():
+                iTile, iBlock = chcfg['index']
+                #chcfg.clear()
+                #chcfg['index'] = [iTile, iBlock]
+
+                # copy the tile info
+                chcfg.update(self['tiles'][tiletype][iTile])
+                # clean up parameters that are only used at the tile level
+                del chcfg['ref_div'], chcfg['out_div'], chcfg['fabric_div'], chcfg['f_out'], chcfg['blocks']
+
+                block = self._get_tile(tiletype, iTile).blocks[iBlock]
+
+                """
+                # now we compute the ratio between the sample and fabric clocks
+                # this is surprisingly annoying to do in full generality
+                # https://docs.amd.com/r/en-US/pg269-rf-data-converter/RF-DAC-Interface-Data-and-Clock-Rates
+                # https://docs.amd.com/r/en-US/pg269-rf-data-converter/RF-ADC-Interface-Data-and-Clock-Rates
+                # note that this ratio has to be the same for all channels in a tile
+                if tiletype == 'dac':
+                    data_width = block.FabWrVldWords
+                else:
+                    data_width = block.FabRdVldWords
+                mixer_settings = block.MixerSettings
+                iq = mixer2iq[tiletype][tuple(mixer_settings[k] for k in ['MixerType', 'MixerMode'])]
+                """
+
+                if tiletype == 'dac':
+                    chcfg['interpolation'] = block.InterpolationFactor
+                    if self['ip_type'] == self.XRFDC_GEN3:
+                        chcfg['datapath'] = block.DataPathMode
+                    #chcfg['fabric_div'] = data_width*chcfg['interpolation']//iq
+                else:
+                    chcfg['decimation'] = block.DecimationFactor
+                    #chcfg['fabric_div'] = data_width*iq//chcfg['decimation']
+                #fabric_divs[tiletype][iTile].append(chcfg['fabric_div'])
+                #chcfg['f_fabric'] = chcfg['fs']/chcfg['fabric_div']
+
+        """
+        for tiletype in ['dac', 'adc']:
+            for iTile, tiledivs in fabric_divs[tiletype].items():
+                assert len(set(tiledivs)) == 1
+                tilecfg = self['tiles'][tiletype][iTile]
+                tilecfg['fabric_div'] = tiledivs[0]
+                tilecfg['f_out'] = tilecfg['fs']/tilecfg['fabric_div']/tilecfg['out_div']
+        """
+
+    def map_clocks(self, soc):
+        """Map the clock networks driving the various IP blocks, and determine the resulting constraints on the RFDC sampling rates.
+        This method gets run early in QickSoc initialization because it's needed to check validity of a requested set of sampling freqs.
+
+        This code assumes that the RFDC configuration dictionary has been filled (this happens in RFDC driver initialization).
+        It does not assume that configure_connections() has been run on all drivers.
+        """
+        # first, gather information
+
+        # read the clock settings and block configs
+        self._read_freqs()
+
+        # search for IP blocks with trace_clocks() methods - typically this is just the tProc
+        # we run trace_clocks() here
+        # it will also run as part of QickSoc init (via configure_connections()), but that's after sampling rate modification
+        clk_groups = defaultdict(list)
+        for blockname, blockdict in soc.ip_dict.items():
+            if hasattr(blockdict['driver'], 'trace_clocks'):
+                ip = soc._get_block(blockname)
+                ip.trace_clocks(soc)
+                for clkname, clkcfg in ip['clk_srcs'].items():
+                    clkid = (blockname, clkname)
+                    clk_groups[clkcfg['source']].append([clkid, clkcfg['src_range']])
+        # check all RFDC inputs and outputs
+        for tiletype, direction in [('dac', 's'), ('adc', 'm')]:
+            for iTile in self['tiles'][tiletype].keys():
+                clkcfg = soc.metadata.trace_clk_back(self['fullpath'],'%s%d_axis_aclk'%(direction, iTile))
+                clkid = (tiletype, iTile)
+                clk_groups[clkcfg['source']].append([clkid, clkcfg['src_range']])
+
+        # now, analyze clock groups
+        self.cfg['clk_groups'] = []
+        for clk_src, clk_dests in clk_groups.items():
+            # find RFDC tiles whose fabric clocks come from this source
+            fs_group = [x[0] for x in clk_dests]
+            # find limits imposed on the clock source freq
+            src_ranges = [x[1] for x in clk_dests if x[1] is not None]
+
+            if clk_src[0] in ['dac', 'adc']:
+                if fs_group:
+                    self['clk_groups'].append(fs_group)
+
+                tilecfg = self['tiles'][clk_src[0]][clk_src[1]]
+                # cross-check
+                # this isn't a fundamental rule, we might end up making a firmware that violates it
+                # for now, this assumption simplifies thinking about clock groups
+                if clk_src not in fs_group:
+                    raise RuntimeError("%s tile %d drives logic, but not its own fabric clock. There may be a problem with this firmware design."%(clk_src[0].upper(), clk_src[1]))
+                # add the output clock limits to the tile info
+                if src_ranges:
+                    tilecfg['outclk_limits'] = [max([x[0] for x in src_ranges]), min([x[1] for x in src_ranges])]
+
+    def clocks_locked(self):
+        lockdict = {}
+        for tiletype in ['dac', 'adc']:
+            lockdict[tiletype] = {}
+            for i in self['tiles'][tiletype]:
+                lockdict[tiletype][i] = (self._get_tile(tiletype, i).PLLLockStatus == 2)
+        return lockdict
+
+    def tile_states(self):
+        status = self.IPStatus
+        statedict = {}
+        for tiletype in ['dac', 'adc']:
+            statedict[tiletype] = {}
+            for i in self['tiles'][tiletype]:
+                statedict[tiletype][i] = status[tiletype.upper()+"TileStatus"][i]['TileState']
+        return statedict
+
+    def restart_all_tiles(self):
+        """
+        Restart all DAC and ADC tiles using XRFdc_StartUp.
+
+        This will re-lock tile PLLs, reset DDS phases to random values, and reset all logic driven by RF clocks.
+        It won't reset RFDC registers (e.g. if you set custom sampling rates, those will stay in place).
+        """
+        fails = []
+        for tiletype in ['dac', 'adc']:
+            for i in self['tiles'][tiletype]:
+                try:
+                    self._get_tile(tiletype, i).StartUp()
+                except Exception as e:
+                    logger.error("failed to restart %s tile %d" % (tiletype.upper(), i))
+                    fails.append(e.args)
+        if fails:
+            err = ("Some DAC or ADC tiles failed to start up, with the following error messages " +
+                    "(see https://docs.amd.com/r/en-US/pg269-rf-data-converter/Power-on-Sequence-Steps for state numbers):\n" +
+                    "\n".join(["\n".join(fail) for fail in fails])
+                    )
+            raise RuntimeError(err)
+
+    def valid_sample_rates(self, tiletype, tile):
+        """
+        Return an array of valid sample rates.
+        This code is based on XRFdc_SetPLLConf().
+        """
+        if tiletype not in ['dac', 'adc']:
+            raise RuntimeError('tiletype must be "dac" or "adc"')
+        if tile not in self['tiles'][tiletype]:
+            raise RuntimeError('specified tile is not enabled in this firmware')
+        tilecfg = self['tiles'][tiletype][tile]
+        # reference clock after the PLL reference divider
+        # this divider can't be changed by software, and Xilinx recommends keeping it at 1 for best phase noise
+        refclk = tilecfg['f_ref']/tilecfg['ref_div']
+        words_per_axi = tilecfg['fabric_div']
+
+        # Allowed divider values, see PG269 "PLL Parameters"
+        # https://docs.amd.com/r/en-US/pg269-rf-data-converter/PLL-Parameters
+        # Note that the values in PG269 (in comments) are rounded and can't be used literally.
+        # The values here are the VCO_RANGE_* constants used by XRFdc_SetPLLConf().
+        Fb_div_vals = np.arange(13,161, dtype=int)
+        if self['ip_type'] == self.XRFDC_GEN3 and tiletype=='dac':
+            M_vals = np.concatenate([[1,2,3], np.arange(4,66,2)])
+            VCO_range = [7800, 13800] # [7863, 13760]
+        else:
+            M_vals = np.concatenate([[2,3], np.arange(4,66,2)])
+            VCO_range = [8500, 13200]
+
+        VCO_possible = refclk * Fb_div_vals
+        Fb_div_possible = Fb_div_vals[(VCO_possible>=VCO_range[0]) & (VCO_possible<=VCO_range[1])]
+        fs_possible = refclk*(Fb_div_possible.T/M_vals[:,np.newaxis]).ravel()
+
+        if 'outclk_limits' in tilecfg:
+            fs_range = [x*tilecfg['out_div']*tilecfg['fabric_div'] for x in tilecfg['outclk_limits']]
+            fs_possible = fs_possible[fs_possible >= fs_range[0]]
+            fs_possible = fs_possible[fs_possible <= fs_range[1]]
+
+        # See DS926 "RF-ADC/RF-DAC to PL Interface Performance"
+        # https://docs.amd.com/r/en-US/ds926-zynq-ultrascale-plus-rfsoc/RF-ADC/RF-DAC-to-PL-Interface-Switching-Characteristics
+        if self['ip_type'] == self.XRFDC_GEN3:
+            max_axi_clk = 614 # MHz
+        else:
+            max_axi_clk = 520 # MHz
+        fs_possible = fs_possible[fs_possible <= words_per_axi*max_axi_clk]
+
+        # Allowed ranges of sampling freqs
+        # https://docs.amd.com/r/en-US/ds926-zynq-ultrascale-plus-rfsoc/RF-DAC-Electrical-Characteristics
+        # https://docs.amd.com/r/en-US/ds926-zynq-ultrascale-plus-rfsoc/RF-ADC-Electrical-Characteristics
+        if tiletype=='adc' and self['hs_adc']:
+            fs_min = 1000
+        else:
+            fs_min = 500
+        fs_possible = fs_possible[fs_possible >= fs_min]
+        if tiletype=='dac':
+            if self['ip_type'] == self.XRFDC_GEN3:
+                fs_max = 9850
+            else:
+                fs_max = 6554
+        else:
+            if self['ip_type'] < self.XRFDC_GEN3:
+                fs_max = 4096 # ZCU111
+            else:
+                if self['hs_adc']:
+                    fs_max = 5000
+                else:
+                    fs_max = 2500
+        fs_possible = fs_possible[fs_possible <= fs_max]
+
+        # special rules for Gen3 RFSoC DACs
+        if self['ip_type'] == self.XRFDC_GEN3 and tiletype=='dac':
+            # forbidden "hole" for Gen3 RFSoC DAC PLL
+            # https://docs.amd.com/r/en-US/ds926-zynq-ultrascale-plus-rfsoc/RF-Converters-Clocking-Characteristics
+            # actually, this is a consequence of the VCO range
+            fs_possible = fs_possible[(fs_possible<=6882) | (fs_possible>=7863)]
+
+            # in datapath mode 1, Gen3 DACs can't go above 7 Gsps
+            # https://docs.amd.com/r/en-US/pg269-rf-data-converter/RF-DAC-High-Sampling-Rates-Mode-Gen-3/DFE
+            # https://docs.amd.com/r/en-US/ds926-zynq-ultrascale-plus-rfsoc/RF-DAC-Electrical-Characteristics
+            datapaths = [self[tiletype+'s'][chname]['datapath'] for chname in tilecfg['blocks']]
+            if any([x==1 for x in datapaths]):
+                fs_possible = fs_possible[fs_possible<=7000]
+
+        fs_possible.sort()
+        return fs_possible
+
+    def round_sample_rate(self, tiletype, tile, fs_target):
+        """
+        Return the closest achievable sample rate to the requested value.
+        """
+        if tiletype not in ['dac', 'adc']:
+            raise RuntimeError('tiletype must be "dac" or "adc"')
+        if tile not in self['tiles'][tiletype]:
+            raise RuntimeError('specified tile is not enabled in this firmware')
+        fs_possible = self.valid_sample_rates(tiletype, tile)
+        fs_best = fs_possible[np.argmin(np.abs(fs_possible - fs_target))]
+        return fs_best
+
+    def _set_sample_rate(self, tiletype, tile, fs):
+        """
+        Set the sample rate of a tile.
+        It's assumed that the requested frequency has already been validated and rounded to a valid value.
+
+        Parameters
+        ----------
+        tiletype : str
+            'dac' or 'adc'
+        tile : int
+            Tile number (0-3)
+        fs : float
+            Requested sample rate, in Msps
+        """
+        self.logger.info('programming %s tile %d to %.3f Msps'%(tiletype.upper(), tile, fs))
+        f_ref = self['tiles'][tiletype][tile]['f_ref']
+        self._get_tile(tiletype, tile).DynamicPLLConfig(source=xrfdc.CLK_SRC_PLL, ref_clk_freq=f_ref, samp_rate=fs)
+
+    def configure_sample_rates(self, dac_sample_rates=None, adc_sample_rates=None):
+        """
+        Set the tile sample rates.
+        This should only be called as part of initialization.
+
+        Parameters
+        ----------
+        dac_sample_rates : dict[int, float]
+            Sample rates to override the values compiled into the firmware.
+            This should be a dictionary mapping DAC tiles to sample rates (in megasamples per second).
+        adc_sample_rates : dict[int, float]
+            Sample rates to override the values compiled into the firmware.
+            This should be a dictionary mapping ADC tiles to sample rates (in megasamples per second).
+        """
+
+        # build a dictionary for the requested fs changes
+        fs_requested = {
+            'dac': dac_sample_rates,
+            'adc': adc_sample_rates
+        }
+        for tiletype, fs_dict in fs_requested.items():
+            # handle None input
+            if fs_dict is None:
+                fs_dict = {}
+            # check that all tiles are valid
+            for iTile, fs in fs_dict.items():
+                if iTile not in self['tiles'][tiletype]:
+                    raise RuntimeError('requested to change fs for %s tile %d, which is not enabled in this firmware'%(tiletype.upper(), iTile))
+            # do a copy, since we will be modifying this dictionary
+            fs_requested[tiletype] = fs_dict.copy()
+
+        # compute the scaling to be applied to each RF tile's fs
+        fs_ratios = {}
+        for tiletype, tiles in self['tiles'].items():
+            for iTile, tilecfg in tiles.items():
+                if iTile not in fs_requested[tiletype]:
+                    fs_ratios[(tiletype, iTile)] = Fraction(1)
+                else:
+                    fs_target = fs_requested[tiletype][iTile]
+                    fs_best = self.round_sample_rate(tiletype, iTile, fs_target)
+                    fs_current = tilecfg['fs']
+                    fs_err = fs_best - fs_target
+                    self.logger.info('%s tile %d: fs requested = %f Msps, best possible = %.3f Msps, error = %.3f Msps.'%(tiletype.upper(), iTile, fs_target, fs_best, fs_err))
+                    if abs(fs_err) > 10:
+                        raise RuntimeError("%s tile %d: requested fs %f Msps is not supported, closest is %.3f."%(tiletype.upper(), iTile, fs_target, fs_best))
+                    if abs(fs_err) > 1:
+                        self.logger.warning('%s tile %d: requested fs %f.3 Msps could not be achieved, will use %f.3 Msps.'%(tiletype.upper(), iTile, fs_target, fs_best))
+                    if fs_best > fs_current+0.1:
+                        raise RuntimeError('%s tile %d: increasing a sample rate is not allowed, but requested fs (%.3f Msps) is greater than current fs (%.3f Msps)'%(tiletype.upper(), iTile, fs_best, fs_current))
+                    fs_requested[tiletype][iTile] = fs_best
+                    fs_ratios[(tiletype, iTile)] = Fraction(fs_best/fs_current).limit_denominator()
+
+        # check that linked clocks will get the same scaling
+        for fs_group in self['clk_groups']:
+            tiles = [x for x in fs_group if x[0] in ['dac', 'adc']]
+            if not tiles: continue
+            ratios = [fs_ratios[tile] for tile in tiles]
+            if len(set(ratios)) != 1:
+                tilenames = ["%s %d"%(tile[0].upper(), tile[1]) for tile in tiles]
+                ratios_f = [float(r) for r in ratios]
+                raise RuntimeError("the following RF tiles have related clocks and their sampling frequencies must be scaled by the same ratio: %s\nafter rounding your requested frequencies to the nearest valid value, you are requesting scaling by: %s"%(tilenames, ratios_f))
+
+        # now we can apply the changes
+        for tiletype, fs_dict in fs_requested.items():
+            for iTile, fs in fs_dict.items():
+                self._set_sample_rate(tiletype, iTile, fs)
+        # we changed the clocks, so refresh that info
+        self._read_freqs()
+
+    def set_mixer_freq(self, blockname, f, blocktype='dac', phase_reset=True, force=False, scale='auto'):
+        """
+        Set the NCO frequency that will be mixed with the generator output (for DAC) or raw ADC data (for ADC).
+
+        Note that the RFdc driver does its own math to round the frequency to the NCO's frequency step.
+        If you want predictable behavior, the frequency you use here should already be rounded.
+        Rounding is normally done for you as part of AbsQickProgram.declare_gen().
+
+        blockname : int
+            channel ID (2-digit string)
+        f : float
+            NCO frequency (MHz)
+        blocktype : str
+            'dac' or 'adc'
+        force: bool
+            force update, even if the setting is the same
+        phase_reset : bool
+            if we change the frequency, also reset the NCO's phase accumulator
+        scale : str
+            'auto', 'full', or 'reduced'
+            this controls the DAC output range - 'full' is the full DAC range, 'reduced' applies a 0.7 scale factor, 'auto' is the default behavior of reduced scale for fine mixer (see https://docs.amd.com/r/en-US/pg269-rf-data-converter/RF-DAC-Numerical-Controlled-Oscillator-and-Mixer, https://docs.amd.com/r/en-US/pg269-rf-data-converter/struct-XRFdc_Mixer_Settings)
+        """
+        if blocktype not in ['dac','adc']:
+            raise RuntimeError("Block type must be adc or dac")
+        blkcache = self.settings_cache[blocktype][blockname]
+
+        blk = self._get_block(blocktype, blockname)
+        # Make a copy of mixer settings.
+        blk_mixer = blk.MixerSettings.copy()
+        if blk_mixer['MixerType'] != xrfdc.MIXER_TYPE_FINE:
+            raise RuntimeError("tried to set mixer freq for %s %s, but mixer is not enabled" % (blocktype.upper(), blockname))
+
+        scalecode = {
+                'auto': xrfdc.MIXER_SCALE_AUTO,
+                'full': xrfdc.MIXER_SCALE_1P0,
+                'reduced': xrfdc.MIXER_SCALE_0P7
+                }[scale]
+        # if we wouldn't be changing any settings, return immediately
+        if all([not force, self.get_mixer_freq(blockname, blocktype) == f, self.get_mixer_scale(blockname, blocktype) == scalecode]):
+            return
+
+        self.logger.info('%s block %s: setting mixer_freq %f, mixer_scale %s'%(blocktype.upper(), blockname, f, scale))
+
+        # Update the copy
+        blk_mixer.update({
+            'EventSource': xrfdc.EVNT_SRC_IMMEDIATE,
+            'Freq': f,
+            'PhaseOffset': 0,
+            'FineMixerScale': scalecode,
+            })
+
+        # Update settings.
+        blk.MixerSettings = blk_mixer
+        blk.UpdateEvent(xrfdc.EVENT_MIXER)
+        # The phase reset is mostly important when setting the frequency to 0: you want the NCO to end up at 1 instead of a complex value.
+        # So we apply the reset after setting the new frequency (otherwise you accumulate some rotation before stopping the NCO).
+        if phase_reset: blk.ResetNCOPhase()
+
+        blkcache['mixer_freq'] = f
+        blkcache['mixer_scale'] = scalecode
+
+    def get_mixer_freq(self, blockname, blocktype='dac'):
+        if blocktype not in ['dac','adc']:
+            raise RuntimeError("Block type must be adc or dac")
+        blkcache = self.settings_cache[blocktype][blockname]
+        if 'mixer_freq' not in blkcache:
+            blk_mixer = self._get_block(blocktype, blockname).MixerSettings
+            if blk_mixer['MixerType'] != xrfdc.MIXER_TYPE_FINE:
+                raise RuntimeError("tried to get mixer freq for %s %s, but mixer is not enabled" % (blocktype.upper(), blockname))
+            f = blk_mixer['Freq']
+            self.logger.info('%s block %s: read mixer freq=%f'%(blocktype.upper(), blockname, f))
+            blkcache['mixer_freq'] = f
+        return blkcache['mixer_freq']
+
+    def get_mixer_scale(self, blockname, blocktype='dac'):
+        if blocktype not in ['dac','adc']:
+            raise RuntimeError("Block type must be adc or dac")
+        blkcache = self.settings_cache[blocktype][blockname]
+        if 'mixer_scale' not in blkcache:
+            blk_mixer = self._get_block(blocktype, blockname).MixerSettings
+            if blk_mixer['MixerType'] != xrfdc.MIXER_TYPE_FINE:
+                raise RuntimeError("tried to get mixer scale for %s %s, but mixer is not enabled" % (blocktype.upper(), blockname))
+            scalecode = blk_mixer['FineMixerScale']
+            self.logger.info('%s block %s: read mixer scale=%d'%(blocktype.upper(), blockname, scalecode))
+            blkcache['mixer_scale'] = scalecode
+        return blkcache['mixer_scale']
+
+    def set_nyquist(self, blockname, nqz, blocktype='dac', force=False):
+        """
+        Sets channel to operate in Nyquist zone nqz.
+        This setting doesn't change the DAC output frequencies:
+        you will always have some power at both the demanded frequency and its image(s).
+        Setting the NQZ to 2 increases output power in the 2nd/3rd Nyquist zones.
+        See "RF-DAC Nyquist Zone Operation" in PG269.
+
+        :param blockname: channel ID (2-digit string)
+        :type blockname: int
+        :param nqz: Nyquist zone (1 or 2)
+        :type nqz: int
+        :param blocktype: 'dac' or 'adc'
+        :type blocktype: str
+        :param force: force update, even if the setting is the same
+        :type force: bool
+        """
+        if nqz not in [1,2]:
+            raise RuntimeError("Nyquist zone must be 1 or 2")
+        if blocktype not in ['dac','adc']:
+            raise RuntimeError("Block type must be adc or dac")
+        if not force and self.get_nyquist(blockname, blocktype) == nqz:
+            return
+        self.logger.info('%s block %s: setting nqz=%d'%(blocktype.upper(), blockname, nqz))
+        blk = self._get_block(blocktype, blockname)
+        blk.NyquistZone = nqz
+        self.settings_cache[blocktype][blockname]['nqz'] = nqz
+
+    def get_nyquist(self, blockname, blocktype='dac'):
+        """
+        Get the current Nyquist zone setting for a channel.
+
+        Parameters
+        ----------
+        blockname : str
+            Channel ID (2-digit string)
+        blocktype : str
+            'dac' or 'adc'
+
+        Returns
+        -------
+        int
+            NQZ setting (1 or 2)
+        """
+        if blocktype not in ['dac','adc']:
+            raise RuntimeError("Block type must be adc or dac")
+        blkcache = self.settings_cache[blocktype][blockname]
+        if 'nqz' not in blkcache:
+            blk = self._get_block(blocktype, blockname)
+            nqz = blk.NyquistZone
+            self.logger.info('%s block %s: read nqz=%d'%(blocktype.upper(), blockname, nqz))
+            blkcache['nqz'] = nqz
+        return blkcache['nqz']
+
+    def get_adc_attenuator(self, blockname):
+        """Read the ADC's built-in step attenuator.
+
+        Only available for RFSoC Gen 3 (ZCU216, RFSoC4x2, RFSoC2x4).
+
+        Parameters
+        ----------
+        blockname : str
+            Channel ID (2-digit string)
+
+        Returns
+        -------
+        float
+            Attenuation value (dB)
+        """
+        if self['ip_type'] < self.XRFDC_GEN3:
+            raise RuntimeError("you tried to access the RF-ADC attenuator, but this only exists on Gen 3 RFSoC (ZCU216, RFSoC4x2, RFSoC2x4).")
+        adc = self._get_block('adc', blockname)
+        return adc.DSA['Attenuation']
+
+    def set_adc_attenuator(self, blockname, attenuation):
+        """Set the ADC's built-in step attenuator.
+        The requested value will be rounded to the nearest valid value (0-27 dB inclusive, 1 dB steps).
+
+        Only available for RFSoC Gen 3 (ZCU216, RFSoC4x2, RFSoC2x4).
+
+        Parameters
+        ----------
+        blockname : str
+            Channel ID (2-digit string)
+        attenuation : float
+            Attenuation value (dB)
+        """
+        if self['ip_type'] < self.XRFDC_GEN3:
+            raise RuntimeError("you tried to access the RF-ADC attenuator, but this only exists on Gen 3 RFSoC (ZCU216, RFSoC4x2, RFSoC2x4).")
+        adc = self._get_block('adc', blockname)
+        attenuation = np.round(attenuation)
+        adc.DSA['Attenuation'] = attenuation
+        return attenuation
+
+    def _round_dac_curr(self, curr):
+        """Given an output current value in uA for a Gen3 RFSoC, round it to an even multiple of the step size (43.75 uA).
+        """
+        curr_code = round((curr - self.XRFDC_MIN_I_UA_INT) / self.XRFDC_STEP_I_UA)
+        return (curr_code * self.XRFDC_STEP_I_UA + self.XRFDC_MIN_I_UA_INT)
+
+    def get_dac_curr(self, blockname):
+        """Get the output current for an RF-DAC.
+        The output amplitude scales with the current.
+
+        Parameters
+        ----------
+        blockname : str
+            Channel ID (2-digit string)
+
+        Returns
+        -------
+        float
+            Output current (mA)
+        """
+        blkcache = self.settings_cache['dac'][blockname]
+        if 'output_curr' not in blkcache:
+            iTile, iBlock = self['dacs'][blockname]['index']
+            i = xrfdc._ffi.new('unsigned int [1]')
+            xrfdc._lib.XRFdc_GetOutputCurr(self._instance, iTile, iBlock, i)
+            if self['ip_type'] == self.XRFDC_GEN3:
+                blkcache['output_curr'] = self._round_dac_curr(i[0]) / 1000.0
+            else:
+                blkcache['output_curr'] = float(i[0])
+        return blkcache['output_curr']
+
+    def set_dac_curr(self, blockname, output_curr, force=False):
+        """Set the output current for an RF-DAC in variable output power (VOP) mode.
+        The output amplitude scales with the current.
+
+        VOP mode is only available for Gen 3 RFSoCs (ZCU216, ZCU208), and must be enabled in the firmware at compile time.
+
+        Parameters
+        ----------
+        blockname : str
+            Channel ID (2-digit string)
+        float
+            Requested output current (mA)
+
+        Returns
+        -------
+        float
+            Rounded value of output current (mA)
+        """
+        if self['dac_power'] != 'VOP':
+            raise RuntimeError('You can only change the DAC output current if your firmware was compiled with the DACs set to variable output power (VOP) mode.')
+        if not force and self.get_dac_curr(blockname) == output_curr:
+            return
+        rounded = self._round_dac_curr(output_curr*1000) # convert to uA and round
+        self.logger.info('DAC %s: setting output_curr=%.3f mA (rounded to %.2f uA)'%(blockname, output_curr, rounded))
+        iTile, iBlock = self['dacs'][blockname]['index']
+        xrfdc._lib.XRFdc_SetDACVOP(self._instance, iTile, iBlock, int(rounded))
+        rounded /= 1000.0 # convert to mA
+        self.settings_cache['dac'][blockname]['output_curr'] = rounded
+        return rounded
+
+    def get_adc_cal(self, blockname):
+        """Get the current calibration coefficients for an ADC.
+
+        Parameters
+        ----------
+        blockname : str
+            Channel ID (2-digit string)
+
+        Returns
+        -------
+        dict of list
+            Calibration coefficients
+        """
+        adc = self._get_block('adc', blockname)
+        a = xrfdc._ffi.new("XRFdc_Calibration_Coefficients *")
+        cal = {}
+        for name, (const, n) in self.ADC_CAL_BLOCKS.items():
+            adc.GetCalCoefficients(const, a)
+            cal[name] = [getattr(a, 'Coeff%d'%(i)) for i in range(n)]
+        return cal
+
+    def set_adc_cal(self, blockname, cal, calblocks):
+        """Set calibration coefficients for an ADC.
+
+        See the Xilinx documentation for explanations and cautions:
+
+        https://docs.amd.com/r/en-US/pg269-rf-data-converter/Getting/Setting-Calibration-Coefficients
+
+        Parameters
+        ----------
+        blockname : str
+            Channel ID (2-digit string)
+        cal : dict of list
+            Calibration coefficients
+        calblocks : list of str
+            List of calibration blocks to configure.
+            Valid values are OCB1, OCB2, GCB, TSCB.
+
+        Returns
+        -------
+        dict of list
+            Calibration coefficients
+        """
+        adc = self._get_block('adc', blockname)
+        for name, (const, n) in self.ADC_CAL_BLOCKS.items():
+            a = xrfdc._ffi.new("XRFdc_Calibration_Coefficients *")
+            for i in range(n):
+                setattr(a, 'Coeff%d'%(i), cal[name][i])
+            adc.SetCalCoefficients(const, a)
+
+    def restart_adc_tile(self, tile):
+        """Restart an ADC tile.
+
+        This is useful as a way to rerun the OCB2 offset calibration, though of course it resets all of the calibrations.
+        WHatever voltage the ADCs on this tile are seeing when you run this, that will be 0 ADU.
+
+        Parameters
+        ----------
+        tile : int
+            ADC tile number (0-3)
+        """
+        try:
+            # unlike Reset(), StartUp() doesn't reset RFDC registers (e.g. the sample rate)
+            self.adc_tiles[tile].StartUp()
+        except Exception as e:
+            # some configurations will cause RFDC errors (e.g. a DC-coupled DC-in card with an ADC in AC-coupled mode will lead to the ADC common-mode voltage going out of range)
+            # we want to print the error but not error out
+            logger.warning(e)
+
+    def freeze_adc_cal(self, blockname):
+        """Freeze an ADC's calibration (stop the background calibration).
+
+        See the Xilinx documentation:
+
+        https://docs.amd.com/r/en-US/pg269-rf-data-converter/Background-Calibration-Process
+
+        Parameters
+        ----------
+        blockname : str
+            Channel ID (2-digit string)
+        """
+        adc = self._get_block('adc', blockname)
+        adc.CalFreeze['FreezeCalibration'] = 1
+
+    def unfreeze_adc_cal(self, blockname, calblocks=None):
+        """Unfreeze an ADC's calibration (resume the background calibration).
+
+        See the Xilinx documentation:
+
+        https://docs.amd.com/r/en-US/pg269-rf-data-converter/Background-Calibration-Process
+
+        Parameters
+        ----------
+        blockname : str
+            Channel ID (2-digit string)
+        """
+        adc = self._get_block('adc', blockname)
+        adc.CalFreeze['FreezeCalibration'] = 0
+        if calblocks is None:
+            if self['ip_type'] < self.XRFDC_GEN3:
+                calblocks = ['OCB2', 'GCB', 'TSCB']
+            else:
+                calblocks = ['OCB1', 'OCB2', 'GCB', 'TSCB']
+        for calblock in calblocks:
+            adc.DisableCoefficientsOverride(self.ADC_CAL_BLOCKS[calblock][0])
+
+class QickSoc(Overlay, QickConfig):
+    """
+    This class loads, initializes, and provides access to the QICK firmware.
+
+    Parameters
+    ----------
+    bitfile : str
+        Path to the firmware bitfile. This should end with .bit, and the corresponding .hwh file must be in the same directory.
+    download : bool
+        Load the bitfile into the FPGA logic. If you are certain that the bitfile you specified is already running, you can use False here.
+    no_tproc : bool
+        Use if this is a special firmware that doesn't have a tProcessor.
+    no_rf : bool
+        Use if this is a special firmware that doesn't have an RF data converter.
+    force_init_clks : bool
+        Re-initialize the board clocks regardless of whether they appear to be locked. Specifying (as True or False) the clk_output or external_clk options will also force clock initialization.
+    clk_output: bool or None
+        If true, output a copy of the RF reference. This option is supported for the ZCU111 (get 122.88 MHz from J108) and ZCU216/ZCU208 (get 245.76 MHz from OUTPUT_REF J10).
+    external_clk: bool or None
+        If true, lock the board clocks to an external reference. This option is supported for the ZCU111 (put 12.8 MHz on External_REF_CLK J109), ZCU216/ZCU208 (put 10 MHz on INPUT_REF_CLK J11), and RFSoC 4x2 (put 10 MHz on CLK_IN).
+    dac_sample_rates : dict[int, float] or None
+        Sample rates to override the values compiled into the firmware.
+        This should be a dictionary mapping DAC tiles to sample rates (in megasamples per second).
+    adc_sample_rates : dict[int, float] or None
+        Sample rates to override the values compiled into the firmware.
+        This should be a dictionary mapping ADC tiles to sample rates (in megasamples per second).
+    """
 
     # The following constants are no longer used. Some of the values may not match the bitfile.
-    #fs_adc = 384*8 # MHz
-    #fs_dac = 384*16 # MHz
-    #pulse_mem_len_IQ = 65536 # samples for I, Q
-    #ADC_decim_buf_len_IQ = 1024 # samples for I, Q
-    #ADC_accum_buf_len_IQ = 16384 # samples for I, Q
-    #tProc_instruction_len_bytes = 8 
+    # fs_adc = 384*8 # MHz
+    # fs_dac = 384*16 # MHz
+    # pulse_mem_len_IQ = 65536 # samples for I, Q
+    # ADC_decim_buf_len_IQ = 1024 # samples for I, Q
+    # ADC_accum_buf_len_IQ = 16384 # samples for I, Q
+    #tProc_instruction_len_bytes = 8
     #tProc_prog_mem_samples = 8000
     #tProc_prog_mem_size_bytes_tot = tProc_instruction_len_bytes*tProc_prog_mem_samples
-    #tProc_data_len_bytes = 4 
+    #tProc_data_len_bytes = 4
     #tProc_data_mem_samples = 4096
     #tProc_data_mem_size_bytes_tot = tProc_data_len_bytes*tProc_data_mem_samples
     #tProc_stack_len_bytes = 4
@@ -959,174 +942,514 @@ class QickSoc(Overlay):
     #tProc_stack_size_bytes_tot = tProc_stack_len_bytes*tProc_stack_samples
     #phase_resolution_bits = 32
     #gain_resolution_signed_bits = 16
-    
+
     # Constructor.
-    def __init__(self, bitfile=None, force_init_clks=False,ignore_version=True, **kwargs):
-        """
-        Constructor method
-        """
-        # Load bitstream.
-        if bitfile==None:
-            super().__init__(bitfile_path(), ignore_version=ignore_version, **kwargs)
-        else:
-            super().__init__(bitfile, ignore_version=ignore_version, **kwargs)
+    def __init__(self, bitfile=None, download=True, no_tproc=False, no_rf=False, force_init_clks=False, clk_output=None, external_clk=None, dac_sample_rates=None, adc_sample_rates=None, **kwargs):
+        if bitfile is None:
+            bitfile = bitfile_path()
 
-        # RF data converter (for configuring ADCs and DACs)
-        self.rf = self.usp_rf_data_converter_0
+        # Initialize the configuration
+        self._cfg = {}
+        QickConfig.__init__(self)
 
-        # Read the config to get a list of enabled ADCs and DACs, and the sampling frequencies.
-        self.list_rf_blocks(self.ip_dict['usp_rf_data_converter_0']['parameters'])
+        self['board'] = os.environ["BOARD"]
+        self['sw_version'] = get_version()
 
-        # Configure PLLs if requested, or if any ADC/DAC is not locked.
-        if force_init_clks:
-            self.set_all_clks()
-        else:
-            dac_locked = [self.rf.dac_tiles[iTile].PLLLockStatus==2 for iTile in self.dac_tiles]
-            adc_locked = [self.rf.adc_tiles[iTile].PLLLockStatus==2 for iTile in self.adc_tiles]
-            if not (all(dac_locked) and all(adc_locked)):
-                self.set_all_clks()
-                
-        # AXIS Switch to upload samples into Signal Generators.
-        self.switch_gen = self.axis_switch_gen
+        # a space to dump any additional lines of config text which you want to print in the QickConfig
+        self['extra_description'] = []
 
-        # AXIS Switch to read samples from averager.
-        self.switch_avg = self.axis_switch_avg
-        
-        # AXIS Switch to read samples from buffer.
-        self.switch_buf = self.axis_switch_buf
-        
-        # Signal generators.
+        # 1. read the config from the HWH file and (optionally) download the bitstream into the FPGA with Overlay.__init__()
+        # 2. check and (if necessary) configure the reference clocks with QickSoc.config_clocks() - there must be a loaded bitstream at this point, to check the clocks
+        # 2a. if we configure the clocks, we re-download the bitstream
+        # 3. initialize IP blocks and map connections with QickSoc.map_signal_paths() - this must be done after download, otherwise the IPs will get reset by download
+        # NOTE: the exception to this is the RFDC - we initialize that IP in step 2, because we need to check for PLL lock, but it doesn't seem to do anything stateful in its init
+
+        # PYNQ 3.0 has a bug in how it caches the .hwh metadata (https://github.com/Xilinx/PYNQ/issues/1409).
+        # We work around this by always clearing the metadata cache.
+        try:
+            from pynq.pl_server import global_state
+            global_state.clear_global_state()
+        except:
+            pass
+
+        # Read the bitstream configuration from the HWH file.
+        # We don't program the FPGA yet - we therefore cannot access any of the IP blocks, at this point we can only look at the HWH metadata.
+        Overlay.__init__(self, bitfile, ignore_version=True, download=False, **kwargs)
+
+        if not no_rf:
+            # get a sneak peek at the DAC power settings and reference clocks
+            rf_cfg = RFDC._parse_hwh(self.ip_dict['usp_rf_data_converter_0']['parameters'])
+
+            # Examine the RFDC config to find the reference clock frequency.
+            refclks = []
+            for tiletype in ['dac', 'adc']:
+                refclks.extend([v['f_ref'] for k,v in rf_cfg['tiles'][tiletype].items()])
+            if len(set(refclks)) != 1:
+                raise RuntimeError("This firmware wants RF reference clocks %s, but they must all be equal"%(refclks))
+            self['refclk_freq'] = refclks[0]
+
+            # set the board's DAC_AVTT voltage to the value appropriate for this firmware's RF-DAC output power setting (20 mA, 32 mA, or variable output power - see https://docs.amd.com/r/en-US/pg269-rf-data-converter/RF-DAC-Analog-Outputs).
+            # Rules for DAC output power and DAC_AVTT:
+            # * "A 3.0V DAC_AVTT should not be used in the 20 mA mode. This risks exceeding the maximum ratings of the device and also risks affecting device reliability."
+            # https://docs.amd.com/r/en-US/pg269-rf-data-converter/RF-DAC-Output-Current-Mode-Gen-1/Gen-2
+            # * "To use the VOP feature, the DAC_AVTT must be 3.0V."
+            # https://docs.amd.com/r/en-US/pg269-rf-data-converter/VOP-Details-Gen-3/DFE
+            #
+            # 1. figure out what DAC_AVTT value the new bitstream wants, and read the current value of DAC_AVTT
+            # 2. if we need 2.5 V, apply that now; if we need 3.0 V, apply that after bitstream download
+
+            avtt_needed = {
+                    '20mA': 2.5,
+                    '32mA': 3.0,
+                    'VOP': 3.0,
+                    }[rf_cfg['dac_power']]
+            avtt_now = read_dac_avtt()
+            logger.info("DAC_AVTT=%.3f V, the bitfile we're about to load needs %.3f V" % (avtt_now, avtt_needed))
+            if min(abs(avtt_now - 2.5), abs(avtt_now - 3.0)) > 0.1:
+                raise RuntimeError('DAC_AVTT should be 2.5 or 3.0 V, but it is %f' % (avtt_now))
+            if avtt_needed < avtt_now - 0.1:
+                logger.info('lowering DAC_AVTT before loading bitfile')
+                print('setting DAC_AVTT to %.1f V' % (avtt_needed))
+                set_dac_avtt(avtt_needed)
+
+        # If download=True, we program the FPGA.
+        if download:
+            self.download()
+
+        if not no_rf:
+            if avtt_needed > avtt_now + 0.1:
+                logger.info('raising DAC_AVTT after loading bitfile')
+                if self['board'] in ['RFSoC4x2', 'RFSoC2x4']:
+                    print('This bitfile puts the RF-DACs in %s mode which requires DAC_AVTT=%.1f V, but DAC_AVTT on the RFSoC4x2/2x4 is hard-wired at 2.5 V. The DACs will probably work anyway, but performance is not guaranteed.' % (rf_cfg['dac_power'], avtt_needed))
+                else:
+                    print('setting DAC_AVTT to %.1f V' % (avtt_needed))
+                    set_dac_avtt(avtt_needed)
+
+            # RF data converter (for configuring ADCs and DACs, and setting NCOs)
+            self.rf = self.usp_rf_data_converter_0
+            self['rf'] = self.rf.cfg
+
+        # Extract the IP connectivity information from the HWH parser and metadata.
+        self.metadata = QickMetadata(self)
+        self['fw_timestamp'] = self.metadata.timestamp
+
+        # list of objects that need to be registered for autoproxying over Pyro
+        self.autoproxy = []
+
+        # Initialize lists of IP blocks.
+        # Signal generators (anything driven by the tProc)
         self.gens = []
-
-        # Readout blocks.
-        self.readouts = []
-
+        # Constant generators
+        self.iqs = []
         # Average + Buffer blocks.
         self.avg_bufs = []
+        # Readout blocks.
+        self.readouts = []
+        # Time-tagger blocks.
+        self.time_taggers = []
+
+        if not no_rf:
+            # map the clock networks, so we can validate the requested sampling rates
+            self.rf.map_clocks(self)
+
+            # Configure xrfclk reference clocks
+            self.config_clocks(force_init_clks, clk_output, external_clk)
+
+            # Update the ADC sample rate if specified
+            if dac_sample_rates or adc_sample_rates:
+                self.rf.configure_sample_rates(dac_sample_rates, adc_sample_rates)
+
+        self.map_signal_paths(no_tproc)
+        if not no_tproc:
+            #self.tnet = self.qick_net_0
+            self._streamer = DataStreamer(self)
+            self.autoproxy.extend([self.streamer, self.tproc])
+
+    @property
+    def tproc(self):
+        return self._tproc
+    
+    @property
+    def streamer(self):
+        return self._streamer
+
+    def _get_block(self, fullpath):
+        """Return the IP block specified by its full path.
+
+        Blocks inside hierarchies have slash-separated fullpaths e.g. "rfb_control/attn_spi"
+        PYNQ has two ways to access blocks inside hierarchies: recursively (soc.rfb_control.attn_spi) or directly (getattr(soc, "rfb_control/attn_spi")).
+        Annoyingly, these are separate instances of the driver object so you have to be consistent about which you use.
+        For some types of blocks (e.g. memories) the direct access uses a modified path with slashes removed (e.g. ddr4ddr4_0 instead of ddr4/ddr4_0).
+
+        To avoid these complications, we use this method, which consistently uses recursive access.
+        """
+        block = self
+        # recurse into hierarchies, if present
+        for x in fullpath.split('/'):
+            block = getattr(block, x)
+        return block
+
+    def map_signal_paths(self, no_tproc):
+        """
+        Make lists of signal generator, readout, and buffer blocks in the firmware.
+        Also map the switches connecting the generators and buffers to DMA.
+        Fill the config dictionary with parameters of the DAC and ADC channels.
+        """
+        # Use the HWH parser to trace connectivity and deduce the channel numbering.
+        # Some blocks (e.g. DDR4) are inside hierarchies.
+        # We access these through the hierarchy (e.g. self.ddr4.axis_buffer_ddr_0)
+        # but list them using ip_dict, which has all blocks, even those inside hierarchies
+        for key, val in self.ip_dict.items():
+            if hasattr(val['driver'], 'configure_connections'):
+                self._get_block(val['fullpath']).configure_connections(self)
+
+        if not no_tproc:
+            # tProcessor, 64-bit instruction, 32-bit registers, x8 channels.
+            if 'axis_tproc64x32_x8_0' in self.ip_dict:
+                self.TPROC_VERSION = 1
+                self._tproc = self.axis_tproc64x32_x8_0
+                self._tproc.configure(self.axi_bram_ctrl_0, self.axi_dma_tproc)
+            elif 'qick_processor_0' in self.ip_dict:
+                self.TPROC_VERSION = 2
+                self._tproc = self.qick_processor_0
+                self._tproc.configure(self.axi_dma_tproc)
+            else:
+                raise RuntimeError('No tProcessor found')
+
+            self['tprocs'] = [self.tproc.cfg]
+        else:
+            self.TPROC_VERSION = 0
+
+        # temporary lists for blocks that we only expect to see once
+        ddr4_buf = []
+        mr_buf = []
 
         # Populate the lists with the registered IP blocks.
-        for key,val in self.ip_dict.items():
-            if (val['driver'] == AxisSignalGenV4):
-                self.gens.append(getattr(self,key))
-            elif (val['driver'] == AxisReadoutV2):
-                self.readouts.append(getattr(self,key))
-            elif (val['driver'] == AxisAvgBuffer):
-                self.avg_bufs.append(getattr(self,key))
+        for key, val in self.ip_dict.items():
+            if issubclass(val['driver'], AbsPulsedSignalGen):
+                self.gens.append(self._get_block(key))
+            elif val['driver'] == AxisConstantIQ:
+                self.iqs.append(self._get_block(key))
+            elif issubclass(val['driver'], AbsReadout):
+                self.readouts.append(self._get_block(key))
+            elif issubclass(val['driver'], AxisAvgBuffer):
+                self.avg_bufs.append(self._get_block(key))
+            elif issubclass(val['driver'], AxisBufferDdrV1):
+                ddr4_buf.append(self._get_block(key))
+            elif issubclass(val['driver'], MrBufferEt):
+                mr_buf.append(self._get_block(key))
+            elif val['driver'] == QICK_Time_Tagger:
+                self.time_taggers.append(self._get_block(key))
 
-        # Sanity check: we should have the same number of signal generators as DACs.
-        if len(self.dac_blocks) != len(self.gens):
-            raise RuntimeError("We have %d DACs but %d signal generators."%(len(self.dac_blocks),len(self.gens)))
+        # AxisReadoutV3 isn't a PYNQ-registered IP block, so we add it here
+        for buf in self.avg_bufs:
+            if buf.readout not in self.readouts:
+                self.readouts.append(buf.readout)
 
-        # Sanity check: we should have the same number of readouts and buffer blocks as ADCs.
-        if len(self.adc_blocks) != len(self.readouts):
-            raise RuntimeError("We have %d ADCs but %d readout blocks."%(len(self.adc_blocks),len(self.readouts)))
-        if len(self.adc_blocks) != len(self.avg_bufs):
-            raise RuntimeError("We have %d ADCs but %d avg/buffer blocks."%(len(self.adc_blocks),len(self.avg_bufs)))
-        
-        # Sort the lists by channel number.
-        # Typically they are already in order, but good to make sure?
-        self.gens.sort(key=lambda x: x.ch)
-        self.readouts.sort(key=lambda x: x.ch)
-        self.avg_bufs.sort(key=lambda x: x.ch)
+        # Sort the lists.
+        # We order gens by the tProc port number and tProc mux port number (if present).
+        # We order buffers by the switch port number.
+        # Those orderings are important, since those indices get used in programs.
+        self.gens.sort(key=lambda x:(x['tproc_ch'], x._cfg.get('tmux_ch')))
+        self.avg_bufs.sort(key=lambda x: x.switch_ch)
+        # The IQ and readout orderings aren't critical for anything.
+        self.iqs.sort(key=lambda x: x['dac'])
+        self.readouts.sort(key=lambda x: x['adc'])
 
         # Configure the drivers.
-        for gen in self.gens:
-            gen.configure(self.axi_dma_gen, self.switch_gen)
+        for i, gen in enumerate(self.gens):
+            gen.configure(i, self.rf)
+
+        for i, iq in enumerate(self.iqs):
+            iq.configure(i, self.rf)
 
         for readout in self.readouts:
-            readout.configure(self.fs_adc)
+            readout.configure(self.rf)
 
-        for buf in self.avg_bufs:
-            buf.configure(self.axi_dma_avg, self.switch_avg,
-                    self.axi_dma_buf, self.switch_buf)
+        # Filter the list of MR buffers to select the ones wired to readout blocks (discarding those wired directly to ADCs or other blocks).
+        # There should only be one.
+        mr_buf = [x for x in mr_buf if x['readouts']]
+        if len(mr_buf) == 1:
+            self.mr_buf = mr_buf[0]
+            self['mr_buf'] = self.mr_buf.cfg
+        elif len(mr_buf) > 1:
+            raise RuntimeError("found multiple MR buffers wired to readouts, which is not currently supported by the software")
 
+        # Find the DDR4 controller and buffer, if present.
+        if len(ddr4_buf) == 1:
+            self.ddr4_buf = ddr4_buf[0]
+            self['ddr4_buf'] = self.ddr4_buf.cfg
+        elif len(ddr4_buf) > 1:
+            raise RuntimeError("found multiple DDR4 buffers, which is not currently supported by the software")
 
-        # tProcessor, 64-bit instruction, 32-bit registes, x8 channels.
-        self.tproc  = self.axis_tproc64x32_x8_0
-        self.tproc.configure(self.axi_bram_ctrl_0, self.axi_dma_tproc)
+        # Fill the config dictionary with driver parameters.
+        self['gens'] = [gen.cfg for gen in self.gens]
+        self['iqs'] = [iq.cfg for iq in self.iqs]
+        self['time_taggers'] = [x.cfg for x in self.time_taggers]
 
-    def __repr__(self):
-        lines=[]
-        lines.append("\n\tGenerator switch: %d to %d"%(
-            self.switch_gen.NSL, self.switch_gen.NMI))
-        lines.append("\n\tAverager switch: %d to %d"%(
-            self.switch_avg.NSL, self.switch_avg.NMI))
-        lines.append("\n\tBuffer switch: %d to %d"%(
-            self.switch_buf.NSL, self.switch_buf.NMI))
+        # In the config, we define a "readout" as the chain of ADC+readout+buffer.
+        def merge_cfgs(bufcfg, rocfg):
+            merged = {**bufcfg, **rocfg}
+            for k in set(bufcfg.keys()) & set(rocfg.keys()):
+                del merged[k]
+                merged["avgbuf_"+k] = bufcfg[k]
+                merged["ro_"+k] = rocfg[k]
+            return merged
+        self['readouts'] = [merge_cfgs(buf.cfg, buf.readout.cfg) for buf in self.avg_bufs]
 
-        lines.append("\n\t%d DAC channels:"%(len(self.dac_blocks)))
-        for iCh, (iTile,iBlock) in enumerate(self.dac_blocks):
-            lines.append("\t%d:\ttile %d, channel %d, fs=%.3f GHz"%(iCh,iTile,iBlock,
-                self.rf.dac_tiles[iTile].blocks[iBlock].BlockStatus['SamplingFreq']))
-
-        lines.append("\n\t%d ADC channels:"%(len(self.adc_blocks)))
-        for iCh, (iTile,iBlock) in enumerate(self.adc_blocks):
-            lines.append("\t%d:\ttile %d, channel %d, fs=%.3f GHz"%(iCh,iTile,iBlock,
-                self.rf.adc_tiles[iTile].blocks[iBlock].BlockStatus['SamplingFreq']))
-
-        lines.append("\n\t%d signal generators: max length %d samples"%(len(self.gens),
-            self.gens[0].MAX_LENGTH))
-
-        lines.append("\n\t%d readout blocks"%(len(self.readouts)))
-
-        lines.append("\n\t%d average+buffer blocks: max length %d samples (averages), %d (decimated buffer)"%(len(self.avg_bufs),
-            self.avg_bufs[0].AVG_MAX_LENGTH, 
-            self.avg_bufs[0].BUF_MAX_LENGTH))
-
-        lines.append("\n\ttProc: %d words program memory, %d words data memory"%(2**self.tproc.PMEM_N, 2**self.tproc.DMEM_N))
-
-        return "\nQICK configuration:\n"+"\n".join(lines)
-
-    def list_rf_blocks(self, rf_config):
+    def config_clocks(self, force_init_clks, clk_output, external_clk):
         """
-        Lists the enabled ADCs and DACs and get the sampling frequencies.
-        XRFdc_CheckBlockEnabled in xrfdc_ap.c is not accessible from the Python interface to the XRFdc driver.
-        This re-implements that functionality.
+        Configure PLLs if requested, or if any ADC/DAC is not locked.
+        The ADC/DAC PLL lock status is read through the RFDC IP, so this assumes that the bitstream has already been downloaded.
+        The reference clock frequency must already have been read from the firmware config.
         """
+        # if we're changing the clock config, we must set the clocks to apply the config
+        if force_init_clks or (external_clk is not None) or (clk_output is not None):
+            print("configuring reference clock chips, as requested")
+            self.set_all_clks(clk_output, external_clk)
+        else:
+            # only set clocks if the RFDC isn't locked
+            if not self.clocks_locked():
+                print("RFSoC PLLs are not locked, configuring reference clock chips (this is normal after power cycle)")
+                self.set_all_clks(clk_output, external_clk)
+        # Check if all DAC and ADC PLLs are locked.
+        if not self.clocks_locked():
+            print(
+                "Not all DAC and ADC PLLs are locked. The FPGA may not be getting a good reference clock from the on-board clock chips.")
 
-        hs_adc = rf_config['C_High_Speed_ADC']=='1'
+    def clocks_locked(self):
+        """
+        Checks whether the DAC and ADC PLLs are locked.
+        This can only be run after the bitstream has been downloaded.
+        A failure usually means the FPGA is not getting a good reference clock from the on-board clock chips.
 
-        self.dac_tiles = []
-        self.dac_blocks = []
-        self.adc_tiles = []
-        self.adc_blocks = []
+        :return: clock status
+        :rtype: bool
+        """
+        lockdict = self.rf.clocks_locked()
+        for tiletype in ['dac', 'adc']:
+            if not all(list(lockdict[tiletype].values())):
+                return False
+        return True
 
-        for iTile,tile in enumerate(self.rf.dac_tiles):
-            if rf_config['C_DAC%d_Enable'%(iTile)]!='1':
-                continue
-            self.dac_tiles.append(iTile)
-            for iBlock,block in enumerate(tile.blocks):
-                if rf_config['C_DAC_Slice%d%d_Enable'%(iTile,iBlock)]!='true':
-                    continue
-                self.dac_blocks.append((iTile,iBlock))
-
-        for iTile,tile in enumerate(self.rf.adc_tiles):
-            if rf_config['C_ADC%d_Enable'%(iTile)]!='1':
-                continue
-            self.adc_tiles.append(iTile)
-            for iBlock,block in enumerate(tile.blocks):
-                if hs_adc:
-                    if iBlock>=2 or rf_config['C_ADC_Slice%d%d_Enable'%(iTile,2*iBlock)]!='true':
-                        continue
-                else:
-                    if rf_config['C_ADC_Slice%d%d_Enable'%(iTile,iBlock)]!='true':
-                        continue
-                self.adc_blocks.append((iTile,iBlock))
-
-        # Assume all DACs and ADCs each share a common sampling frequency, so we only need to check the first one.
-        # We assume the sampling frequencies are integers in MHz.
-        iTile,iBlock = self.dac_blocks[0]
-        self.fs_dac = int(self.rf.dac_tiles[iTile].blocks[iBlock].BlockStatus['SamplingFreq']*1000)
-        iTile,iBlock = self.adc_blocks[0]
-        self.fs_adc = int(self.rf.adc_tiles[iTile].blocks[iBlock].BlockStatus['SamplingFreq']*1000)
-
-    def set_all_clks(self):
+    def set_all_clks(self, clk_output, external_clk):
         """
         Resets all the board clocks
         """
-        print("resetting clocks:",self.__class__.FREF_PLL)
-        xrfclk.set_all_ref_clks(self.__class__.FREF_PLL)
-    
+        if self['board'] == 'ZCU111':
+            # master clock generator is LMK04208, always outputs 122.88
+            # DAC/ADC are clocked by LMX2594
+            # available: 102.4, 204.8, 409.6, 737.0
+            lmk_freq = 122.88
+            lmx_freq = self['refclk_freq']
+            print("LMK04208 clock reference = %.3f MHz, LMX2594 clock synth = %.3f MHz" % (lmk_freq, lmx_freq))
+
+            if hasattr(xrfclk, "xrfclk"): # pynq 2.7
+                # load the default clock chip configurations from file, so we can then modify them
+                xrfclk.xrfclk._find_devices()
+                xrfclk.xrfclk._read_tics_output()
+                if clk_output:
+                    # change the register for the LMK04208 chip's 5th output, which goes to J108
+                    # we need this for driving the RF board
+                    xrfclk.xrfclk._Config['lmk04208'][lmk_freq][6] = 0x00140325
+                if external_clk:
+                    # default value is 0x2302886D
+                    xrfclk.xrfclk._Config['lmk04208'][lmk_freq][14] = 0x2302826D
+            else: # pynq 2.6
+                if clk_output:
+                    # change the register for the LMK04208 chip's 5th output, which goes to J108
+                    # we need this for driving the RF board
+                    xrfclk._lmk04208Config[lmk_freq][6] = 0x00140325
+                else: # restore the default
+                    xrfclk._lmk04208Config[lmk_freq][6] = 0x80141E05
+                if external_clk:
+                    xrfclk._lmk04208Config[lmk_freq][14] = 0x2302826D
+                else: # restore the default
+                    xrfclk._lmk04208Config[lmk_freq][14] = 0x2302886D
+            xrfclk.set_all_ref_clks(lmx_freq)
+        elif self['board'] in ['ZCU208', 'ZCU216']:
+            # master clock generator is LMK04828, which is used for DAC/ADC clocks
+            # only 245.76 available by default
+            # LMX2594 is not used
+            # available: 102.4, 204.8, 409.6, 491.52, 737.0
+            lmk_freq = self['refclk_freq']
+            lmx_freq = self['refclk_freq']*2
+            print("LMK04828 clock reference = %.3f MHz, LMX2594 clock synth = %.3f MHz" % (lmk_freq, lmx_freq))
+
+            assert hasattr(xrfclk, "xrfclk") # ZCU216 only has a pynq 2.7 image
+            xrfclk.xrfclk._find_devices()
+            xrfclk.xrfclk._read_tics_output()
+            if external_clk:
+                # default value is 0x01471A
+                xrfclk.xrfclk._Config['lmk04828'][lmk_freq][80] = 0x01470A
+            if clk_output:
+                # default value is 0x012C22
+                xrfclk.xrfclk._Config['lmk04828'][lmk_freq][55] = 0x012C02
+            xrfclk.set_ref_clks(lmk_freq=lmk_freq, lmx_freq=lmx_freq)
+        elif self['board'] in ['RFSoC4x2', 'RFSoC2x4']:
+            # master clock generator is LMK04828, always outputs 245.76
+            # DAC/ADC are clocked by LMX2594
+            # available: 102.4, 204.8, 409.6, 491.52, 737.0
+            lmk_freq = 245.76
+            lmx_freq = self['refclk_freq']
+            print("LMK04828 clock reference = %.3f MHz, LMX2594 clock synth = %.3f MHz" % (lmk_freq, lmx_freq))
+
+            assert hasattr(xrfclk, "xrfclk") # RFSoC4x2 only has a pynq 3.0 image
+            xrfclk.xrfclk._find_devices()
+            xrfclk.xrfclk._read_tics_output()
+            if external_clk:
+                # default value is 0x01471A
+                xrfclk.xrfclk._Config['lmk04828'][lmk_freq][80] = 0x01470A
+            xrfclk.set_ref_clks(lmk_freq=lmk_freq, lmx_freq=lmx_freq)
+
+        # wait for the clock chips to lock
+        time.sleep(1.0)
+        # initialize the FPGA
+        self.download()
+        # or: force the tile PLLs to relock
+        #self.rf.restart_all_tiles()
+        # or: reset PL, wait for reset
+        #self.pl_reset(reinit=False)
+        #time.sleep(1.0)
+
+    def pl_reset(self, reinit=True):
+        """Reset all firmware IP blocks.
+        This pulses the pl_resetn0 line from the PS (also known as the "fabric reset" or the "PS-PL reset").
+        Every firmware block's reset logic is triggered by this pulse.
+        The main visible effect of this reset is to reset the start times of all the phase-coherent DDS oscillators.
+
+        Some firmware blocks have startup code in their __initialize__() to configure the block after the firmware is loaded.
+        That configuration gets wiped out by a PL reset, so this method also re-configures those blocks.
+
+        More info on the PL reset:
+        The reset sequence is defined in psu_ps_pl_reset_config_data() in psu_init.c.
+        You can find this in the BSP or the firmware project files.
+        The reset sequence and the memory addresses invovled appear to be the same for all RFSoCs.
+
+        https://support.xilinx.com/s/article/68962
+        https://support.xilinx.com/s/question/0D52E00006lLhBnSAK/zynq-ultrascale-howto-reset-the-pl
+        https://docs.amd.com/r/en-US/ug1137-zynq-ultrascale-mpsoc-swdev/GPIO-Reset-to-PL
+        https://docs.amd.com/r/en-US/pg201-zynq-ultrascale-plus-processing-system/Fabric-Reset-Enable
+
+        Parameters
+        ----------
+        reinit : bool
+            Reinitialize firmware blocks. False is OK if you haven't run map_signal_paths() yet (which triggers block initialization).
+        """
+        base_addr = 0xFF0A0000
+        logger.debug("base addr: %#010x" % (base_addr))
+
+        length = 0x400 # bytes
+
+        # Align the base address with the pages
+        virt_base = base_addr & ~(mmap.PAGESIZE - 1)
+
+        # Calculate base address offset w.r.t the base address
+        virt_offset = base_addr - virt_base
+        mmap_file = os.open("/dev/mem", os.O_RDWR | os.O_SYNC)
+
+        mem = mmap.mmap(
+            mmap_file,
+            length + virt_offset,
+            mmap.MAP_SHARED,
+            mmap.PROT_READ | mmap.PROT_WRITE,
+            offset=virt_base,
+        )
+        os.close(mmap_file)
+        array = np.frombuffer(mem, np.uint32, length >> 2, virt_offset)
+        logger.debug(array)
+
+        def mask_write(offset, mask, val):
+            index = (offset - base_addr) >> 2
+            regval = array[index]
+            logger.debug("initial\t%#010x" % (regval))
+            regval &= ~(mask)
+            logger.debug("masked\t%#010x" % (regval))
+            regval |= (val & mask)
+            logger.debug("final\t%#010x" % (regval))
+            array[index] = regval
+
+        GPIO_MASK_DATA_5_MSW_OFFSET = 0XFF0A002C
+        GPIO_DIRM_5_OFFSET          = 0XFF0A0344
+        GPIO_OEN_5_OFFSET           = 0XFF0A0348
+        GPIO_DATA_5_OFFSET          = 0XFF0A0054
+
+        mask_write(GPIO_MASK_DATA_5_MSW_OFFSET, 0xFFFF0000, 0x80000000)
+        mask_write(GPIO_DIRM_5_OFFSET,          0xFFFFFFFF, 0x80000000)
+        mask_write(GPIO_OEN_5_OFFSET,           0xFFFFFFFF, 0x80000000)
+        mask_write(GPIO_DATA_5_OFFSET,          0xFFFFFFFF, 0x80000000)
+        mask_write(GPIO_DATA_5_OFFSET,          0xFFFFFFFF, 0x00000000)
+        mask_write(GPIO_DATA_5_OFFSET,          0xFFFFFFFF, 0x80000000)
+
+        if reinit:
+            for k,v in self.ip_dict.items():
+                if v['type'].startswith("xilinx.com:ip:axi_dma"):
+                    dma = getattr(self,k)
+                    dma.set_up_tx_channel()
+                    dma.set_up_rx_channel()
+
+            for x in self.readouts:
+                x.freq_reg = 0
+                x.phase_reg = 0
+                x.nsamp_reg = 10
+                x.outsel_reg = 0
+                x.mode_reg = 1
+                x.update()
+
+    def get_sample_rates(self):
+        """
+        Produce dictionaries of the current sample rates of the DAC and ADC tiles.
+        A dictionary of this form can be used to configure the sample rates at SoC initialization.
+
+        Returns
+        -------
+        dict[str, dict[int, float]]
+            A pair of dictionaries mapping DAC/ADC tiles to sample rates (in Msps).
+        """
+        return {tiletype: {k: v['fs'] for k,v in self['rf']['tiles'][tiletype].items()} for tiletype in ['dac', 'adc']}
+
+    def valid_sample_rates(self, tiletype, tile):
+        """
+        Return an array of valid sample rates.
+        This does not account for dependencies due to clock groups,
+        or the restriction that you're not allowed to raise the sample rate.
+
+        Parameters
+        ----------
+        tiletype : str
+            'dac' or 'adc'
+        tile : int
+            Tile number (0-3)
+
+        Returns
+        -------
+        numpy.ndarray
+            Array of sample rates, in Msps
+        """
+        return self.rf.valid_sample_rates(tiletype, tile)
+
+    def round_sample_rate(self, tiletype, tile, fs_target):
+        """
+        Return the closest achievable sample rate to the requested value.
+        This does not account for dependencies due to clock groups,
+        or the restriction that you're not allowed to raise the sample rate.
+
+        Parameters
+        ----------
+        tiletype : str
+            'dac' or 'adc'
+        tile : int
+            Tile number (0-3)
+        fs_target : float
+            Requested sample rate, in Msps
+
+        Returns
+        -------
+        float
+            Closest valid sample rate, in Msps
+        """
+        return self.rf.round_sample_rate(tiletype, tile, fs_target)
+
     def get_decimated(self, ch, address=0, length=None):
         """
         Acquires data from the readout decimated buffer
@@ -1138,19 +1461,15 @@ class QickSoc(Overlay):
         :param length: Buffer transfer length
         :type length: int
         :return: List of I and Q decimated arrays
-        :rtype: list
+        :rtype: list of numpy.ndarray
         """
         if length is None:
             # this default will always cause a RuntimeError
             # TODO: remove the default, or pick a better fallback value
-            length = self.avg_bufs[ch].BUF_MAX_LENGTH
-        if length %2 != 0:
-            raise RuntimeError("Buffer transfer length must be even number.")
-        if length >= self.avg_bufs[ch].BUF_MAX_LENGTH:
-            raise RuntimeError("length=%d longer or equal to %d"%(length, self.avg_bufs[ch].BUF_MAX_LENGTH))
-        buff = allocate(shape=length, dtype=np.int32)
-        [di,dq]=self.avg_bufs[ch].transfer_buf(buff,address,length)
-        return [np.array(di,dtype=float),np.array(dq,dtype=float)]
+            length = self.avg_bufs[ch]['buf_maxlen']
+
+        # request data from DMA
+        return self.avg_bufs[ch].transfer_buf(address, length)
 
     def get_accumulated(self, ch, address=0, length=None):
         """
@@ -1169,167 +1488,817 @@ class QickSoc(Overlay):
         if length is None:
             # this default will always cause a RuntimeError
             # TODO: remove the default, or pick a better fallback value
-            length = self.avg_bufs[ch].AVG_MAX_LENGTH
-        if length %2 != 0:
-            raise RuntimeError("Buffer transfer length must be even number.")
-        if length >= self.avg_bufs[ch].AVG_MAX_LENGTH:
-            raise RuntimeError("length=%d longer than %d"%(length, self.avg_bufs[ch].AVG_MAX_LENGTH))
-        buff = allocate(shape=length, dtype=np.int64)
-        di,dq = self.avg_bufs[ch].transfer_avg(buff,address=address,length=length)
+            length = self.avg_bufs[ch]['avg_maxlen']
 
-        return np.array(di), np.array(dq) #[np_buffi,np_buffq]
+        # request data from DMA
+        return self.avg_bufs[ch].transfer_avg(address, length)
 
-    def start(self):
-        """Start the tprocessor"""
-        return self.tproc.start()
+    def configure_readout(self, ch, ro_regs):
+        """Configure readout channel output style and frequency.
+        This method is only for use with PYNQ-configured readouts.
 
-    def stop(self):
-        """Stop the tprocessor"""
-        return self.tproc.stop()
-
-    def single_read(self, addr):
-        """Read single value from data memory
-        
-        :param addr: Address of data memory to read
-        :type addr: int
-        :return: value at data address 'addr' 
-        :rtype: int
-
+        Parameters
+        ----------
+        ch : int
+            readout channel number (index in 'readouts' list)
+        ro_regs : dict
+            readout registers, from QickConfig.calc_ro_regs()
         """
-        return self.tproc.single_read(addr)
+        buf = self.avg_bufs[ch]
+        buf.readout.set_all_int(ro_regs)
 
-    def single_write(self, addr,data):
-        """Read single value from data memory
-        
-        :param addr: Address of data memory to read
-        :type addr: int
-        :param data: data to write into memory
-        :type data: int
-        """
-        return self.tproc.single_write(addr,data)
+    def config_avg(
+        self, ch, address=0, length=1,
+        edge_counting=False, high_threshold=1000, low_threshold=0):
+        """Configure accumulated buffer; must then enable using enable_buf()
 
-    def read_dmem(self, addr=0, length=100):
+        Parameters
+        ----------
+        ch : int
+            Readout channel to configure
+        address : int
+            Starting address of buffer
+        length : int
+            length of buffer (how many samples to integrate)
         """
-        Reads tProc data memory using DMA
+        avg_buf = self.avg_bufs[ch]
+        if avg_buf['has_edge_counter']:
+            avg_buf.config_avg(
+                address, length,
+                edge_counting=edge_counting, high_threshold=high_threshold, low_threshold=low_threshold)
+        else:
+            avg_buf.config_avg(address, length)
 
-        :param addr: Starting address
-        :type addr: int
-        :param length: Number of samples
-        :type length: int
-        :return: List of memory data
-        :rtype: list
-        """
-        return self.tproc.read_dmem(addr,length)
+    def config_buf(self, ch, address=0, length=1):
+        """Configure decimated buffer; must then enable using enable_buf()
 
-    def load_dmem(self, buff_in, addr=0):
+        Parameters
+        ----------
+        ch : int
+            Readout channel to configure
+        address : int
+            Starting address of buffer
+        length : int
+            length of buffer (how many samples to take)
         """
-        Writes tProc data memory using DMA
+        avg_buf = self.avg_bufs[ch]
+        avg_buf.config_buf(address, length)
 
-        :param buff_in: Input buffer
-        :type buff_in: int
-        :param addr: Starting destination address
-        :type addr: int
-        """
-        return self.tproc.load_dmem(buff_in, addr)
+    def enable_buf(self, ch, enable_avg=True, enable_buf=True):
+        """Enable capture of accumulated and/or decimated data for a buffer
 
-    def configure_readout(self, ch, output, frequency):
-        """Configure readout channel output style and frequency
-        :param ch: Channel to configure
-        :type ch: int
-        :param output: output type from 'product', 'dds', 'input'
-        :type output: str
+        Parameters
+        ----------
+        ch : int
+            Readout channel to configure
+        enable_avg : bool
+            Enable accumulated data capture
+        enable_buf : bool
+            Enable decimated data capture
         """
-        self.readouts[ch].set_out(sel=output)
-        self.readouts[ch].set_freq(frequency)
+        avg_buf = self.avg_bufs[ch]
+        avg_buf.enable(avg=enable_avg, buf=enable_buf)
 
-    def config_avg(self, ch, address=0, length=1, enable=True):
-        """Configure and optionally enable accumulation buffer
-        :param ch: Channel to configure
-        :type ch: int
-        :param address: Starting address of buffer
-        :type address: int
-        :param length: length of buffer (how many samples to take)
-        :type length: int
-        :param enable: True to enable buffer
-        :type enable: bool
-        """
-        self.avg_bufs[ch].config_avg(address, length)
-        if enable:
-            self.enable_avg(ch)
-        
-    def enable_avg(self, ch):
-        self.avg_bufs[ch].enable_avg()
-    
-    def config_buf(self, ch, address=0, length=1, enable=True):
-        """Configure and optionally enable decimation buffer
-        :param ch: Channel to configure
-        :type ch: int
-        :param address: Starting address of buffer
-        :type address: int
-        :param length: length of buffer (how many samples to take)
-        :type length: int
-        :param enable: True to enable buffer
-        :type enable: bool
-        """
-        self.avg_bufs[ch].config_buf(address, length)
-        if enable:
-            self.enable_buf(ch)
+    def load_weights(self, ch, data, addr=0):
+        """Load weights array to a weighted buffer.
 
-    def enable_buf(self, ch):
-        self.avg_bufs[ch].enable_buf()
-        
-    def load_bin_program(self, binprog):
-        return self.tproc.load_bin_program(binprog)
-
-    def get_avg_max_length(self, ch=0):
-        """Get accumulation buffer length for channel
-        :param ch: Channel
-        :type ch: int
-        :return: Length of accumulation buffer for channel 'ch'
-        :rtype: int
+        Parameters
+        ----------
+        ch : int
+            Readout channel to configure
+        data : numpy.ndarray of int16
+            array of 16-bit (I, Q) values for weights
+        address : int
+            starting address
         """
-        return self.avg_bufs[ch].AVG_MAX_LENGTH
-    
-    def load_pulse_data(self, ch, idata, qdata, addr):
-        """Load pulse data into signal generators
-        :param ch: Channel
-        :type ch: int
-        :param idata: data for ichannel
-        :type idata: ndarray(dtype=int16)
-        :param qdata: data for qchannel
-        :type qdata: ndarray(dtype=int16)
-        :param addr: address to start data at
-        :type addr: int
-        """
-        return self.gens[ch-1].load(xin_i=idata, xin_q=qdata, addr=addr)                 
+        # we may have converted to list for pyro compatiblity, so convert back to ndarray
+        data = np.array(data, dtype=np.int16)
+        self.avg_bufs[ch].load_weights(data, addr)
 
-    def set_nyquist(self, ch, nqz):
+    def load_envelope(self, ch, data, addr):
+        """Load envelope data into a signal generator.
+
+        Parameters
+        ----------
+        ch: int
+            Generator channel to configure
+        data: numpy.ndarray of int16
+            Array of (I, Q) values for pulse envelope
+        addr: int
+            Starting address
+        """
+        # we may have converted to list for pyro compatiblity, so convert back to ndarray
+        data = np.array(data, dtype=np.int16)
+        self.gens[ch].load(xin=data, addr=addr)
+
+    def set_nyquist(self, ch, nqz, force=False):
         """
         Sets DAC channel ch to operate in Nyquist zone nqz mode.
-        Channels are indexed as they are on the tProc outputs: in other words, the first DAC channel is channel 1.
-        (tProc output 0 is reserved for readout triggers and PMOD outputs)
 
-        Channel 1 : connected to Signal Generator V4, which drives DAC 228 CH0.
-        Channel 2 : connected to Signal Generator V4, which drives DAC 228 CH1.
-        Channel 3 : connected to Signal Generator V4, which drives DAC 228 CH2.
-        Channel 4 : connected to Signal Generator V4, which drives DAC 229 CH0.
-        Channel 5 : connected to Signal Generator V4, which drives DAC 229 CH1.
-        Channel 6 : connected to Signal Generator V4, which drives DAC 229 CH2.
-        Channel 7 : connected to Signal Generator V4, which drives DAC 229 CH3.
-        tiles: DAC 228: 0, DAC 229: 1
-        channels: CH0: 0, CH1: 1, CH2: 2, CH3: 3
-
-        :param ch: DAC channel
+        :param ch: DAC channel (index in 'gens' list)
         :type ch: int
         :param nqz: Nyquist zone
         :type nqz: int
-        :return: 'True' or '1' if the task was completed successfully
-        :rtype: bool
         """
-        #ch_info={1: (0,0), 2: (0,1), 3: (0,2), 4: (1,0), 5: (1,1), 6: (1, 2), 7: (1,3)}
-    
-        tile, channel = self.dac_blocks[ch-1]
-        dac_block=self.rf.dac_tiles[tile].blocks[channel]
-        dac_block.NyquistZone=nqz
-        return dac_block.NyquistZone
 
+        self.gens[ch].set_nyquist(nqz)
+
+    def set_mixer_freq(self, ch, f, ro_ch=None, phase_reset=True, fullscale=False):
+        """
+        Set mixer frequency for a signal generator.
+        If the generator does not have a mixer, you will get an error.
+
+        Parameters
+        ----------
+        ch : int
+            DAC channel (index in 'gens' list)
+        f : float
+            Mixer frequency (in MHz)
+        ro_ch : int
+            readout channel (index in 'readouts' list) for frequency matching
+            use None if you don't want mixer freq to be rounded to a valid readout frequency
+        phase_reset : bool
+            if this changes the frequency, also reset the phase (so if we go to freq=0, we end up on the real axis)
+        fullscale : bool
+            use the full DAC output range, disabling the mixer's default 0.7 scale factor (see https://docs.amd.com/r/en-US/pg269-rf-data-converter/RF-DAC-Numerical-Controlled-Oscillator-and-Mixer, https://docs.amd.com/r/en-US/pg269-rf-data-converter/struct-XRFdc_Mixer_Settings)
+        """
+        if fullscale:
+            scale = 'full'
+        else:
+            scale = 'auto'
+        if self.gens[ch].HAS_MIXER:
+            self.gens[ch].set_mixer_freq(f, ro_ch=ro_ch, phase_reset=phase_reset, scale=scale)
+        elif f != 0:
+            raise RuntimeError("tried to set a mixer frequency, but this channel doesn't have a mixer")
+
+    def set_adc_attenuator(self, blockname, attenuation):
+        """Set the RFSoC ADC's built-in step attenuator.
+        The requested value will be rounded to the nearest valid value (0-27 dB inclusive, 1 dB steps).
+
+        Only available for RFSoC Gen 3 (ZCU216, RFSoC4x2, RFSoC2x4).
+        See https://docs.amd.com/r/en-US/pg269-rf-data-converter/Digital-Step-Attenuator-Gen-3/DFE.
+
+        Parameters
+        ----------
+        blockname : str
+            RF-ADC ID (2-digit string).
+            This is the concatenation of the tile and block numbers displayed in the firmware configuration:
+            in other words, for "ADC tile 2, blk 1" the blockname is "21".
+        attenuation : float
+            Attenuation value (dB)
+
+        Returns
+        -------
+        float
+            The rounded attenuation value that was actually set (dB)
+        """
+        return self.rf.set_adc_attenuator(blockname, attenuation)
+
+    def get_adc_attenuator(self, blockname):
+        """Read the RFSoC ADC's built-in step attenuator.
+
+        Only available for RFSoC Gen 3 (ZCU216, RFSoC4x2, RFSoC2x4).
+        See https://docs.amd.com/r/en-US/pg269-rf-data-converter/Digital-Step-Attenuator-Gen-3/DFE.
+
+        Parameters
+        ----------
+        blockname : str
+            RF-ADC ID (2-digit string).
+            This is the concatenation of the tile and block numbers displayed in the firmware configuration:
+            in other words, for "ADC tile 2, blk 1" the blockname is "21".
+
+        Returns
+        -------
+        float
+            Attenuation value (dB)
+        """
+        return self.rf.get_adc_attenuator(blockname)
+
+    def freeze_adc_cals(self, blocknames):
+        """Freeze the calibrations (stop the background calibration) of a list of RFSoC ADCs.
+
+        See the Xilinx documentation:
+
+        https://docs.amd.com/r/en-US/pg269-rf-data-converter/Background-Calibration-Process
+
+        Parameters
+        ----------
+        blocknames : list of str
+            List of RF-ADC IDs (2-digit strings).
+            An ADC's ID is the concatenation of the tile and block numbers displayed in the firmware configuration:
+            in other words, for "ADC tile 2, blk 1" the blockname is "21".
+        """
+        for adc in blocknames: self.rf.freeze_adc_cal(adc)
+
+    def unfreeze_adc_cals(self, blocknames):
+        """Unfreeze the calibrations (resume the background calibration) of a list of RFSoC ADCs.
+
+        See the Xilinx documentation:
+
+        https://docs.amd.com/r/en-US/pg269-rf-data-converter/Background-Calibration-Process
+
+        Parameters
+        ----------
+        blocknames : list of str
+            List of RF-ADC IDs (2-digit strings).
+            An ADC's ID is the concatenation of the tile and block numbers displayed in the firmware configuration:
+            in other words, for "ADC tile 2, blk 1" the blockname is "21".
+        """
+        for adc in blocknames: self.rf.unfreeze_adc_cal(adc)
+
+    def clear_interrupts(self, max_attempts=5, error_on_interrupt=False, error_on_persist=True, warn=True):
+        """
+        Check all ADCs for interrupts, and attempt to clear them.
+        This is primarily useful for detecting and clearing overrange/overvoltage interrupts.
+        Note that in Gen3 RFSoCs (ZCU208/216, RFSoC4x2/2x4) the internal attenuator is automatically set while an overvoltage interrupt is asserted (https://docs.amd.com/r/en-US/pg269-rf-data-converter/Over-Amplitude-Gen-3/DFE)
+
+        https://docs.amd.com/r/en-US/pg269-rf-data-converter/XRFdc_IntrEnable
+        https://docs.amd.com/r/en-US/pg269-rf-data-converter/Interrupt-Handling
+        https://github.com/Xilinx/embeddedsw/blob/master/XilinxProcessorIPLib/drivers/rfdc/src/xrfdc_hw.h
+
+        Parameters
+        ----------
+        max_attempts : int
+            number of times to attempt to clear interrupts before giving up
+        error_on_interrupt : bool
+            if True, raise an error if any ADC has an interrupt raised
+        error_on_persist : bool
+            if True, raise an error if any ADC has an interrupt that persists after `max_attempts` clears
+        warn : bool
+            if True, interrupts that don't result in an error are logged as warnings
+
+        Returns
+        -------
+        bool
+            True if all interrupts were successfully cleared
+        """
+        # 0x0000F000 is only used by DAC, I think
+        # 0x03000000 is not used?
+        interrupt_masks = [
+            (0x0000000F, "XRFDC_IXR_FIFOUSRDAT_MASK"), # FIFO over/underflow, linked to XRFDC_ADC_FIFO_OVR_MASK?
+            (0x00000FF0, "XRFDC_ADC_IXR_DATAPATH_MASK"), # overflow/saturation in datapath (e.g. decimation), linked to XRFDC_ADC_DAT_OVR_MASK?
+            (0x00FF0000, "XRFDC_SUBADC_IXR_DCDR_MASK"), # analog input over/under full-scale range for individual sub-ADCs, linked to OVR_RANGE interrupt
+            (0x04000000, "XRFDC_ADC_OVR_VOLTAGE_MASK"), # analog input exceeding ADC safe range - gen3 RFSoC
+            (0x08000000, "XRFDC_ADC_OVR_RANGE_MASK"), # analog input exceeding ADC full-scale range
+            (0x10000000, "XRFDC_ADC_CMODE_OVR_MASK"), # analog input common-mode voltage above spec - gen3 RFSoC
+            (0x20000000, "XRFDC_ADC_CMODE_UNDR_MASK"), # analog input common-mode voltage below spec - gen3 RFSoC
+            (0x40000000, "XRFDC_ADC_DAT_OVR_MASK"),
+            (0x80000000, "XRFDC_ADC_FIFO_OVR_MASK"),
+        ]
+        arr = xrfdc._ffi.new("unsigned int [1]")
+
+        # all interrupts that were raised before or during clear_interrupts()
+        ints_ever = defaultdict(set)
+
+        for attempts in range(max_attempts):
+            ints_now = defaultdict(set)
+            for adcname, cfg in self['rf']['adcs'].items():
+                tile, block = cfg['index']
+
+                status = xrfdc._lib.XRFdc_GetIntrStatus(self.rf._instance, xrfdc._lib.XRFDC_ADC_TILE, tile, block, arr)
+                if status != 0: raise RuntimeError("error in reading interrupts: %d" % (status))
+
+                interrupts = arr[0]
+                if interrupts == 0: continue
+                for mask, name in interrupt_masks:
+                    if (mask & interrupts) != 0:
+                        interrupts &= 0xFFFFFFFF - mask
+                        ints_now[adcname].add(name)
+                if interrupts != 0: logger.warning("unrecognized interrupts on tile %s block %s: %s" %(*adcname, interrupts))
+                ints_ever[adcname].update(ints_now[adcname])
+                logger.info("attempt %d, interrupts on tile %s block %s: %s %s"%(attempts, *adcname, hex(arr[0]), ints_now[adcname]))
+
+                status = xrfdc._lib.XRFdc_IntrClr(self.rf._instance, xrfdc._lib.XRFDC_ADC_TILE, tile, block, 0xFFFFFFFF)
+                if status != 0: raise RuntimeError("error in clearing interrupts: %d" % (status))
+            if not ints_now: break
+        if ints_ever:
+            msg = "The following ADC interrupts were raised:"
+            for adcname, ints in ints_ever.items():
+                msg += "\nADC tile %s block %s: %s" %(*adcname, ints)
+            if ints_now:
+                msg += "\nThe following ADC interrupts persisted after %d clears:" % (max_attempts)
+                for adcname, ints in ints_now.items():
+                    msg += "\nADC tile %s block %s: %s" %(*adcname, ints)
+            else:
+                msg += "\nThe ADC interrupts were cleared after %d attempts." % (attempts)
+            msg += "\nMost ADC interrupts indicate that at some point the input signal to the ADC exceeded the ADC's voltage range."
+            msg += "\nYou should reduce the amplification going into the ADC; filtering may also help."
+            msg += "\nSee https://docs.amd.com/r/en-US/pg269-rf-data-converter/Interrupt-Handling"
+
+            if error_on_persist and ints_now:
+                raise ADCInterruptError(msg)
+            elif error_on_interrupt and ints_ever:
+                raise ADCInterruptError(msg)
+            else:
+                level = logging.WARNING if warn else logging.INFO
+                logger.log(level, msg)
+        return not ints_now
+
+    def config_mux_gen(self, ch, tones):
+        """Set up a list of tones all at once, using raw (integer) units.
+        If the supplied list of tones is shorter than the number supported, the extra tones will have their gains set to 0.
+
+        Parameters
+        ----------
+        ch : int
+            generator channel (index in 'gens' list)
+        tones : list of dict
+            Tones to configure.
+            This is generated by QickConfig.calc_muxgen_regs().
+        """
+        self.gens[ch].set_tones_int(tones)
+
+    def config_mux_readout(self, pfbpath, cfgs, sel=None):
+        """Set up a list of readout frequencies all at once, using raw (integer) units.
+
+        Parameters
+        ----------
+        pfbpath : str
+            Firmware path of the PFB readout being configured.
+        cfgs : list of dict
+            Readout chains to configure.
+            This is generated by QickConfig.calc_pfbro_regs().
+        sel : str
+            Output selection (if supported), default to 'product'
+        """
+        pfb = getattr(self, pfbpath)
+        if pfb.HAS_OUTSEL:
+            if sel is None: sel = 'product'
+            pfb.set_out(sel)
+        else:
+            if sel is not None:
+                raise RuntimeError("this readout doesn't support configuring sel, you have sel=%s" % (sel))
+        for cfg in cfgs:
+            pfb.set_freq_int(cfg)
+
+    def set_iq(self, ch, f, i, q, ro_ch=None, phase_reset=True):
+        """
+        Set frequency, I, and Q for a constant-IQ output.
+
+        Parameters
+        ----------
+        ch : int
+            DAC channel (index in 'gens' list)
+        f : float
+            frequency (in MHz)
+        i : float
+            I value (in range -1 to 1)
+        q : float
+            Q value (in range -1 to 1)
+        ro_ch : int
+            readout channel (index in 'readouts' list) for frequency matching
+            use None if you don't want freq to be rounded to a valid readout frequency
+        phase_reset : bool
+            if this changes the frequency, also reset the phase (so if we go to freq=0, we end up on the real axis)
+        """
+        self.iqs[ch].set_mixer_freq(f)
+        self.iqs[ch].set_iq(i, q)
+
+    def load_bin_program(self, binprog, load_mem=True):
+        """Write the program to the tProc program memory.
+
+        Parameters
+        ----------
+        binprog : numpy.ndarray or dict
+            compiled program (format depends on tProc version)
+        load_mem : bool
+            write waveform and data memory now (can do this later with reload_mem())
+        """
+        binprog = obtain(binprog)
+        # cast to ndarray
+        if self.TPROC_VERSION == 1:
+            binprog = np.array(binprog, dtype=np.uint64)
+        elif self.TPROC_VERSION == 2:
+            for mem_sel in ['pmem', 'dmem', 'wmem']:
+                if binprog[mem_sel] is not None:
+                    binprog[mem_sel] = np.array(binprog[mem_sel], dtype=np.int32)
+        self.tproc.load_bin_program(binprog, load_mem=load_mem)
+
+    def reload_mem(self):
+        """Reload the waveform and data memory, overwriting any changes made by running the program.
+        """
+        if self.TPROC_VERSION == 2:
+            self.tproc.reload_mem()
+
+    def load_mem(self, data, mem_sel='dmem', addr=0):
+        """
+        Write a block of the selected tProc memory.
+        For tProc v1 only the data memory ("dmem") is valid.
+        For tProc v2 the program, data, and waveform memory are all accessible.
+
+        Parameters
+        ----------
+        data : numpy.ndarray of int
+            Data to be loaded
+            32-bit array of shape (n, 8) for pmem and wmem, (n) for dmem
+        mem_sel : str
+            "pmem", "dmem", "wmem"
+        addr : int
+            Starting write address
+        """
+        data = np.array(data, dtype=np.int32)
+        if self.TPROC_VERSION == 1:
+            if mem_sel=='dmem':
+                self.tproc.load_dmem(data, addr)
+            else:
+                raise RuntimeError("invalid mem_sel: %s"%(mem_sel))
+        elif self.TPROC_VERSION == 2:
+            self.tproc.load_mem(mem_sel, data, addr)
+
+    def read_mem(self, length, mem_sel='dmem', addr=0):
+        """
+        Read a block of the selected tProc memory.
+        For tProc v1 only the data memory ("dmem") is valid.
+        For tProc v2 the program, data, and waveform memory are all accessible.
+
+        Parameters
+        ----------
+        length : int
+            Number of words to read
+        mem_sel : str
+            "pmem", "dmem", "wmem"
+        addr : int
+            Starting read address
+
+        Returns
+        -------
+        numpy.ndarray
+            32-bit array of shape (n, 8) for pmem and wmem, (n) for dmem
+        """
+        if self.TPROC_VERSION == 1:
+            if mem_sel=='dmem':
+                return self.tproc.read_dmem(addr, length)
+            else:
+                raise RuntimeError("invalid mem_sel: %s"%(mem_sel))
+        elif self.TPROC_VERSION == 2:
+            return self.tproc.read_mem(mem_sel, length, addr)
+
+    def start_src(self, src):
+        """
+        Sets the start source of tProc
+
+        :param src: start source "internal" or "external"
+        :type src: str
+        """
+        self.tproc.start_src(src)
+
+    def start_tproc(self):
+        """
+        Start the tProc.
+
+        If the tProc is configured for external start, this does nothing (the tProc will start on the first start signal it sees after external start is enabled).
+        """
+        if self.TPROC_VERSION == 1:
+            self.tproc.start()
+        elif self.TPROC_VERSION == 2:
+            if self.tproc.get_start_src() == 'internal':
+                self.tproc.start()
+
+    def stop_tproc(self, lazy=False):
+        """
+        Stop the tProc.
+        This is somewhat slow (tens of ms) for tProc v1.
+
+        Parameters
+        ----------
+        lazy : bool
+            Only stop the tProc if it's easy (i.e. do nothing for v1)
+        """
+        if self.TPROC_VERSION == 1:
+            if not lazy:
+                # there's no easy way to stop v1 - we need to reset and reload
+                self.tproc.reset()
+                # reload the program (since the reset will have wiped it out)
+                self.tproc.reload_program()
+        elif self.TPROC_VERSION == 2:
+            self.tproc.stop()
+
+    def clear_tproc_counter(self, addr):
+        """
+        Initialize the tProc shot counter.
+        For tProc v1, the data memory at the specified address is zeroed.
+        For tProc v2, the tProc is reset, which zeroes all registers (the address is ignored).
+
+        Typical tProc v2 programs will also initialize the counter registers at the beginning of the program, but zeroing the counter now is important to distinguish "program waiting for external start" from "program complete."
+
+        Parameters
+        ----------
+        addr : int
+            Counter address
+        """
+        if self.TPROC_VERSION == 1:
+            self.tproc.single_write(addr=addr, data=0)
+        elif self.TPROC_VERSION == 2:
+            self.tproc.reset()
+
+    def get_tproc_counter(self, addr):
+        """
+        Read the tProc shot counter.
+        For tProc V1, this accesses the data memory at the given address.
+        For tProc V2, this accesses one of the two special AXI-readable registers.
+
+        Parameters
+        ----------
+        addr : int
+            Counter address
+
+        Returns
+        -------
+        int
+            Counter value
+        """
+        if self.TPROC_VERSION == 1:
+            return self.tproc.single_read(addr=addr)
+        elif self.TPROC_VERSION == 2:
+            self.tproc.read_sel=1
+            reg = {1:'axi_r_dt1', 2:'axi_r_dt2'}[addr]
+            return getattr(self.tproc, reg)
+
+    def reset_gens(self):
+        """
+        Reset the tProc and run a minimal tProc program that drives all signal generators with 0's.
+        Useful for stopping any periodic or stdysel="last" outputs that may have been driven by a previous program.
+        """
+        # list channel numbers for all generators capable of playing arbitrary envelopes
+        # (what we actually care about is whether they can play periodic pulses, but it's the same set of gens)
+        gen_chs = [i for i, gen in enumerate(self.gens) if isinstance(gen, AbsArbSignalGen)]
+
+        if self.TPROC_VERSION == 1:
+            prog = QickProgram(self)
+            for gen in gen_chs:
+                prog.set_pulse_registers(ch=gen, style="const", mode="oneshot", freq=0, phase=0, gain=0, length=3)
+                prog.pulse(ch=gen,t=0)
+            prog.end()
+        elif self.TPROC_VERSION == 2:
+            prog = QickProgramV2(self)
+            for gen in gen_chs:
+                prog.pulse(ch=gen, name="dummypulse", t=0)
+            prog.end()
+        self.tproc.reset()
+        # this should always run with internal trigger
+        prog.run(self, start_src="internal")
+
+    def start_readout(self, total_shots, counter_addr=1, ch_list=None, reads_per_shot=1, stride=None):
+        """
+        Start a streaming readout of the accumulated buffers.
+
+        :param total_shots: Final value expected for the shot counter
+        :type total_shots: int
+        :param counter_addr: Data memory address for the shot counter
+        :type counter_addr: int
+        :param ch_list: List of readout channels
+        :type ch_list: list of int
+        :param reads_per_shot: Number of data points to expect per counter increment
+        :type reads_per_shot: list of int
+        :param stride: Default number of measurements to transfer at a time.
+        :type stride: int
+        """
+        ch_list = obtain(ch_list)
+        reads_per_shot = obtain(reads_per_shot)
+        if ch_list is None: ch_list = [0, 1]
+        if isinstance(reads_per_shot, int):
+            reads_per_shot = [reads_per_shot]*len(ch_list)
+        streamer = self.streamer
+
+        if not streamer.readout_worker.is_alive():
+            print("restarting readout worker")
+            streamer.start_worker()
+            print("worker restarted")
+
+        # if there's still a readout job running, stop it
+        if streamer.readout_running():
+            print("cleaning up previous readout: stopping tProc and streamer loop")
+            # stop the tProc
+            self.stop_tproc()
+            # tell the readout to stop (this will break the readout loop)
+            streamer.stop_readout()
+            streamer.done_flag.wait()
+            # push a dummy packet into the data queue to halt any running poll_data(), and wait long enough for the packet to be read out
+            streamer.data_queue.put((0, None))
+            time.sleep(0.1)
+            print("streamer stopped")
+        streamer.stop_flag.clear()
+
+        if streamer.data_available():
+            # flush all the data in the streamer buffer
+            print("clearing streamer buffer")
+            # read until the queue times out, discard the data
+            self.poll_data(totaltime=-1, timeout=0.1)
+            print("buffer cleared")
+
+        streamer.total_count = total_shots
+        streamer.count = 0
+
+        streamer.done_flag.clear()
+        streamer.job_queue.put((total_shots, counter_addr, ch_list, reads_per_shot, stride))
+
+    def poll_data(self, totaltime=0.1, timeout=None):
+        """
+        Get as much data as possible from the streamer data queue.
+        Stop when any of the following conditions are met:
+        * all the data has been transferred (based on the total_count)
+        * we got data, and it has been totaltime seconds since poll_data was called
+        * timeout is defined, and the timeout expired without getting new data in the queue
+        If there are errors in the error queue, raise the first one.
+
+        :param totaltime: How long to acquire data (negative value = ignore total time and total count, just read until timeout)
+        :type totaltime: float
+        :param timeout: How long to wait for the next data packet (None = wait forever)
+        :type timeout: float
+        :return: list of (data, stats) pairs, oldest first
+        :rtype: list
+        """
+        streamer = self.streamer
+
+        time_end = time.time() + totaltime
+        new_data = []
+        while (totaltime < 0) or (streamer.count < streamer.total_count and time.time() < time_end):
+            try:
+                raise RuntimeError("exception in readout loop") from streamer.error_queue.get(block=False)
+            except queue.Empty:
+                pass
+            try:
+                length, data = streamer.data_queue.get(block=True, timeout=timeout)
+                # if we stopped the readout while we were waiting for data, break out and return
+                if streamer.stop_flag.is_set() or data is None:
+                    break
+                streamer.count += length
+                new_data.append((length, data))
+            except queue.Empty:
+                break
+        return new_data
+
+    def prepare_round(self):
+        """This runs before a program starts running.
+        This is called by acquire/acquire_decimated/run_rounds; user code should not call it.
+
+        By default this does nothing, but a subclass of QickSoc may override this.
+        """
+        pass
+
+    def cleanup_round(self):
+        """This runs after a program has finished running.
+        This is called by acquire/acquire_decimated/run_rounds; user code should not call it.
+
+        By default this does nothing, but a subclass of QickSoc may override this.
+        """
+        pass
+
+    def clear_ddr4(self, length=None):
+        """Clear the DDR4 buffer, filling it with 0's.
+        This is not necessary (the buffer will overwrite old data), but may be useful for debugging.
+        Clearing the full buffer (4 GB) typically takes 4-5 seconds.
+
+        Parameters
+        ----------
+        length : int
+            Number of samples to clear (starting at the beginning of the buffer). If None, clear the entire buffer.
+        """
+        self.ddr4_buf.clear_mem(length)
+
+    def get_ddr4(self, nt, start=None):
+        """Get data from the DDR4 buffer.
+        The first samples (typically 401 or 801) of the buffer are always stale data from the previous acquisition.
+
+        Parameters
+        ----------
+        nt : int
+            Number of data transfers (each transfer is 128 or 256 decimated samples) to retrieve.
+            If start=None, the amount of data will be reduced (see below).
+        start : int
+            Number of samples to skip at the beginning of the buffer.
+            If a value is specified, the end address of the transfer window will also be incremented.
+            If None, the junk at the start of the buffer will be skipped but the end address will not be incremented.
+            This reduces the amount of data, giving you exactly the block of valid data from a DDR4 trigger with the same value of nt.
+        """
+        return self.ddr4_buf.get_mem(nt, start)
+
+    def arm_ddr4(self, ch, nt, force_overwrite=False):
+        """Prepare the DDR4 buffer to take data.
+        This must be called before starting a program that triggers the buffer.
+        Once the buffer is armed, the first trigger it receives will cause the buffer to record the specified amount of data.
+        Later triggers will have no effect.
+
+        Parameters
+        ----------
+        ch : int
+            The readout channel to record (index in 'readouts' list).
+        nt : int
+            Number of data transfers to record; the number of IQ samples/transfer (128 or 256) is printed in the QickSoc config.
+            Note that the amount of useful data is less (see ``get_ddr4``)
+        force_overwrite : bool
+            Allow a DDR4 acqusition that exceeds the DDR4 memory capacity. The memory will be used as a circular buffer:
+            later transfers will wrap around to the beginning of the memory and overwrite older data.
+        """
+        self.ddr4_buf.set_switch(self['readouts'][ch]['avgbuf_fullpath'])
+        self.ddr4_buf.arm(nt, force_overwrite)
+
+    def arm_mr(self, ch):
+        """Prepare the Multi-Rate buffer to take data.
+        This must be called before starting a program that triggers the buffer.
+        Once the buffer is armed, the first trigger it receives will cause the buffer to record until the buffer is filled.
+        Later triggers will have no effect.
+
+        Parameters
+        ----------
+        ch : int
+            The readout channel to record (index in 'readouts' list).
+        """
+        self.mr_buf.set_switch(self['readouts'][ch]['avgbuf_fullpath'])
+        self.mr_buf.disable()
+        self.mr_buf.enable()
+
+    def get_mr(self, start=None):
+        """Get data from the multi-rate buffer.
+        The first 8 samples are always stale data from the previous acquisition.
+        The transfer window always extends to the end of the buffer.
+
+        Parameters
+        ----------
+        start : int
+            Number of samples to skip at the beginning of the buffer.
+            If None, the junk at the start of the buffer is skipped.
+        """
+        return self.mr_buf.transfer(start)
+
+    def tt_arm(self, blk):
+        """Start data capture on the specified time-tagger block.
+
+        Parameters
+        ----------
+        blk : int
+            The time tagger block to arm (index in `time_taggers` list).
+        """
+        self.time_taggers[blk].disarm()
+        self.time_taggers[blk].arm()
+
+    def tt_disarm(self, blk):
+        """Stop data capture on the specified time-tagger block.
+
+        Parameters
+        ----------
+        blk : int
+            The time tagger block to arm (index in `time_taggers` list).
+        """
+        self.time_taggers[blk].disarm()
+
+    def tt_readmem(self, blk, mem):
+        """Read one of the specified time-tagger block's memories.
+        Reading a time-tagger memory clears it.
+
+        Parameters
+        ----------
+        blk : int
+            The time tagger block to read (index in `time_taggers` list).
+        mem : str
+            "ARM", "SMP", "TAG0"/"TAG1"/"TAG2"/"TAG3"
+        """
+        return self.time_taggers[blk].read_mem(mem)
+
+    def tt_reset(self, blk):
+        """Reset and flush the memories of the specified time-tagger block.
+
+        Parameters
+        ----------
+        blk : int
+            The time tagger block to reset (index in `time_taggers` list).
+        """
+        #self.time_taggers[blk].reset()
+        self.time_taggers[blk].flush_mems()
+
+    def tt_config(self, blk, threshold, wr_smp=32, filt=False, slope=False, invert=False, interp=0, deadtime=5):
+        """Configure the specified time-tagger block.
+
+        Parameters
+        ----------
+        blk : int
+            The time tagger block to flush (index in `time_taggers` list).
+        threshold : int
+            Tag threshold (-2^15 through 2^15-1).
+        wr_smp : int
+            Number of 8-sample chunks to capture per tag in the SMP memory (1 through 32).
+            If this time tagger has no SMP memory, this is ignored.
+        filt : bool
+            Trigger on signal after a 2-sample smoothing filter.
+        slope : bool
+            Trigger on slope (difference between consecutive samples), not level.
+        invert : bool
+            Trigger on inverted signal.
+        interp : int
+            Number of bits for interpolation (0 through 7).
+        deadtime : int
+            Minimum time (in fabric ticks, 8 samples) between one tag and the next (5 through 255).
+            This should be larger than the expected pulse width, otherwise you will get double-triggering on the same pulse.
+        """
+        filt = 1 if filt else 0
+        slope = 1 if slope else 0
+        invert = 1 if invert else 0
+        self.time_taggers[blk].set_config(
+                filt=filt,
+                slope=slope,
+                invert=invert,
+                wr_smp=wr_smp,
+                interp=interp
+                )
+        self.time_taggers[blk].set_dead_time(deadtime)
+        self.time_taggers[blk].set_threshold(threshold)

@@ -1,0 +1,120 @@
+# Automatically update the package version.
+# The version has the format major.minor.PR, where PR is the number of the most recent pull request.
+# This action runs automatically when a pull request is opened, or a commit is added to an open pull request.
+# https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#pull_request_target
+#
+# It checks the version number against the PR number; if it does not match, the version number is updated in a new commit.
+# The commit will be credited to the GitHub Actions user.
+# https://github.com/orgs/community/discussions/26560#discussioncomment-3252339
+# 
+# We need write access, which is only available using the pull_request_target trigger.
+# It is dangerous to have write access at the same time that you are checking out untrusted code from a PR.
+# However, we are only extracting a version number and (possibly) committing a new version number back to the PR, which is relatively safe.
+# In other words, we are doing a bad thing ("pull_request_target with an explicit PR checkout") but our workflow is safe ("Reformat and commit the code"):
+# https://securitylab.github.com/research/github-actions-preventing-pwn-requests/
+#
+# If you don't want this action to run (e.g. if you want a different version number for a certain PR), include [skip actions] in the commit message.
+# https://docs.github.com/en/actions/managing-workflow-runs/skipping-workflow-runs
+#
+# If we make a new commit in this action, the action doesn't get run on the new commit (not sure why, actually).
+# This is a problem if we want to use this as a status check.
+# The workaround is to manually apply the status at the end: ugly!
+# Using: https://docs.github.com/en/rest/commits/statuses?apiVersion=2022-11-28#create-a-commit-status
+#
+# Because this action uses the pull_request_target trigger, it's exempt from the workflow approval rules and will run automatically regardless of the submitter:
+# https://docs.github.com/en/actions/managing-workflow-runs/approving-workflow-runs-from-public-forks#about-workflow-runs-from-public-forks
+
+name: Update version
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+  statuses: write
+  checks: write
+  
+jobs:
+  update_version:
+    runs-on: ubuntu-latest
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      GH_TOKEN: ${{ github.token }}
+      VERSION_PATH: qick_lib/qick/VERSION
+      CHECK_TOKEN: ${{ secrets.CHECK_TOKEN }}
+    steps:
+    - uses: actions/checkout@v7
+    - name: Checkout pull request
+      run: gh pr checkout $PR_NUMBER
+    - name: Compare version numbers
+      run: |
+        file_version=$(cut -d '.' -f 3 "$VERSION_PATH")
+        echo "PR number: $PR_NUMBER, VERSION number: $file_version"
+        echo "file_version=$file_version" >> $GITHUB_ENV
+    - name: Debug
+      run: gh auth status
+    - name: Update VERSION if necessary
+      if: env.file_version != github.event.pull_request.number
+      run: |
+        echo "updating VERSION"
+        echo "$(cut -d '.' -f -2 $VERSION_PATH).$PR_NUMBER" > "$VERSION_PATH"
+        git config user.email "129547417+qickbot@users.noreply.github.com"
+        git config user.name "QICK actions [bot]"
+        git config push.default upstream
+        git add "$VERSION_PATH"
+        git commit -am "update version"
+        git push
+        repopath=$(git remote get-url origin|cut -d'/' -f4,5)
+        headpath=$(gh pr view --json headRepositoryOwner,headRepository -t '{{.headRepositoryOwner.login}}/{{.headRepository.name}}')
+        new_sha="$(git rev-parse HEAD)"
+        reporef="/repos/${repopath}/statuses/${new_sha}"
+        headref="/repos/${headpath}/statuses/${new_sha}"
+        echo "reporef=$reporef" >> $GITHUB_ENV
+        echo "headref=$headref" >> $GITHUB_ENV
+    - name: Set status for update commit using CLI and GITHUB_TOKEN, PR head path
+      continue-on-error: true
+      if: env.file_version != github.event.pull_request.number
+      run: |
+        gh api \
+          --method POST \
+          -H "Accept: application/vnd.github+json" \
+          -H "X-GitHub-Api-Version: 2022-11-28" \
+          "$headref" \
+          -f state='success' \
+          -f context='update_version'
+    - name: Set status for update commit using CLI and GITHUB_TOKEN, repo path
+      continue-on-error: true
+      if: env.file_version != github.event.pull_request.number
+      run: |
+        gh api \
+          --method POST \
+          -H "Accept: application/vnd.github+json" \
+          -H "X-GitHub-Api-Version: 2022-11-28" \
+          "$reporef" \
+          -f state='success' \
+          -f context='update_version'
+    - name: Set status for update commit using curl and PAT, PR head path
+      continue-on-error: true
+      if: env.file_version != github.event.pull_request.number
+      run: |
+        curl -L -X POST \
+          -H "Accept: application/vnd.github+json" \
+          -H "X-GitHub-Api-Version: 2022-11-28" \
+          -H "Authorization: Bearer $CHECK_TOKEN" \
+          "https://api.github.com${headref}" \
+          -d '{"state":"success","context":"update_version"}'
+    - name: Set status for update commit using curl and PAT, repo path
+      continue-on-error: true
+      if: env.file_version != github.event.pull_request.number
+      run: |
+        repopath=$(git remote get-url origin|cut -d'/' -f4,5)
+        curl -L -X POST \
+          -H "Accept: application/vnd.github+json" \
+          -H "X-GitHub-Api-Version: 2022-11-28" \
+          -H "Authorization: Bearer $CHECK_TOKEN" \
+          "https://api.github.com${reporef}" \
+          -d '{"state":"success","context":"update_version"}'

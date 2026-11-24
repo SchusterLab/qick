@@ -1,3 +1,12 @@
+// Description: 
+// AVG_TOP block receives an input stream of samples (s_axis), captures and stores them in an internal memory when indicated and generates two output streams, one with averaged data stored in internal memory (m0_axis) and one with averaged data as soon as it's calculated prior to internal memory (m1_axis) 
+// Capturing flow is controlled by the AVG FSM block and is initiated by an external trigger after the buffer has been enabled. Number of captured samples and address where to store them are configurable. 
+// Captured samples are internally stored in BRAM memory. 
+// Output stream is generated and controlled from the DATA_READER FSM block. Address to start reading and number of samples are configurable. It can be interfaced with an AXIS DMA module.
+//
+// Parameters:
+// N: memory depth as 2**N; B: memory data width
+//
 module avg_top (
 	// Reset and clock.
 	rstn			,
@@ -7,9 +16,10 @@ module avg_top (
 	trigger_i		,
 
 	// Data input.
+	din_valid_i		,
 	din_i			,
 
-	// Reset and clock for M_AXIS_*
+	// Reset and clock for m0_axis and m1_axis
 	m_axis_aclk		,
 	m_axis_aresetn	,
 
@@ -30,7 +40,10 @@ module avg_top (
 	AVG_LEN_REG		,
 	DR_START_REG	,
 	DR_ADDR_REG		,
-	DR_LEN_REG
+	DR_LEN_REG      ,
+	AVG_PHOTON_MODE_REG ,
+	AVG_H_THRSH_REG     ,
+	AVG_L_THRSH_REG
 	);
 
 ////////////////
@@ -50,6 +63,7 @@ input				clk;
 
 input				trigger_i;
 
+input				din_valid_i;
 input	[2*B-1:0]	din_i;
 
 input				m_axis_aclk;
@@ -70,6 +84,9 @@ input	[31:0]		AVG_LEN_REG;
 input				DR_START_REG;
 input	[N-1:0]		DR_ADDR_REG;
 input	[N-1:0]		DR_LEN_REG;
+input               AVG_PHOTON_MODE_REG;
+input   [B-1:0]     AVG_H_THRSH_REG;
+input   [B-1:0]     AVG_L_THRSH_REG;
 
 //////////////////////
 // Internal signals //
@@ -120,24 +137,28 @@ avg
 	avg_i
 	(
 		// Reset and clock.
-		.rstn		(rstn					),
-		.clk		(clk					),
+		.rstn			(rstn					),
+		.clk			(clk					),
 
 		// Trigger input.
-		.trigger_i	(trigger_i				),
+		.trigger_i		(trigger_i				),
 
 		// Data input.
-		.din_i		(din_i					),
+		.din_valid_i	(din_valid_i			),
+		.din_i			(din_i					),
 
 		// Memory interface.
-		.mem_we_o	(mem_we_int				),
-		.mem_addr_o	(mem_addra_int			),
-		.mem_di_o	(mem_di_int				),
+		.mem_we_o		(mem_we_int				),
+		.mem_addr_o		(mem_addra_int			),
+		.mem_di_o		(mem_di_int				),
 
 		// Registers.
-		.START_REG	(AVG_START_REG_resync	),
-		.ADDR_REG	(AVG_ADDR_REG			),
-		.LEN_REG	(AVG_LEN_REG			)
+		.START_REG		(AVG_START_REG_resync	),
+		.ADDR_REG		(AVG_ADDR_REG			),
+		.LEN_REG		(AVG_LEN_REG			),
+		.PHOTON_MODE_REG (AVG_PHOTON_MODE_REG),
+		.H_THRSH_REG (AVG_H_THRSH_REG       ),
+		.L_THRSH_REG (AVG_L_THRSH_REG       )
 	);
 
 // Dual port BRAM.
@@ -193,13 +214,13 @@ data_reader
     );
 
 // Output data register (dc fifo to cross domain).
-fifo_dc_axi
+fifo_dc_axi_xpm
     #(
         // Data width.
         .B	(4*B	),
         
         // Fifo depth.
-        .N	(4		)
+        .N	(16		)
     )
     fifo_i
     ( 

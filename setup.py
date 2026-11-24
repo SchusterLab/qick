@@ -5,10 +5,16 @@ https://github.com/pypa/sampleproject
 """
 
 # Always prefer setuptools over distutils
-from setuptools import setup, find_packages
+from setuptools import setup, find_namespace_packages
 import pathlib
 
 here = pathlib.Path(__file__).parent.resolve()
+
+def get_version(rel_path):
+    """
+    qick_lib/qick/VERSION is a text file containing only the version number.
+    """
+    return (here / rel_path).read_text().strip()
 
 # Get the long description from the README file
 long_description = (here / 'README.md').read_text(encoding='utf-8')
@@ -36,7 +42,7 @@ setup(
     # For a discussion on single-sourcing the version across setup.py and the
     # project code, see
     # https://packaging.python.org/en/latest/single_source_version.html
-    version='1.0.0',  # Required
+    version=get_version("qick_lib/qick/VERSION"),  # Required
 
     # This is a one-line description or tagline of what your project does. This
     # corresponds to the "Summary" metadata field:
@@ -128,7 +134,7 @@ setup(
     #
     #   py_modules=["my_module"],
     #
-    packages=find_packages(where='qick_lib'),  # Required
+    packages=find_namespace_packages(where='qick_lib'),  # Required
 
     # Specify which Python versions you support. In contrast to the
     # 'Programming Language' classifiers above, 'pip install' will check this
@@ -142,8 +148,18 @@ setup(
     #
     # For an analysis of "install_requires" vs pip's requirements files see:
     # https://packaging.python.org/en/latest/requirements.html
-    setup_requires=["numpy","cffi"],
-    install_requires=["numpy", 'pynq','tqdm'],  # Optional
+    # setup_requires=["numpy","cffi"],
+
+    # Only install pynq on the supported architectures.
+    # If you're not installing this on a Zynq, you won't be able to use qick.py (hardware interface)
+    # but qick_asm.py, averager_program.py, and the notebooks should still work.
+    # All current PYNQ OS versions use NumPy 1.xx, which is pickle-incompatible with NumPy 2.0.
+    # We may therefore lose compatibility with the QICK library on a PC running NumPy 2.0.
+    install_requires=[
+        "numpy",
+        "pynq>=2.6,<3.1; platform_machine=='aarch64' or platform_machine=='armv7l'",
+        "tqdm", # Optional
+    ],
 
     # List additional groups of dependencies here (e.g. development
     # dependencies). Users will be able to install these using the "extras"
@@ -153,15 +169,20 @@ setup(
     #
     # Similar to `install_requires` above, these must be valid existing
     # projects.
-    # extras_require={  # Optional
-    #     'dev': ['check-manifest'],
-    #     'test': ['coverage'],
-    # },
+    extras_require={
+        # install all extra optional dependencies
+        'full': ['pyro4'],
+    },
 
     # If there are data files included in your packages that need to be
     # installed, specify them here.
     package_data={  # Optional
-        'qick': ['*.bit', '*.hwh']
+        'qick': ['*.bit', '*.hwh', 'VERSION',
+                 'ipq_pynq_utils/ipq_pynq_utils/data/*.json',
+                 'ipq_pynq_utils/ipq_pynq_utils/data/*.txt',
+                 'ipq_pynq_utils/ipq_pynq_utils/data/*.h',
+                 'ipq_pynq_utils/ipq_pynq_utils/data/clockFiles/*.txt',
+                 ]
     },
     include_package_data=True,
 
@@ -195,7 +216,8 @@ setup(
     # maintainers, and where to support the project financially. The key is
     # what's used to render the link text on PyPI.
     project_urls={  # Optional
-        'Documentation': 'https://qick-docs.readthedocs.io/en/latest/',
-        'Documentation Repo': 'https://github.com/openquantumhardware/qick-docs',
+        'Source': 'https://github.com/openquantumhardware/qick',
+        'Documentation': 'https://qick-docs.readthedocs.io/latest/',
+        'Tracker': 'https://github.com/openquantumhardware/qick/issues',
     },
 )

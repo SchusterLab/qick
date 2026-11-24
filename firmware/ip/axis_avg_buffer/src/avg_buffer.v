@@ -1,8 +1,16 @@
+// Description:
+// AVG_BUFFER is a block that receives an input stream of samples (s_axis) and generates three output streams, one with processed averaged data (m0_axis) and one with raw captured data (m1_axis) and one with averaged data but prior to be stored in internal memory (sent to tProc register) (m2_axis) Captured samples are internally stored in PL memory. 
+// Capture is configured and controlled with Registers and is initiated by an external trigger after the buffer has been enabled. Number of captured samples and address where to store them are configurable.
+// Output stream generation is configured and controlled with Registers where the address to start reading data and the number of samples can be configured. Output stream can be interfaced to an AXIS-DMA module
+// 
+// Parameters:
+// N_AVG & N_BUF: memory depth as 2**N; B: memory data width
+//
 // Data is I,Q.
 // I: lower B bits.
 // Q: upper B bits.
 module avg_buffer (
-	// Reset and clock for s.
+	// Reset and clock for s_axis
 	s_axis_aclk			,
 	s_axis_aresetn		,
 
@@ -14,7 +22,7 @@ module avg_buffer (
 	s_axis_tready		,
 	s_axis_tdata		,
 
-	// Reset and clock for m0, m1 and m2.
+	// Reset and clock for m0_axis, m1_axis and m2_axis.
 	m_axis_aclk			,
 	m_axis_aresetn		,
 
@@ -39,6 +47,9 @@ module avg_buffer (
 	AVG_START_REG		,
 	AVG_ADDR_REG		,
 	AVG_LEN_REG			,
+	AVG_PHOTON_MODE_REG ,
+	AVG_H_THRSH_REG     ,
+	AVG_L_THRSH_REG     ,
 	AVG_DR_START_REG	,
 	AVG_DR_ADDR_REG		,
 	AVG_DR_LEN_REG		,
@@ -92,6 +103,9 @@ output	[4*B-1:0]	m2_axis_tdata;
 input				AVG_START_REG;
 input	[N_AVG-1:0]	AVG_ADDR_REG;
 input	[31:0]		AVG_LEN_REG;
+input               AVG_PHOTON_MODE_REG;
+input   [B-1:0]     AVG_H_THRSH_REG;
+input   [B-1:0]     AVG_L_THRSH_REG;
 input				AVG_DR_START_REG;
 input	[N_AVG-1:0]	AVG_DR_ADDR_REG;
 input	[N_AVG-1:0]	AVG_DR_LEN_REG;
@@ -140,6 +154,7 @@ avg_top
 		.trigger_i		(trigger_resync		),
 
 		// Data input.
+		.din_valid_i	(s_axis_tvalid		),
 		.din_i			(s_axis_tdata		),
 
 		// Reset and clock for M_AXIS_*
@@ -156,14 +171,17 @@ avg_top
 		.m1_axis_tvalid	(m2_axis_tvalid		),
 		.m1_axis_tready	(m2_axis_tready		),
 		.m1_axis_tdata	(m2_axis_tdata		),
-
+		
 		// Registers.
 		.AVG_START_REG	(AVG_START_REG		),
 		.AVG_ADDR_REG	(AVG_ADDR_REG		),
 		.AVG_LEN_REG	(AVG_LEN_REG		),
 		.DR_START_REG	(AVG_DR_START_REG	),
 		.DR_ADDR_REG	(AVG_DR_ADDR_REG	),
-		.DR_LEN_REG		(AVG_DR_LEN_REG		)
+		.DR_LEN_REG		(AVG_DR_LEN_REG		),
+		.AVG_PHOTON_MODE_REG (AVG_PHOTON_MODE_REG),
+		.AVG_H_THRSH_REG (AVG_H_THRSH_REG   ),
+		.AVG_L_THRSH_REG (AVG_L_THRSH_REG   )
 	);
 
 // Buffer block.
@@ -182,6 +200,7 @@ buffer_top
 		.trigger_i		(trigger_resync		),
 
 		// Data input.
+		.din_valid_i	(s_axis_tvalid		),
 		.din_i			(s_axis_tdata		),
 
 		// AXIS Master for output.
