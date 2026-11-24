@@ -114,6 +114,45 @@ point (20 reps x 10 rounds):
 - In the no-reset variant the ten rounds agree in phase to within 0.03 of a
   cycle, as expected when nothing is reset.
 
+## Simulation of the reset path (added 2026-11-24)
+
+`slab/sim/reset_path/` simulates a reset issued on one tProc clock edge
+travelling down both paths, using the real source for every block on the way:
+`cdcsync` and its XPM FIFO, `sg_translator`, the generator's FIFO and
+`ctrl_sg_v6`; and `tmux`, `cdcsync`, `sg_translator`, the readout's FIFO and
+`ctrl_dyn_ro_v1`. Clocks are the stock rates with exact ratios. It records the
+clock edge at which each sample counter is zeroed, for resets issued on each
+of the 28 slots, three passes, four choices of static clock phase.
+
+Results (simulation):
+
+| Quantity | Value |
+|---|---|
+| Generator: reset to counter zero | 24.7 to 26.3 ns, 28 distinct values 59.6 ps apart |
+| Readout: reset to counter zero | 38.6 to 41.8 ns, 7 distinct values 465 ps apart |
+| Readout minus generator | 12.4 to 16.9 ns, 28 distinct values, mean 14.5 to 14.9 ns |
+| Same slot on a later pass | identical every time |
+| Mean phase vector over the 28 slots at 5.798 GHz | 0.04 to 0.07 |
+
+What this settles:
+
+- The 28 and 7 offset counts and their spacings are exactly as derived above.
+- A given slot always gives the same result, so the crossing itself adds no
+  randomness in simulation. (Real hardware has jitter that simulation does
+  not; a slot that sits on a clock edge could still flip.)
+- Resets every shot with a period that is not a multiple of 28 cycles average
+  to 0.04 to 0.07 of full amplitude, about 0.6 to 1.1 ADU on a 16 ADU signal.
+  That is below the 1.13 ADU random floor of 200 shots, as seen in run 306.
+- The digital reset paths account for about 15 ns of the 151 ns residual. The
+  other 136 ns or so is the oscillator-to-converter pipelines, the converters,
+  the cables and cryostat, and the device.
+- After a one-off alignment the slope should repeat to within about +-2.2 ns,
+  and the phase intercept takes one of 28 values.
+
+Not modelled: the tProc's own output stage (assumed equal for the two ports),
+the register slice before the generator (modelled as one register), the
+oscillators and converters, and clock jitter.
+
 ## Answers to the five questions
 
 **1. Is the reading right?** Yes for the source. The clocks are confirmed as
@@ -135,7 +174,7 @@ It should repeat to within a few ns after each alignment (one clock of each
 domain is 1.7 and 3.3 ns). It is not computable from the configuration today:
 the library holds no latency model for these paths. A scan with the DAC
 cabled directly to the ADC would measure the firmware and converter part;
-the rest is the cryostat path. I did not count the pipeline stages.
+the rest is the cryostat path. The simulation above gives the reset-path part: about 15 ns.
 
 The phase intercept is a different matter. It changes by a large fraction of
 a cycle for each sub-ns step, so it takes a new value at every alignment.

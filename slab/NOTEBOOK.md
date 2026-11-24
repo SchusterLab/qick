@@ -9,8 +9,10 @@ results, and say where each number came from.
   ZCU216 tProc v2 block design, and analysed stored labdev runs 306 and 314.
 - Findings, evidence and proposed tests are in
   [notes/readout-phase.md](notes/readout-phase.md).
-- Not done: counting the pipeline stages to predict the residual delay; any
-  measurement on hardware.
+- Simulated the reset path with the real HDL in Vivado 2024.1's simulator
+  (`slab/sim/reset_path/`). It reproduces the 28 and 7 offsets exactly and
+  puts the reset-path part of the residual at about 15 ns of 151 ns.
+- Not done: any measurement on hardware.
 
 ## 2026-11-24: fork brought up to date
 
