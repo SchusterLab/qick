@@ -11,7 +11,13 @@
 */
 //////////////////////////////////////////////////////////////////////////////
 module qproc_ctrl # (
-   parameter TIME_READ      =  1
+   parameter TIME_READ      =  1 ,
+   // Number of t_clk cycles after which the relative phases of t_clk and the
+   // generator/readout clocks repeat (28 for the stock ZCU216 clocks).
+   // If greater than 1, a time reset takes effect only when a free-running
+   // counter of this many cycles reads zero, so time zero always falls on
+   // the same point of that pattern. 0 or 1: reset immediately (original behavior).
+   parameter TIME_SYNC_PERIOD =  0
 )(
 // Time, Core and AXI CLK & RST.
    input   wire        t_clk_i         ,
@@ -244,7 +250,22 @@ assign ctrl_t_step      = t_time_step ;
 
 // Time Control State Machine
 ///////////////////////////////////////////////////////////////////////////////
-enum {T_RST_STOP=0, T_RST_RUN=1, T_UPDT=2,  T_RUN=3, T_STOP=4, T_STEP=5} time_st_nxt, time_st;
+enum {T_RST_STOP=0, T_RST_RUN=1, T_UPDT=2,  T_RUN=3, T_STOP=4, T_STEP=5, T_RST_WAIT=6} time_st_nxt, time_st;
+
+// Free-running counter marking the common period of the clocks.
+wire time_sync_ok;
+generate
+   if (TIME_SYNC_PERIOD > 1) begin : TIME_SYNC
+      reg [$clog2(TIME_SYNC_PERIOD)-1:0] time_sync_cnt;
+      always_ff @(posedge t_clk_i)
+         if (!t_rst_ni)                                 time_sync_cnt <= 0;
+         else if (time_sync_cnt == TIME_SYNC_PERIOD-1)  time_sync_cnt <= 0;
+         else                                           time_sync_cnt <= time_sync_cnt + 1;
+      assign time_sync_ok = (time_sync_cnt == 0);
+   end else begin : NO_TIME_SYNC
+      assign time_sync_ok = 1'b1;
+   end
+endgenerate
 // Sequential Stante Machine
 always_ff @(posedge t_clk_i)
    if (!t_rst_ni)   time_st  <= T_RST_STOP;
@@ -258,7 +279,7 @@ always_comb begin
    time_st_nxt = time_st;
    //COMMON TRANSITIONS
    if       ( ctrl_t_rst_stop ) time_st_nxt = T_RST_STOP  ;
-   if       ( ctrl_t_rst_run  ) time_st_nxt = T_RST_RUN  ;
+   if       ( ctrl_t_rst_run  ) time_st_nxt = time_sync_ok ? T_RST_RUN : T_RST_WAIT ;
    else if  ( ctrl_t_updt     ) time_st_nxt = T_UPDT ;
    else if  ( ctrl_t_run      ) time_st_nxt = T_RUN ;
    else if  ( ctrl_t_stop     ) time_st_nxt = T_STOP ;
@@ -273,6 +294,13 @@ always_comb begin
          time_en_o = 1;
          time_rst_o = 1;
          time_st_nxt = T_RUN ;
+      end
+      T_RST_WAIT : begin
+         // Time is stopped (nothing is dispatched) until the common period starts.
+         // Only a stop request takes precedence.
+         if      ( ctrl_t_rst_stop | ctrl_t_stop ) ;
+         else if ( time_sync_ok )  time_st_nxt = T_RST_RUN ;
+         else                      time_st_nxt = T_RST_WAIT ;
       end
       T_UPDT : begin
          time_en_o = 1;

@@ -189,27 +189,42 @@ Ranked by cost:
    registers, so software can confirm the alignment without an RF
    measurement.
 
-## The alignment block (added 2026-11-24, simulated, not built)
+## Chosen design: resets scheduled on legal ticks (2026-11-24)
 
-`firmware/ip/axis_phrst_sync_v1` keeps every clock rate as it is. It sits on
-the tProc clock between a tProc port and the crossing, passes ordinary words
-through, and holds any word with the phase-reset bit until a free-running
-28-cycle counter reads zero (at most 65 ns). Every reset then crosses on the
-same point of the clock pattern.
+Decision (Dave): the hardware does nothing automatically to a reset word.
+Software schedules every phase reset on a legal tick, and the hardware is
+fully deterministic. An earlier block that held reset words until the next
+legal tick (`axis_phrst_sync_v1`) was dropped for this reason; it is in the
+history at the commit "Add axis_phrst_sync_v1".
 
-Simulation, with the block in front of both paths: the generator and readout
-counters are each zeroed at one position in the common period, and readout
-minus generator takes one value, for resets issued on all 28 slots and four
-static clock phases. Without the block: 28 values. The block's own testbench
-checks that reset words leave only on slot zero, that other words pass with
-zero or one cycle of latency, and that order is preserved.
+A legal tick is a tProc time that is a multiple of the common period of the
+clocks: 28 tProc cycles (65.1 ns) with the stock ZCU216 rates. The reset-path
+simulation shows that resets issued on the same slot of that period always
+land on the same offset.
 
-Costs: a pulse that carries a reset starts up to 65 ns late, and any word
-sent to the same port while one is held waits behind it. The value 28 is a
-build parameter, so it is wrong if sample rates are changed in software.
-Gating the tProc's own time zero instead was considered and dropped: the
-tProc time can also be shifted at run time, and the change would be inside
-the processor core.
+For software to know the slot, time zero has to fall on a fixed slot. That is
+the one hardware change:
+
+- `qproc_ctrl` has a new parameter `TIME_SYNC_PERIOD`. When it is 28, a time
+  reset (program start, or a time reset issued by the program) waits in a new
+  state, with time stopped and nothing dispatched, until a free-running
+  28-cycle counter reads zero. The wait is at most 65 ns and happens before
+  time zero, so every time in the program is exact. Default 0: unchanged.
+- Simulated (`slab/sim/time_sync/`): 200 starts at random times against an
+  unrelated core clock. Option on: time zero falls on 1 slot. Option off: on
+  all 28.
+
+Still to do:
+
+- Pass the parameter up through `qick_processor` and the IP packaging, and
+  expose the value to the library through the board configuration.
+- Library: place any pulse or readout configuration with a phase reset on a
+  multiple of the period, and keep the time reference on that grid (delays
+  that move the reference rounded to multiples of the period); refuse a
+  program that breaks the rule.
+- A run-time shift of the tProc time (the time-update command) by an amount
+  that is not a multiple of the period breaks the alignment. The library has
+  to refuse or round it.
 
 ## Answers to the five questions
 

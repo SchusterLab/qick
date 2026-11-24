@@ -6,9 +6,9 @@ Every difference between this fork's `main` and `openquantumhardware/qick`
 | Change | Files | Upstream status |
 |---|---|---|
 | Fork documentation and sync script | `slab/`, `CLAUDE.md` | Lab only |
-| Phase-reset alignment block `axis_phrst_sync_v1` (HDL and testbench only; not yet packaged as an IP or used in any project) | `firmware/ip/axis_phrst_sync_v1/` | Not proposed upstream yet |
+| tProc time reset aligned to the common period of the clocks: new parameter `TIME_SYNC_PERIOD` on `qproc_ctrl`, default 0 = unchanged behaviour. Not yet passed up through `qick_processor` or the IP packaging, so no build uses it. | `firmware/ip/qick_processor/src/qproc_ctrl.sv` | Not proposed upstream yet |
 
-No existing upstream file is modified.
+With `TIME_SYNC_PERIOD` at its default the firmware behaves as upstream's.
 
 ## Dropped
 
