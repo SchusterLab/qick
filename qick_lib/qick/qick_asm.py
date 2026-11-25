@@ -225,6 +225,9 @@ class QickConfig():
                         (tproc['pmem_size'], tproc['dmem_size'], tproc['wmem_size']))
                 lines.append("\t\texternal start pin: %s" % (tproc['start_pin']))
                 lines.append("\t\texternal stop pin: %s" % (tproc['stop_pin']))
+                if tproc.get('time_sync_period', 0) > 1:
+                    lines.append("\t\ttime zero aligned to %d cycles: phase resets must be on multiples of %.4f us" %
+                            (tproc['time_sync_period'], self.time_sync_period_us()))
 
         if "ddr4_buf" in self._cfg:
             buf = self['ddr4_buf']
@@ -728,6 +731,41 @@ class QickConfig():
         else:
             return to_int(obtain(us), fclk, parname='length')
 
+    def time_sync_period_us(self):
+        """The spacing of legal times for phase resets (tProc v2 with TIME_SYNC_PERIOD).
+        On firmware built with the time-sync option, time zero falls on a fixed point of the common period of the clocks,
+        and a phase reset lands on a reproducible sample only if it is issued at a multiple of that period.
+
+        Returns
+        -------
+        float
+            The period in us, or 0 if the firmware has no such period.
+        """
+        period = self['tprocs'][0].get('time_sync_period', 0)
+        if period <= 1:
+            return 0
+        return self.cycles2us(period)
+
+    def round_up_to_sync_tick(self, t):
+        """Round a time (us) up to the next legal time for a phase reset, a multiple of time_sync_period_us().
+        A time relative to the reference time is legal only if the reference time is itself on the grid.
+
+        Parameters
+        ----------
+        t : float
+            time (us)
+
+        Returns
+        -------
+        float
+            The rounded time (us), or t unchanged if the firmware has no such period.
+        """
+        period = self['tprocs'][0].get('time_sync_period', 0)
+        if period <= 1:
+            return t
+        cycles = int(np.ceil(np.round(self.us2cycles(t, as_float=True), 6)/period))*period
+        return self.cycles2us(cycles)
+
     def calc_mixer_freq(self, gen_ch, mixer_freq, nqz, ro_ch):
         """
         Set the NCO frequency that will be mixed with the generator output.
@@ -992,7 +1030,8 @@ class AbsQickProgram(ABC):
                       'reg2freq', 'reg2freq_adc',
                       'cycles2us', 'us2cycles',
                       'deg2reg', 'reg2deg',
-                      'roundfreq', 'get_maxv']
+                      'roundfreq', 'get_maxv',
+                      'time_sync_period_us', 'round_up_to_sync_tick']
 
     # if true, duration units in declare_readout and envelope definitions are in user units (float, us), not raw (int, clock ticks)
     USER_DURATIONS = False

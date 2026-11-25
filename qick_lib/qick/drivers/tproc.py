@@ -403,6 +403,8 @@ class Axis_QICK_Proc(SocIP):
         self.cfg['fifo_depth']  = pow( 2, int(description['parameters']['FIFO_DEPTH'])  )
         self.cfg['call_depth']  = int(description['parameters']['CALL_DEPTH'])
         self.cfg['debug']  = int(description['parameters']['DEBUG'])
+        # lab firmware: time resets wait for the start of this many t_clk cycles (0: off, or older firmware)
+        self.cfg['time_sync_period'] = int(description['parameters'].get('TIME_SYNC_PERIOD', 0))
 
         #Compatible with previous Version
         self.DMEM_N = int(description['parameters']['DMEM_AW']) 

@@ -3,6 +3,35 @@
 Running log for the lab fork. Newest entry first. Record dead ends as well as
 results, and say where each number came from.
 
+## 2026-11-24: library schedules phase resets on legal ticks (branch `lab/phrst-grid`)
+
+- The tProc v2 driver reads `TIME_SYNC_PERIOD` into
+  `tprocs[0]['time_sync_period']`, 0 when the firmware lacks it.
+- With a period above 1 the v2 compiler (`TimeGrid` in `asm_v2.py`) follows
+  the reference time through the macros, modulo the period, and refuses a
+  phase reset (generator pulse or readout configuration) that is not at a
+  multiple of the period from time zero. The error gives the time in cycles
+  and us and the nearest legal times. Nothing is moved.
+- Loops: a loop that runs more than once and holds a reset must move the
+  reference time by a multiple of the period per iteration. Swept delays and
+  swept reset times must have start and step on the grid. `resync()`, raw
+  TIME instructions other than `inc_ref` with a literal, and subroutines,
+  labels and jumps (unless every change of the reference time in the program
+  is a multiple of the period) make the time unknown, and a later reset is
+  refused.
+- Not checked: time changes made from the PC (`time_update`, `time_usr`),
+  waveforms edited at run time (`write_wmem` setting the reset bit), raw
+  `WPORT_WR` instructions, and periodic-mode pulses keeping a generator busy.
+- Helpers: `time_sync_period_us()`, `round_up_to_sync_tick(t)`,
+  `delay(..., align=True)` and `delay_auto(..., align=True)`.
+- `AveragerProgramV2` with its default delays (1 us initial delay) is not on
+  the grid; per-shot resets need `initial_delay=round_up_to_sync_tick(...)`
+  and the final delay done with `align=True`. A reset sent once before the
+  loops needs nothing else.
+- Off-board tests: `slab/tests/test_phrst_grid.py`, 29 passing, on the saved
+  testbench config. The reference programs for "no period, no change" were
+  compiled with the library on `main` before the change. Not run on a board.
+
 ## 2026-11-24: first firmware builds in Vivado 2024.1
 
 Both builds: default implementation strategy, about 3 hours each, bitstream

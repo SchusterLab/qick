@@ -873,6 +873,10 @@ class Delay(TimedMacro):
                 delay = None
             else:
                 delay += max_t
+        if getattr(self, 'align', False) and delay is not None and prog.time_sync_period_us() > 0:
+            if delay.is_sweep():
+                raise RuntimeError("a delay with align=True can't be swept, but this one is %s" % (delay))
+            delay = QickParam(prog.round_up_to_sync_tick(float(delay)))
         delay_rounded = self.convert_time(prog, delay, "t")
         prog.decrement_timestamps(delay_rounded)
     def expand(self, prog):
@@ -997,6 +1001,11 @@ class Pulse(TimedMacro):
             prog.set_timestamp(t + pulse_length, gen_ch=self.ch)
         else:
             if t<ts:
+                if prog._time_grid is not None and prog._time_grid.has_phrst(pulse, gen_ch=self.ch):
+                    # the generator would apply the reset when the previous pulse ends, not at t
+                    t_max = t.maxval() if isinstance(t, QickParam) else t
+                    ts_min = ts.minval() if isinstance(ts, QickParam) else ts
+                    raise RuntimeError("pulse '%s' on gen %d has a phase reset, but its time (%.4f us) is before the end of the previous pulse on that generator (%.4f us)"%(self.name, self.ch, t_max, ts_min))
                 logger.warn("warning: pulse time %s appears to conflict with previous pulse ending at %s?"%(t, ts))
                 prog.set_timestamp(ts + pulse_length, gen_ch=self.ch)
             else:
@@ -1127,6 +1136,164 @@ class Trigger(TimedMacro):
                 insts.append(AsmInst(inst={'CMD':'TRIG', 'SRC':'clr', 'DST':str(outport)}, addr_inc=1))
                 if imm_time: insts[-1].inst['TIME'] = '@'+str(t_reg+width_reg)
         return insts
+
+class TimeGrid:
+    """Checks that every phase reset is issued on a legal tick.
+
+    On firmware with a time-sync period (the tProc parameter TIME_SYNC_PERIOD), time zero falls on a fixed point of the common period of the tProc, generator and readout clocks.
+    A phase reset lands on a reproducible sample only if it is issued at an absolute tProc time (reference time + t) that is a multiple of that period.
+    This class follows the reference time through the macro list during preprocessing and raises an error for any phase reset that is not on a legal tick, or whose time is not known at compile time.
+    Nothing is moved: a program that breaks the rule is refused.
+
+    It is only used if the period is greater than 1; otherwise the compiler does not create one.
+    """
+    PHRST_BIT = 0b010000
+    BRANCHES = {Label: 'label', Jump: 'jump', Call: 'call', CondJump: 'cond_jump'}
+
+    def __init__(self, prog, period):
+        self.prog = prog
+        self.period = period
+        # reference time (cycles) in the first iteration of every loop, None if not known at compile time
+        self.ref = 0
+        self.why = None
+        # open loops, innermost last
+        self.loops = []
+        # first label/jump/call, first phase reset, first change of the reference time that is not a known multiple of the period
+        self.branch = None
+        self.first_phrst = None
+        self.off_grid = None
+
+    def _fmt(self, cycles):
+        return "%d cycles (%.4f us)" % (cycles, self.prog.cycles2us(cycles))
+
+    def _period_str(self):
+        return "the time-sync period of %s" % (self._fmt(self.period))
+
+    def _bad_step(self, raw):
+        # first loop where a swept value (QickRawParam) steps by a non-multiple of the period
+        for loop, steps in raw.steps.items():
+            if steps['step'] % self.period:
+                return loop, steps['step']
+        return None
+
+    def has_phrst(self, pulse, gen_ch=None):
+        if gen_ch is not None and not isinstance(self.prog._gen_mgrs[gen_ch], StandardGenManager):
+            # for muxed generators this bit of the config word is a tone mask bit
+            return False
+        return any(int(self.prog._get_wave(w).conf) & self.PHRST_BIT for w in pulse.get_wavenames())
+
+    def set_unknown(self, why):
+        self.ref = None
+        self.why = why
+        if self.off_grid is None: self.off_grid = why
+
+    def shift(self, cycles, what):
+        # cycles is an int or a stepped QickRawParam
+        if isinstance(cycles, QickRawParam):
+            bad = self._bad_step(cycles)
+            if bad is not None:
+                self.set_unknown("%s is swept in loop '%s' with step %d cycles, not a multiple of %d" % (what, bad[0], bad[1], self.period))
+                return
+            cycles = cycles.start
+        if cycles % self.period and self.off_grid is None:
+            self.off_grid = "%s moves the reference time by %d cycles, not a multiple of %d" % (what, cycles, self.period)
+        if self.ref is not None:
+            self.ref += cycles
+
+    def open_loop(self, name, count):
+        self.loops.append({'name': name, 'count': count, 'ref0': self.ref, 'phrst': None})
+
+    def close_loop(self):
+        loop = self.loops.pop()
+        body = None
+        if self.ref is not None and loop['ref0'] is not None:
+            body = self.ref - loop['ref0']
+        if loop['count'] > 1 and loop['phrst'] is not None:
+            if body is None:
+                raise RuntimeError("%s has a phase reset inside loop '%s', and the time taken by one iteration of that loop is not known at compile time (%s), so the reset would not be on a legal tick in later iterations"
+                        % (loop['phrst'], loop['name'], self.why))
+            if body % self.period:
+                raise RuntimeError("%s has a phase reset inside loop '%s', and one iteration of that loop moves the reference time by %s, which is not a multiple of %s; the reset would land on a different tick in each iteration. "
+                        "Make the loop body a multiple of the period, e.g. with delay_auto(..., align=True)."
+                        % (loop['phrst'], loop['name'], self._fmt(body), self._period_str()))
+        if body is not None:
+            self.ref = loop['ref0'] + loop['count']*body
+
+    def check(self, what, t):
+        # what: description of the instruction; t: its time relative to the reference, int or QickRawParam (cycles)
+        for loop in self.loops:
+            if loop['phrst'] is None: loop['phrst'] = what
+        if self.first_phrst is None: self.first_phrst = what
+        if self.ref is None:
+            raise RuntimeError("%s has a phase reset, but its absolute tProc time is not known at compile time: %s" % (what, self.why))
+        if isinstance(t, QickRawParam):
+            bad = self._bad_step(t)
+            if bad is not None:
+                raise RuntimeError("%s has a phase reset, and its time is swept in loop '%s' with step %d cycles, which is not a multiple of %s"
+                        % (what, bad[0], bad[1], self._period_str()))
+            t = t.start
+        t_abs = self.ref + t
+        off = t_abs % self.period
+        if off:
+            lo = t_abs - off
+            hi = lo + self.period
+            loopnote = " (first iteration of loops %s)" % ([l['name'] for l in self.loops]) if self.loops else ""
+            raise RuntimeError("%s has a phase reset at tProc time %s after time zero%s, which is not a multiple of %s. "
+                    "The nearest legal times are %.4f us and %.4f us after time zero, i.e. t=%.4f us or t=%.4f us for this instruction "
+                    "(the reference time is %s). round_up_to_sync_tick() rounds a time up to the grid."
+                    % (what, self._fmt(t_abs), loopnote, self._period_str(),
+                       self.prog.cycles2us(lo), self.prog.cycles2us(hi),
+                       self.prog.cycles2us(t-off), self.prog.cycles2us(t-off+self.period), self._fmt(self.ref)))
+
+    def _raw(self, t_reg):
+        # the time of a timed macro, as an int or a stepped QickRawParam
+        if isinstance(t_reg, str):
+            return self.prog.reg_dict[t_reg].init
+        return t_reg
+
+    def observe(self, macro):
+        """Update the state after a macro has been preprocessed."""
+        prog = self.prog
+        if isinstance(macro, OpenLoop):
+            self.open_loop(macro.name, macro.n)
+        elif isinstance(macro, CloseLoop):
+            self.close_loop()
+        elif isinstance(macro, Delay):
+            if macro.t_regs['t'] is not None:
+                what = "delay_auto()" if macro.auto else "delay()"
+                if macro.tag is not None: what += " (tag '%s')" % (macro.tag)
+                self.shift(self._raw(macro.t_regs['t']), what)
+        elif isinstance(macro, Resync):
+            self.set_unknown("resync() adds a delay that is computed at run time")
+        elif isinstance(macro, Pulse):
+            if self.has_phrst(prog.pulses[macro.name], gen_ch=macro.ch):
+                self.check("pulse '%s' on gen %d" % (macro.name, macro.ch), self._raw(macro.t_regs['t']))
+        elif isinstance(macro, ConfigReadout):
+            if self.has_phrst(prog.pulses[macro.name]):
+                self.check("readout config '%s' on readout %d" % (macro.name, macro.ch), self._raw(macro.t_regs['t']))
+        elif type(macro) in self.BRANCHES:
+            if self.branch is None: self.branch = "%s('%s')" % (self.BRANCHES[type(macro)], macro.label)
+        elif isinstance(macro, AsmInst):
+            inst = macro.inst
+            if inst.get('CMD') == 'TIME':
+                lit = inst.get('LIT')
+                try:
+                    if inst.get('C_OP') != 'inc_ref' or lit is None or 'R1' in inst:
+                        raise ValueError
+                    self.shift(int(str(lit).lstrip('#')), "a TIME inc_ref instruction")
+                except ValueError:
+                    self.set_unknown("a TIME %s instruction (%s) sets or moves the time at run time" % (inst.get('C_OP'), inst))
+            elif inst.get('CMD') in ['JUMP', 'CALL', 'RET']:
+                if self.branch is None: self.branch = "%s instruction" % (inst.get('CMD'))
+
+    def finish(self):
+        """Check the whole program, after all macros have been observed."""
+        # with labels, jumps or calls the macro list is not the order of execution
+        # the reference time is then on the grid at every point only if every change to it is a multiple of the period
+        if self.branch is not None and self.first_phrst is not None and self.off_grid is not None:
+            raise RuntimeError("%s has a phase reset, and the program uses %s, so the library can't follow the time along every path. "
+                    "That is allowed only if every change of the reference time is a multiple of %s, but %s."
+                    % (self.first_phrst, self.branch, self._period_str(), self.off_grid))
 
 class AsmV2:
     """A list of tProc v2 assembly instructions.
@@ -1404,7 +1571,7 @@ class AsmV2:
 
     # timeline management
 
-    def delay(self, t, tag=None):
+    def delay(self, t, tag=None, align=False):
         """Increment the reference time.
         This will have the effect of delaying all timed instructions executed after this one.
 
@@ -1414,10 +1581,14 @@ class AsmV2:
             time (us)
         tag: str
             arbitrary name for use with get_time_param()
+        align : bool
+            On firmware with a time-sync period (see time_sync_period_us()), round the delay up to a multiple of the period,
+            so a reference time on the grid stays on it. The delay must not be swept. No effect on other firmware.
         """
-        self.append_macro(Delay(t=t, auto=False, tag=tag))
+        # align is only stored if set, so programs that don't use it print as before
+        self.append_macro(Delay(t=t, auto=False, tag=tag, **({'align': True} if align else {})))
 
-    def delay_auto(self, t=0, gens=True, ros=True, tag=None):
+    def delay_auto(self, t=0, gens=True, ros=True, tag=None, align=False):
         """Set the reference time to the end of the last pulse/readout, plus the specified value.
         You can select whether this accounts for pulses, readout windows, or both.
 
@@ -1431,8 +1602,12 @@ class AsmV2:
             check the ends of readout windows
         tag: str
             arbitrary name for use with get_time_param()
+        align : bool
+            On firmware with a time-sync period (see time_sync_period_us()), round the delay up to a multiple of the period,
+            so a reference time on the grid stays on it. The delay must not be swept. No effect on other firmware.
         """
-        self.append_macro(Delay(t=t, auto=True, gens=gens, ros=ros, tag=tag))
+        # align is only stored if set, so programs that don't use it print as before
+        self.append_macro(Delay(t=t, auto=True, gens=gens, ros=ros, tag=tag, **({'align': True} if align else {})))
 
     def wait(self, t, tag=None):
         """Pause tProc execution until the time reaches the specified value, relative to the reference time.
@@ -2124,6 +2299,10 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         self.loop_dict = OrderedDict()
         self.loop_stack = []
 
+        # on firmware with a time-sync period, phase resets must be issued on multiples of the period
+        period = self.tproccfg.get('time_sync_period', 0)
+        self._time_grid = TimeGrid(self, period) if period > 1 else None
+
         # low-level ASM management
 
         # the initial values here are copied from command_recognition() and label_recognition() in tprocv2_assembler.py
@@ -2214,6 +2393,8 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         # this means stepping through the timeline (evaluating "auto" times etc.)
         for i, macro in enumerate(self.macro_list):
             macro.preprocess(self)
+            if self._time_grid is not None: self._time_grid.observe(macro)
+        if self._time_grid is not None: self._time_grid.finish()
         # initialize sweep registers
         for k,v in self.reg_dict.items():
             if v.init is not None:
