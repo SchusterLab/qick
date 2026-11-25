@@ -8,78 +8,95 @@ that the tProc, generator and readout clocks repeat. A phase reset lands on a
 reproducible sample only if it is issued at a time, counted from time zero,
 that is a multiple of that period (a "legal tick"). The library checks every
 phase reset when it compiles a program and refuses one that is not on a legal
-tick; it never moves anything unless you ask it to.
+tick.
+
+Only the resets have to be on the grid. Pulses, triggers, readout configs
+without a reset, and delays can be at any time. The one cost: if you reset in
+every shot, each shot has to be a whole number of periods long so the reset
+hits the grid every time, and the library pads the end of each shot by less
+than one period to make it so.
 
 `soc.time_sync_period_us()` gives the period (0 on firmware without it). On
-firmware without a period, everything below still works: resets are issued at
-the times you give and nothing is checked.
+firmware without a period, everything below still works: resets are issued
+when asked, nothing is padded and nothing is checked.
 
-## Reset once, before the loops
-
-The simplest case: reset at the start of the program, then run the shots with
-any timing. Time zero is on the grid, so a reset at `t=0` is legal.
+## Reset at the start of every shot
 
 ```python
 class Prog(AveragerProgramV2):
     def _initialize(self, cfg):
         self.declare_gen(ch=GEN, nqz=1)
         self.declare_readout(ch=RO, length=1.0)
-        self.add_readoutconfig(ch=RO, name="ro_rst", freq=f, gen_ch=GEN, phrst=1)
+        self.add_readoutconfig(ch=RO, name="ro", freq=f, gen_ch=GEN)
         self.add_pulse(ch=GEN, name="p", style="const", freq=f, phase=0, gain=0.5, length=0.5)
-        self.reset_phases(gens=[GEN], ros={RO: "ro_rst"})
 
     def _body(self, cfg):
-        self.pulse(ch=GEN, name="p", t=0)
-        self.trigger(ros=[RO], t=0.3)
-```
-
-`reset_phases()` resets every named generator and readout at the same legal
-tick, then moves the reference time past the resets to the next legal tick,
-so `t=0` afterwards is free and on the grid. Generators get the built-in
-"phrst" waveform (zero output for 3 fabric cycles). A readout needs a readout
-config defined with `phrst=1`, because a readout config also sets the
-frequency and phase; the readout keeps that config afterwards.
-
-## Reset every shot
-
-Pass `align=True` to `AveragerProgramV2`. It rounds `initial_delay` up so the
-loops start on the grid, and lengthens the end-of-shot delay (`final_delay`)
-so every shot is a whole number of periods. A reset in the shot then lands on
-the same tick in every shot.
-
-```python
-class Prog(AveragerProgramV2):
-    def _initialize(self, cfg):
-        ...  # as above, without the reset
-    def _body(self, cfg):
-        self.reset_phases(gens=[GEN], ros={RO: "ro_rst"})
+        self.reset_phases()
         self.pulse(ch=GEN, name="p", t=0)
         self.trigger(ros=[RO], t=0.3)
 
-prog = Prog(soccfg, reps=1000, final_delay=10.0, align=True)
+prog = Prog(soccfg, reps=1000, final_delay=10.0)
 ```
 
-Each shot can be up to one period (65 ns) longer than without `align`. If the
-end-of-shot delay would be swept (for example because a pulse length is
-swept), its longest value is used for every shot. With `final_delay=None`,
-end the shot yourself with `self.delay_auto(..., align=True)`.
+`self.reset_phases()` with no arguments resets every declared generator that
+supports it and every declared tProc-configured readout, all on the same legal
+tick: the first one at which those channels have finished their previous
+pulses and readout windows. It then moves the reference time past the resets,
+to the next legal tick, so `t=0` afterwards is free.
+
+To reset only some channels: `self.reset_phases(gens=[0, 2], ros=[0])`. Leaving
+out `gens` or `ros` means all of that kind; `gens=[]` or `ros=[]` means none.
+A channel that can't be reset (a muxed generator, a generator without a DDS,
+a readout not configured by the tProc) is skipped when you don't name it, and
+is an error when you do.
+
+`AveragerProgramV2` sees the reset in the shot and, on firmware with a period,
+rounds `initial_delay` up to the grid and pads the end-of-shot delay so every
+shot is a whole number of periods. Shots without a reset are left alone.
+`align=True` forces the padding, `align=False` turns it off (and a per-shot
+reset is then refused unless your shot already is a whole number of periods).
+If the end-of-shot delay would be swept (for example because a pulse length is
+swept), its longest value is used for every shot. With `final_delay=None` the
+library can't pad for you: end the shot with `self.delay_auto(..., align=True)`.
+
+### What the reset sends
+
+- A generator gets the built-in "phrst" waveform: zero output for 3 fabric
+  cycles.
+- A readout gets a copy of its readout config with the reset bit set (named
+  `<config>_phrst`, made once), so its frequency and phase stay as you set
+  them. If the readout has several readout configs, say which one to copy:
+  `self.reset_phases(ros={RO: "ro_long"})`. A config that already has
+  `phrst=1` is sent as it is.
+
+The reset zeroes a time counter in the generator or readout; the phase of
+every later pulse or readout config is computed from its frequency and that
+counter. So pulses and readout configs sent after the reset, without `phrst`,
+keep the reset: `send_readoutconfig(ch=RO, name="ro", t=...)` later in the
+shot just retunes the readout. Until another config is sent, the readout runs
+with the copy, which has the same settings as the original.
+
+## Reset once, before the loops
+
+Put `self.reset_phases()` in `_initialize()` instead. The shots are then not
+padded; time zero is on the grid, so the reset is legal.
 
 ## Explicit times
 
+`reset_phases(t=0.15)` issues the resets at the first legal tick at or after
+0.15 us from the reference time.
+
 `pulse(..., t=...)` and `send_readoutconfig(..., t=...)` with a `phrst=1`
-pulse or config are checked as they are. Round a time to the grid with
-`soc.round_up_to_sync_tick(t)`; this gives a legal absolute time only if the
-reference time is on the grid, which it is at time zero, after
-`reset_phases()`, and after `delay(..., align=True)` or
-`delay_auto(..., align=True)`.
+pulse or config are checked as they are. `soc.round_up_to_sync_tick(t)` rounds
+a time up to the grid; that is a legal time only if the reference time is on
+the grid, which it is at time zero, after `reset_phases()`, and after
+`delay(..., align=True)` or `delay_auto(..., align=True)`.
 
 ```python
 # "p_rst" defined with add_pulse(..., phrst=1)
 self.delay_auto(0.2, align=True)
 self.pulse(ch=GEN, name="p_rst", t=self.round_up_to_sync_tick(0.15))
 ```
-
-`reset_phases(..., t=0.15)` does the rounding for you.
 
 To see what the checker sees, compile the program and call
 `prog.phase_reset_times()`: for each reset, the channel, the time from time

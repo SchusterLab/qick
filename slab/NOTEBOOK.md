@@ -3,6 +3,29 @@
 Running log for the lab fork. Newest entry first. Record dead ends as well as
 results, and say where each number came from.
 
+## 2026-11-24: bare `reset_phases()` at the top of the body (branch `lab/phrst-grid`)
+
+- From user feedback: the common case is one call at the start of `_body`.
+  `reset_phases()` now defaults to every declared generator that supports a
+  reset and every declared tProc-configured readout; channels that can't be
+  reset are skipped unless named. `ros` takes a list; a readout's reset is a
+  copy of its only readout config with phrst set (`<config>_phrst`), or of
+  the one named in the dict form.
+- Firmware (read, not simulated): in `ctrl_dyn_ro_v1.sv` and `ctrl_sg_v6.sv`
+  a reset zeroes a time counter `cnt_n`, and each config's phase is
+  `freq * cnt_n + phase`. So configs sent later without phrst keep the reset.
+- `AveragerProgramV2(align=None)` is now the default: pads the initial and
+  end-of-shot delays only on firmware with a period and only if the shot or
+  a subroutine has a phase reset. The reference programs for "period present,
+  no resets" (`slab/tests/data/phrst_grid_golden_period.json`) were compiled
+  with the library at `3684d545`, before any of this work; the existing
+  no-period reference files regenerated from it identical.
+- Kept the round-up of the reference time after `reset_phases()` to the next
+  tick: without it a plain loop of a reset and on-grid delays drifts off the
+  grid (seen in a test), and `round_up_to_sync_tick()` would stop giving
+  legal times after a reset. Cost: at most one period per reset.
+- 48 off-board tests pass. Not run on a board.
+
 ## 2026-11-24: helpers for phase resets on legal ticks (branch `lab/phrst-grid`)
 
 - `reset_phases(gens=[...], ros={ch: config}, t=None)`: resets the named

@@ -6,8 +6,9 @@ one axis_signal_gen_v6, one axis_dyn_readout_v1). It is old but compiles
 programs; only its printed description fails.
 
 Run:  .venv/bin/python -m pytest slab/tests
-Regenerate the reference programs (only from a library without the check):
-      .venv/bin/python slab/tests/test_phrst_grid.py --golden
+Regenerate the reference programs from the library before any of this work
+(commit 3684d545), e.g. from a worktree of it:
+      PYTHONPATH=<worktree>/qick_lib .venv/bin/python slab/tests/test_phrst_grid.py --golden
 """
 import copy
 import json
@@ -23,6 +24,8 @@ from qick.asm_v2 import AsmV2, QickProgramV2, AveragerProgramV2, QickSweep1D
 HERE = os.path.dirname(os.path.abspath(__file__))
 CFG_PATH = os.path.join(HERE, '..', '..', 'firmware', 'testbench', 'qick_testbench', 'soccfg.json')
 GOLDEN_PATH = os.path.join(HERE, 'data', 'phrst_grid_golden.json')
+# the same programs without phase resets, compiled with a period of 28 in the config (which the old library ignores)
+GOLDEN_PERIOD_PATH = os.path.join(HERE, 'data', 'phrst_grid_golden_period.json')
 
 P = 28  # common period of the clocks on the lab ZCU216, in tProc cycles
 
@@ -101,20 +104,21 @@ class SubProg(AveragerProgramV2):
         self.trigger(ros=[0], t=0.2)
 
 
-def golden_programs(soccfg):
-    """Programs compared against the library before this change. They are
-    compiled without a period, so whether they would pass the check does not matter."""
+def golden_programs(soccfg, phrst=1):
+    """Programs compared against the library before this work. With phrst=1 they are
+    compiled without a period, so whether they would pass the check does not matter.
+    With phrst=0 they have no phase reset and are compiled with a period."""
     progs = {}
-    progs['flat'] = flat_prog(soccfg, t_pulse=0.123, t_ro=0.05, delay=0.37, ro_phrst=1)
-    progs['shots'] = ShotProg(soccfg, reps=10, final_delay=1.0, cfg={'gen_phrst': 1})
+    progs['flat'] = flat_prog(soccfg, t_pulse=0.123, t_ro=0.05, delay=0.37, gen_phrst=phrst, ro_phrst=phrst)
+    progs['shots'] = ShotProg(soccfg, reps=10, final_delay=1.0, cfg={'gen_phrst': phrst})
     progs['swept'] = ShotProg(soccfg, reps=10, final_delay=0.5,
-                              cfg={'gen_phrst': 1, 'sweep': QickSweep1D('sweep', 0.1, 1.3), 'sweep_n': 7})
-    progs['sub'] = SubProg(soccfg, reps=5, final_delay=0.3, cfg={'gen_phrst': 1})
+                              cfg={'gen_phrst': phrst, 'sweep': QickSweep1D('sweep', 0.1, 1.3), 'sweep_n': 7})
+    progs['sub'] = SubProg(soccfg, reps=5, final_delay=0.3, cfg={'gen_phrst': phrst})
     # flat-top pulse and a resync
     p = QickProgramV2(soccfg)
     declare(p)
     p.add_gauss(ch=0, name='g', sigma=0.02, length=0.08, even_length=True)
-    p.add_pulse(ch=0, name='ft', style='flat_top', envelope='g', freq=50, phase=10, gain=0.3, length=0.2, phrst=1)
+    p.add_pulse(ch=0, name='ft', style='flat_top', envelope='g', freq=50, phase=10, gain=0.3, length=0.2, phrst=phrst)
     p.pulse(ch=0, name='ft', t=0.3)
     p.resync()
     p.delay_auto(0.1)
@@ -137,6 +141,16 @@ def test_no_period_identical_to_before(period):
     with open(GOLDEN_PATH) as f:
         golden = json.load(f)
     progs = golden_programs(make_soccfg(period))
+    assert sorted(progs) == sorted(golden)
+    for name, prog in progs.items():
+        assert dump(prog) == golden[name], name
+
+
+def test_period_without_resets_identical_to_before():
+    # default align=None must not pad anything when there is no phase reset
+    with open(GOLDEN_PERIOD_PATH) as f:
+        golden = json.load(f)
+    progs = golden_programs(make_soccfg(P), phrst=0)
     assert sorted(progs) == sorted(golden)
     for name, prog in progs.items():
         assert dump(prog) == golden[name], name
@@ -347,9 +361,11 @@ def test_loop_misaligned_but_no_phrst_inside_then_phrst_after():
 
 def test_default_averager_rejected_and_aligned_version_accepted():
     soccfg = make_soccfg(P)
-    # the defaults (initial_delay=1 us, final_delay arbitrary) are not on the grid
-    with pytest.raises(RuntimeError):
-        ShotProg(soccfg, reps=10, final_delay=1.0, cfg=shot_cfg(soccfg))
+    # the defaults (initial_delay=1 us, final_delay arbitrary) are not on the grid: refused with align=False
+    with pytest.raises(RuntimeError, match='align=False'):
+        ShotProg(soccfg, reps=10, final_delay=1.0, cfg=shot_cfg(soccfg), align=False)
+    # with the default align=None they are padded, because the shot has a reset
+    ShotProg(soccfg, reps=10, final_delay=1.0, cfg=shot_cfg(soccfg))
     # the same program with its delays rounded to the grid
     class Aligned(ShotProg):
         def _body(self, cfg):
@@ -474,14 +490,15 @@ def test_reset_phases_leaves_reference_on_grid():
     prog = QickProgramV2(soccfg)
     declare(prog, gen_phrst=1)
     prog.delay(cyc(soccfg, 13))
-    prog.reset_phases(gens=0)
+    prog.reset_phases(gens=0, ros=[])
     # t=0 after the reset is legal: this pulse carries its own reset and would be refused off the grid
     prog.pulse(ch=0, name='p', t=0)
     prog.end()
     prog.compile()
     r = prog.phase_reset_times()
     assert r[0]['cycles'] == P
-    assert r[1]['cycles'] % P == 0 and r[1]['cycles'] > r[0]['cycles']
+    # the reference moved past the 3-cycle reset waveform, rounded up to one period
+    assert r[1]['cycles'] == 2 * P
 
 
 def test_reset_phases_explicit_time_rounded_up():
@@ -500,7 +517,7 @@ def test_reset_phases_without_period():
     declare_rst(prog)
     prog.reset_phases(gens=[0], ros={0: 'ro_rst'}, t=cyc(soccfg, 5 * P + 3))
     prog.pulse(ch=0, name='p', t=0)
-    prog.reset_phases(gens=[0])
+    prog.reset_phases(gens=[0], ros=[])
     prog.end()
     prog.compile()
     r = prog.phase_reset_times()
@@ -526,12 +543,95 @@ def test_reset_phases_unsupported_generator_same_error():
     assert str(e1.value) == str(e2.value) and 'phrst not supported' in str(e2.value)
 
 
-def test_reset_phases_readout_config_needs_phrst():
+def test_reset_phases_named_config_without_phrst_is_copied():
+    soccfg = make_soccfg(P)
+    prog = QickProgramV2(soccfg)
+    declare_rst(prog)
+    prog.reset_phases(gens=[], ros={0: 'ro'})
+    prog.reset_phases(gens=[], ros={0: 'ro'})     # the copy is made once
+    prog.reset_phases(gens=[], ros={0: 'ro_rst'})  # already has phrst: used as it is
+    prog.end()
+    prog.compile()
+    assert [r['what'] for r in prog.phase_reset_times()] == ["readout config 'ro_phrst' on readout 0"] * 2 + ["readout config 'ro_rst' on readout 0"]
+    assert 'ro_phrst_phrst' not in prog.pulses
+
+
+def test_reset_phases_default_everything():
     soccfg = make_soccfg(P)
     prog = QickProgramV2(soccfg)
     declare(prog)
-    with pytest.raises(RuntimeError, match='phrst=1'):
-        prog.reset_phases(ros={0: 'ro'})
+    prog.reset_phases()
+    prog.end()
+    prog.compile()
+    r = prog.phase_reset_times()
+    assert [x['what'] for x in r] == ["pulse 'phrst_gen0' on gen 0", "readout config 'ro_phrst' on readout 0"]
+    assert r[0]['cycles'] == r[1]['cycles'] == 0
+    # the copy has the readout's settings, plus the reset bit
+    orig = prog._get_wave(prog.pulses['ro'].get_wavenames()[0])
+    rst = prog._get_wave(prog.pulses['ro_phrst'].get_wavenames()[0])
+    for k in ['freq', 'phase', 'env', 'gain', 'length']:
+        assert rst[k] == orig[k], k
+    assert rst['conf'] == orig['conf'] | 0b010000 and orig['conf'] & 0b010000 == 0
+
+
+def test_reset_phases_default_swept_readout_config_follows_sweep():
+    soccfg = make_soccfg(P)
+    prog = QickProgramV2(soccfg)
+    prog.declare_gen(ch=0, nqz=1)
+    prog.declare_readout(ch=0, length=0.5)
+    prog.add_readoutconfig(ch=0, name='ro', freq=QickSweep1D('i', 100, 120), gen_ch=0)
+    prog.open_loop(5, name='i')
+    prog.reset_phases()
+    prog.delay(cyc(soccfg, 10 * P))
+    prog.close_loop()
+    prog.end()
+    prog.compile()
+    # both the config and its copy are stepped by the loop
+    swept = [w.name for w in prog.waves if w.sweeps()]
+    assert set(swept) >= {prog.pulses['ro'].get_wavenames()[0], prog.pulses['ro_phrst'].get_wavenames()[0]}
+
+
+def test_reset_phases_default_skips_what_cannot_be_reset():
+    with open(CFG_PATH) as f:
+        cfg = json.load(f)
+    cfg['gens'][0]['type'] = 'axis_signal_gen_v5'
+    soccfg = QickConfig(cfg)
+    # generator can't be reset: skipped; readout has no config: skipped; nothing left -> error
+    prog = QickProgramV2(soccfg)
+    prog.declare_gen(ch=0, nqz=1)
+    prog.declare_readout(ch=0, length=0.5)
+    with pytest.raises(RuntimeError, match='no generator or readout'):
+        prog.reset_phases()
+    # named explicitly: they raise
+    with pytest.raises(RuntimeError, match='phrst not supported'):
+        prog.reset_phases(gens=[0], ros=[])
+    with pytest.raises(RuntimeError, match='no readout config'):
+        prog.reset_phases(gens=[], ros=[0])
+    # with a readout config, the default resets the readout only
+    prog.add_readoutconfig(ch=0, name='ro', freq=100)
+    prog.reset_phases()
+    assert prog.macro_list[-1].gens == [] and prog.macro_list[-1].ros == {0: 'ro_phrst'}
+
+
+def test_reset_phases_several_configs_need_a_name():
+    soccfg = make_soccfg(P)
+    prog = QickProgramV2(soccfg)
+    declare(prog)
+    prog.add_readoutconfig(ch=0, name='ro2', freq=150, gen_ch=0)
+    with pytest.raises(RuntimeError, match='several readout configs'):
+        prog.reset_phases()
+    with pytest.raises(RuntimeError, match='several readout configs'):
+        prog.reset_phases(ros=[0])
+    prog.reset_phases(ros={0: 'ro2'})
+    assert prog.macro_list[-1].ros == {0: 'ro2_phrst'} and prog.macro_list[-1].gens == [0]
+
+
+def test_reset_phases_undeclared_or_static_readout():
+    soccfg = make_soccfg(P)
+    prog = QickProgramV2(soccfg)
+    prog.declare_gen(ch=0, nqz=1)
+    with pytest.raises(RuntimeError, match='declared'):
+        prog.reset_phases(ros=[0])
 
 
 class ResetShotProg(AveragerProgramV2):
@@ -562,8 +662,41 @@ def test_averager_align_accepts_per_shot_reset():
 
 def test_averager_without_align_rejected_and_hint():
     soccfg = make_soccfg(P)
-    with pytest.raises(RuntimeError, match='align=True'):
-        ResetShotProg(soccfg, reps=10, final_delay=1.0)
+    with pytest.raises(RuntimeError, match='align=False'):
+        ResetShotProg(soccfg, reps=10, final_delay=1.0, align=False)
+
+
+class BareResetProg(AveragerProgramV2):
+    """The target usage: a bare reset_phases() at the top of the body."""
+    def _initialize(self, cfg):
+        declare(self)
+        self.add_loop('f', 3)
+
+    def _body(self, cfg):
+        self.reset_phases()
+        self.send_readoutconfig(ch=0, name='ro', t=0.02)  # a later config without phrst
+        self.pulse(ch=0, name='p', t=0.0123)
+        self.trigger(ros=[0], t=0.031)
+        if cfg.get('end_shot'):
+            self.delay_auto(0.781, align=cfg['end_shot'] == 'align')
+
+
+def test_bare_reset_phases_in_averager_default():
+    soccfg = make_soccfg(P)
+    prog = BareResetProg(soccfg, reps=10, final_delay=0.77)
+    r = prog.phase_reset_times()
+    assert [x['what'] for x in r] == ["pulse 'phrst_gen0' on gen 0", "readout config 'ro_phrst' on readout 0"]
+    assert all(x['on_grid'] for x in r)
+    # without a period the same program compiles, with the resets at t=0 and no padding
+    prog0 = BareResetProg(make_soccfg(), reps=10, final_delay=0.77)
+    assert [x['cycles'] for x in prog0.phase_reset_times()] == [430, 430]
+
+
+def test_bare_reset_phases_final_delay_none():
+    soccfg = make_soccfg(P)
+    with pytest.raises(RuntimeError, match=r'final_delay=None.*delay_auto\(\.\.\., align=True\)'):
+        BareResetProg(soccfg, reps=10, final_delay=None, cfg={'end_shot': 'plain'})
+    BareResetProg(soccfg, reps=10, final_delay=None, cfg={'end_shot': 'align'})
 
 
 def test_averager_align_no_effect_without_period():
@@ -582,10 +715,20 @@ def test_phase_reset_times_without_period():
     assert r[1]['us'] == pytest.approx(cyc(soccfg, 5 * P + 10))
 
 
+
+def test_averager_align_modes_without_reset():
+    soccfg = make_soccfg(P)
+    def initial(prog):
+        return [m.t_regs['t'] for m in prog.macro_list if type(m).__name__ == 'Delay'][0]
+    assert initial(ShotProg(soccfg, reps=3, final_delay=1.0, cfg={'gen_phrst': 0})) == 430
+    assert initial(ShotProg(soccfg, reps=3, final_delay=1.0, cfg={'gen_phrst': 0}, align=True)) == 16 * P
+    assert initial(ShotProg(soccfg, reps=3, final_delay=1.0, cfg={'gen_phrst': 1})) == 16 * P
+
 if __name__ == '__main__':
     if '--golden' in sys.argv:
-        progs = golden_programs(make_soccfg())
         os.makedirs(os.path.dirname(GOLDEN_PATH), exist_ok=True)
-        with open(GOLDEN_PATH, 'w') as f:
-            json.dump({k: dump(v) for k, v in progs.items()}, f, indent=1)
-        print('wrote', GOLDEN_PATH, sorted(progs))
+        for path, soccfg, phrst in [(GOLDEN_PATH, make_soccfg(), 1), (GOLDEN_PERIOD_PATH, make_soccfg(P), 0)]:
+            progs = golden_programs(soccfg, phrst=phrst)
+            with open(path, 'w') as f:
+                json.dump({k: dump(v) for k, v in progs.items()}, f, indent=1)
+            print('wrote', path, sorted(progs))

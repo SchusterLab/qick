@@ -1147,6 +1147,13 @@ class Trigger(TimedMacro):
                 if imm_time: insts[-1].inst['TIME'] = '@'+str(t_reg+width_reg)
         return insts
 
+def _has_phrst(prog, pulse, gen_ch=None):
+    # whether a pulse (played on gen_ch) or readout config (gen_ch=None) carries a phase reset
+    if gen_ch is not None and not isinstance(prog._gen_mgrs[gen_ch], StandardGenManager):
+        # for muxed generators this bit of the config word is a tone mask bit
+        return False
+    return any(int(prog._get_wave(w).conf) & TimeGrid.PHRST_BIT for w in pulse.get_wavenames())
+
 class ResetPhases(TimedMacro):
     # gens (list of int), ros (dict of readout channel: readout config name), t (float or None)
     # expands to a phase-reset pulse on each generator and a readout config on each readout, all at the same time,
@@ -1232,9 +1239,17 @@ class TimeGrid:
         return "the time-sync period of %s" % (self._fmt(self.period))
 
     def _hint(self):
-        if isinstance(self.prog, AveragerProgramV2) and not self.prog.align:
-            return " With AveragerProgramV2, align=True rounds initial_delay up to the grid and makes every shot a multiple of the period."
-        return ""
+        prog = self.prog
+        if not isinstance(prog, AveragerProgramV2):
+            return ""
+        if prog.align is False:
+            return " AveragerProgramV2 has align=False; with align=None (the default) or True it pads initial_delay and final_delay so every shot is a multiple of the period."
+        hints = []
+        if prog.initial_delay is None:
+            hints.append("with initial_delay=None, start the loops on the grid with delay_auto(..., align=True) in _initialize()")
+        if prog.final_delay is None:
+            hints.append("with final_delay=None, end the shot with delay_auto(..., align=True) so every shot is a multiple of the period")
+        return (" In AveragerProgramV2, " + "; ".join(hints) + ".") if hints else ""
 
     def _raise(self, msg):
         if self.strict:
@@ -1248,10 +1263,7 @@ class TimeGrid:
         return None
 
     def has_phrst(self, pulse, gen_ch=None):
-        if gen_ch is not None and not isinstance(self.prog._gen_mgrs[gen_ch], StandardGenManager):
-            # for muxed generators this bit of the config word is a tone mask bit
-            return False
-        return any(int(self.prog._get_wave(w).conf) & self.PHRST_BIT for w in pulse.get_wavenames())
+        return _has_phrst(self.prog, pulse, gen_ch)
 
     def next_tick(self, t):
         """The smallest time >= t (cycles, relative to the reference time) that is on the grid.
@@ -1803,45 +1815,107 @@ class AsmV2:
         self.append_macro(ConfigReadout(ch=ch, name=name, t=t, tag=tag))
 
     def reset_phases(self, gens=None, ros=None, t=None):
-        """Reset the phase of the named generators and readouts, all at the same time.
+        """Reset the phase of generators and readouts, all at the same time.
+        The usual place for this is the start of the body of a program: self.reset_phases().
 
-        On firmware with a time-sync period (see time_sync_period_us()), the time is a legal tick: an absolute tProc time that is a multiple of the period.
-        On other firmware the resets are issued at the time given, with no rounding.
+        On firmware with a time-sync period (see time_sync_period_us()), the resets are issued on a legal tick:
+        an absolute tProc time that is a multiple of the period. Only the resets are constrained; nothing else is.
+        On other firmware they are issued at the time given (or as soon as the channels are free), with no rounding.
 
-        Afterwards the reference time is moved to the end of the resets (rounded up to the grid, if there is a period),
-        so t=0 is free on every named channel, and on the grid.
-        Generators get the built-in "phrst" waveform: zero gain for 3 fabric cycles.
-        Readouts get the readout config you name, which must have been defined with add_readoutconfig(..., phrst=1):
-        a readout config also sets the frequency and phase, so the library can't send a bare reset to a readout.
+        A reset zeroes the time counter from which the generator or readout computes the phase of every later pulse or config,
+        so pulses and readout configs sent later, without phrst, keep the reset.
+        Generators get the built-in "phrst" waveform: zero output for 3 fabric cycles.
+        A readout gets a copy of its readout config with phrst set (named "<config>_phrst", made once),
+        so its frequency and phase stay as configured; the readout keeps that config until you send another.
+
+        Afterwards the reference time is moved to the end of the resets, so t=0 is free on every reset channel.
+        With a period it is rounded up to the next legal tick (at most one period later), so a loop or shot made of
+        resets and delays that are multiples of the period stays on the grid, and round_up_to_sync_tick() gives legal times after it.
 
         Parameters
         ----------
-        gens : int or list of int
-            generator channels (index in 'gens' list)
-        ros : dict
-            readout channel (index in 'readouts' list): name of a readout config with phrst=1
+        gens : None, int or list of int
+            Generator channels (index in 'gens' list).
+            None: every declared generator that supports phase reset (others are skipped).
+            [] for none.
+        ros : None, list of int, or dict
+            Readout channels (index in 'readouts' list).
+            None: every declared tProc-configured readout that has a readout config (others are skipped).
+            A list resets those readouts, each of which must have exactly one readout config.
+            A dict {channel: config name} says which config to copy, for a readout with several.
+            [] for none.
         t : float or None
-            time (us) relative to the reference time; rounded up to the next legal tick if there is a period.
-            If None, the earliest legal tick at which the named generators have finished their pulses and the named readouts their windows.
+            Time (us) relative to the reference time; rounded up to the next legal tick if there is a period.
+            If None, the earliest (legal) time at which the reset generators have finished their pulses and the reset readouts their windows.
         """
-        if gens is None: gens = []
-        elif isinstance(gens, Number): gens = [gens]
-        ros = {} if ros is None else dict(ros)
+        if gens is None:
+            # every declared generator that can be reset
+            gens = []
+            for ch in self.gen_chs:
+                try:
+                    self._gen_mgrs[ch].check_phrst()
+                    gens.append(ch)
+                except RuntimeError:
+                    pass
+        else:
+            gens = [gens] if isinstance(gens, Number) else list(gens)
+            for ch in gens:
+                if ch not in self.gen_chs:
+                    raise RuntimeError("reset_phases() on generator %d, but only generators %s are declared" % (ch, list(self.gen_chs.keys())))
+                self._gen_mgrs[ch].check_phrst()
+        if ros is None:
+            # every declared tProc-configured readout with a readout config
+            ros = {ch: None for ch in self.ro_chs if self._ro_mgrs[ch] is not None and self._ro_configs(ch)}
+        elif isinstance(ros, Number):
+            ros = {ros: None}
+        elif not isinstance(ros, dict):
+            ros = {ch: None for ch in ros}
+        ros = {ch: self._ro_reset_config(ch, name) for ch, name in ros.items()}
         if not gens and not ros:
-            raise RuntimeError("reset_phases() needs at least one generator or readout")
+            raise RuntimeError("reset_phases(): no generator or readout to reset")
         for ch in gens:
-            if ch not in self.gen_chs:
-                raise RuntimeError("reset_phases() on generator %d, but only generators %s are declared" % (ch, list(self.gen_chs.keys())))
-            self._gen_mgrs[ch].check_phrst()
             name = "phrst_gen%d" % (ch)
             if name not in self.pulses:
                 self.add_raw_pulse(name, ["phrst"], gen_ch=ch)
-        for ch, name in ros.items():
-            if name not in self.pulses:
-                raise RuntimeError("reset_phases() on readout %d with readout config %s, which isn't defined" % (ch, name))
-            if not any(int(self._get_wave(w).conf) & TimeGrid.PHRST_BIT for w in self.pulses[name].get_wavenames()):
-                raise RuntimeError("readout config %s has no phase reset: define it with add_readoutconfig(..., phrst=1)" % (name))
         self.append_macro(ResetPhases(gens=gens, ros=ros, t=t))
+
+    def _ro_configs(self, ch):
+        # names of the readout configs defined with add_readoutconfig() for this readout, not counting reset copies
+        names = []
+        for name, pulse in self.pulses.items():
+            if not isinstance(pulse.ch_mgr, ReadoutManager) or not pulse.params or hasattr(pulse, 'phrst_of'):
+                continue
+            chs = [c for x in pulse.ro_chs for c in (x if isinstance(x, list) else [x])]
+            if ch in chs:
+                names.append(name)
+        return names
+
+    def _ro_reset_config(self, ch, name=None):
+        # the name of a readout config for this readout with phrst set, making a copy of its config if needed
+        if ch not in self.ro_chs:
+            raise RuntimeError("reset_phases() on readout %d, but only readouts %s are declared" % (ch, list(self.ro_chs.keys())))
+        if self._ro_mgrs[ch] is None:
+            raise RuntimeError("readout %d is not configured by the tProc, so reset_phases() can't reset its phase" % (ch))
+        if name is None:
+            names = self._ro_configs(ch)
+            if not names:
+                raise RuntimeError("reset_phases(): readout %d has no readout config to copy; define one with add_readoutconfig()" % (ch))
+            if len(names) > 1:
+                raise RuntimeError("reset_phases(): readout %d has several readout configs %s; say which one to use with ros={%d: name}" % (ch, names, ch))
+            name = names[0]
+        elif name not in self.pulses:
+            raise RuntimeError("reset_phases() on readout %d with readout config %s, which isn't defined" % (ch, name))
+        pulse = self.pulses[name]
+        if _has_phrst(self, pulse):
+            return name
+        copyname = name + "_phrst"
+        if copyname not in self.pulses:
+            params = copy.deepcopy(pulse.params)
+            params['phrst'] = 1
+            chs = [c for x in pulse.ro_chs for c in (x if isinstance(x, list) else [x])]
+            self.add_readoutconfig(ch=chs[0] if len(chs) == 1 else chs, name=copyname, **params)
+            self.pulses[copyname].phrst_of = name
+        return copyname
 
     def trigger(self, ros=None, tts=None, pins=None, t=0, width=None, ddr4=False, mr=False, tag=None):
         """Pulse readout triggers and output pins.
@@ -3080,15 +3154,16 @@ class AveragerProgramV2(AcquireProgramV2):
         Instructions to execute before the contents of the "reps" loop.
     after_reps : AsmV2
         Instructions to execute after the contents of the "reps" loop.
-    align : bool
+    align : bool or None
         On firmware with a time-sync period (see time_sync_period_us()), round initial_delay up so the loops start on the grid,
-        and lengthen final_delay so that every shot ends on the grid; a phase reset in the shot (e.g. reset_phases()) is then on the same tick in every shot.
+        and lengthen final_delay so that every shot ends on the grid (by less than one period); a phase reset in the shot (e.g. reset_phases()) is then on the same tick in every shot.
         If final_delay is swept, its max value is used.
+        None (the default): do this only if the shot contains a phase reset. True: always. False: never.
         No effect on other firmware.
     """
 
     COUNTER_ADDR = 1
-    def __init__(self, soccfg, reps, final_delay, final_wait=0, initial_delay=1.0, reps_innermost=False, before_reps=None, after_reps=None, cfg=None, align=False):
+    def __init__(self, soccfg, reps, final_delay, final_wait=0, initial_delay=1.0, reps_innermost=False, before_reps=None, after_reps=None, cfg=None, align=None):
         self.cfg = {} if cfg is None else cfg.copy()
         self.align = align
         self.reps = reps
@@ -3186,12 +3261,27 @@ class AveragerProgramV2(AcquireProgramV2):
         """
         pass
 
+    def _has_reset(self, macros):
+        # whether any of these macros issues a phase reset
+        for m in macros:
+            if isinstance(m, ResetPhases):
+                return True
+            if isinstance(m, Pulse) and m.name in self.pulses and _has_phrst(self, self.pulses[m.name], gen_ch=m.ch):
+                return True
+            if isinstance(m, ConfigReadout) and m.name in self.pulses and _has_phrst(self, self.pulses[m.name]):
+                return True
+        return False
+
     def make_program(self):
         # play the initialization
         self.set_ext_counter(addr=self.COUNTER_ADDR)
         self._initialize(self.cfg)
+        # the delays that align pads; with align=None this is decided once the shot is known
+        padded = []
         if self.initial_delay is not None:
-            self.delay_auto(self.initial_delay, align=self.align)
+            self.delay_auto(self.initial_delay, align=self.align is True)
+            padded.append(self.macro_list[-1])
+        shot_start = len(self.macro_list)
 
         for name, count, before, after in self.loops:
             self.open_loop(count, name=name)
@@ -3202,7 +3292,8 @@ class AveragerProgramV2(AcquireProgramV2):
         if self.final_wait is not None:
             self.wait_auto(self.final_wait, no_warn=True)
         if self.final_delay is not None:
-            self.delay_auto(self.final_delay, align=self.align)
+            self.delay_auto(self.final_delay, align=self.align is True)
+            padded.append(self.macro_list[-1])
         self.inc_ext_counter(addr=self.COUNTER_ADDR)
 
         # close the loops in reverse order
@@ -3210,6 +3301,12 @@ class AveragerProgramV2(AcquireProgramV2):
         for name, count, before, after in self.loops[::-1]:
             if after is not None: self.extend_macros(after)
             self.close_loop()
+
+        # automatic alignment: only if there is a period and the shot (or a subroutine) has a phase reset
+        if self.align is None and self.tproccfg.get('time_sync_period', 0) > 1:
+            shot = self.macro_list[shot_start:] + [m for asm in self.subroutines.values() for m in asm.macro_list]
+            if self._has_reset(shot):
+                for m in padded: m.align = True
 
         self._cleanup(self.cfg)
 
