@@ -54,6 +54,11 @@ One TCP connection. Every message is a frame:
     body     raw bytes (may be empty); arrays are described in the header as
              {"name", "dtype", "shape", "offset", "nbytes"} and laid end to end
 
+All lengths and all array data are little-endian. A header is at most 1 MiB.
+A body is at most 64 MiB: larger data (DDR4 captures) is always split into
+chunks. Unknown header fields are ignored and an unknown message type is
+answered with `error`, so the two ends can differ in version.
+
 JSON for the header keeps the board dependency-free and easy to debug; the
 body carries the bulk without encoding. (MessagePack would also work, but is
 not in the standard library.)
@@ -64,11 +69,16 @@ Client to board:
 
 | Type | Purpose | Main fields |
 |---|---|---|
-| `hello` | Authenticate and negotiate | `token`, `protocol` version, client library version |
+| `hello` | Start; the board replies with a `challenge` (a nonce) | `protocol` version, client library version, `label` (engine, setup, person or agent), role wanted (`run` or `read`) |
+| `auth` | Answer the challenge | HMAC-SHA256 of the nonce with the token; the token never crosses the wire |
 | `get_config` | Fetch the board configuration (`soccfg`) | |
-| `submit` | Queue a job | `kind` (`"qick_prog"`), `prog` (the `dump_prog` dictionary; envelopes and weights in the body), `run` (rounds, start source, thresholds, which buffers to return, chunk size), `limits` (queue memory bound, policy when reached) |
-| `status` | State of one job or all | `job` |
-| `fetch` | Ask for chunks of a job from a sequence number | `job`, `from_seq`, `wait` |
+| `put_prog` | Store a program in the board's cache | the `dump_prog` dictionary (envelopes and weights in the body); the board replies with its content hash |
+| `submit` | Queue a job | `kind` (`"qick_prog"`), `prog_ref` (content hash; `error` "unknown program" if evicted) or the program inline, `run` (rounds, start source, thresholds, which buffers to return, chunk size, `reduce`, time limit), `limits` (queue memory bound, policy when reached), `ref` (the client's own job reference) |
+| `subscribe` | Watch a running job without owning it | `job`, delivery `newest_only`; no `ack` rights, never slows the owner |
+| `get_state` | Board settings that are not in the program | |
+| `board_change` | Reserved: anything that changes the board for everyone (bitstream, attenuators, clocks) | refused while another client's job is queued or running unless `force`; logged with who asked. Not in version 1 except attenuators if needed |
+| `status` | State of one job, or with no job: connected clients (labels), the queue (each job's submitter and `ref`), server uptime, memory in use against the bound, last error, and when the outputs were last made idle | `job` |
+| `fetch` | Resume a job's chunks from a sequence number after a reconnect (not needed otherwise: chunks are pushed) | `job`, `from_seq` |
 | `ack` | Client has safely stored chunks up to a sequence number; the board may free them | `job`, `seq` |
 | `cancel` | Stop a job | `job` |
 | `bye` | Close | |
@@ -77,13 +87,15 @@ Board to client:
 
 | Type | Purpose | Main fields |
 |---|---|---|
-| `welcome` | Reply to `hello` | protocol version, QICK library version, firmware identity (name, timestamp, hash of the hardware description), board, Python version, `time_sync_period` and other capabilities |
+| `challenge` | Reply to `hello` | nonce |
+| `welcome` | Reply to a correct `auth` | protocol version, QICK library version, hash of the server's own code, firmware identity (name, timestamp, hash of the hardware description), board, Python version, `time_sync_period` and other capabilities, the board's wall-clock time and its monotonic time now |
 | `config` | Reply to `get_config` | the `soccfg` JSON |
-| `accepted` | Reply to `submit` | `job`, position in queue |
+| `accepted` | Reply to `submit` | `job`, position in queue, the run parameters in effect after defaults, and the result layout: order of loop dimensions, readouts and rounds, and values per shot per readout, so a chunk can be written straight into the sweep array |
 | `chunk` | A piece of results | `job`, `seq`, `round`, `shots` = [first, last) covered, arrays in the body, `queued_bytes` |
-| `event` | Something the client must know | `job`, `kind`: `started`, `overrun` (firmware buffer overwritten: which shots), `dropped` (queue bound reached: which `seq`), `stopped`, `error` (with message) |
-| `done` | Job finished | `job`, outcome (`complete`, `incomplete`, `cancelled`, `failed`), totals, timing breakdown (load, run, drain) |
-| `error` | Request refused | reason (bad token, unsupported protocol, unknown job, program format not understood) |
+| `event` | Something the client must know | `job`, `kind`: `started`, `overrun` (firmware buffer overwritten: which shots), `dropped` (queue bound reached: which `seq`), `stopped`, `error` (with the Python traceback text) |
+| `state` | Reply to `get_state` | ADC attenuators, DAC settings where readable, mixer/NCO settings, reference and lock state, temperatures if cheap |
+| `done` | Job finished | `job`, outcome (`complete`, `incomplete`, `cancelled`, `failed`, `timed_out`), totals, whether outputs were made idle, times of: received, queued, loaded, started, finished, drained, sent |
+| `error` | Request refused | reason (authentication failed, unsupported protocol, unknown job, unknown program, program format not understood: which field, board limit exceeded: which) |
 
 ## Behaviour to agree
 
@@ -98,11 +110,37 @@ Board to client:
   the drain position against the ring length. It is reported with the affected
   shot range; the job outcome becomes `incomplete`.
 - **One job runs at a time**; `submit` while one runs queues behind it.
+  Several `submit`s sent back to back run with no gap between them.
+- **Chunks are pushed** on the submitting connection as they are produced;
+  there is no polling. `done` follows the last chunk.
+- **Program cache** by content hash, so a repeated program is neither sent
+  nor loaded again. (A program whose parameters changed is a different
+  compiled program; avoiding a reload for that needs the board to diff the
+  program and waveform memories, which is possible later.)
+- **Times** are seconds on the board's monotonic clock since the server
+  started. The board's wall clock is given once in `welcome` and is not
+  trusted.
+- **Outputs made idle.** At the end of every job, on cancel, on error, on a
+  time limit and on a stop caused by the queue bound, the board stops the
+  tProc and resets the generators, and records when it did. This is what the
+  board commanded, not a measurement at the DAC.
+- **Board-side limits** (optional): a file an administrator writes on the
+  board with a maximum gain per generator and maximum pulse and run
+  durations. Checked at `submit` against the compiled program's waveform
+  table, including the extremes of sweeps, and refused with a reason. It
+  cannot see values a program computes at run time, so it is a guard against
+  mistakes, not a guarantee.
+- **Tokens** reach the board by the lab's claim-link convention into a file
+  only the server can read, are stored hashed and never logged. Two roles:
+  `run` and `read`.
 - **Averaging on the board** is optional per job (`run.reduce`): return every
   shot, or return running sums per chunk so a long average does not move
   every shot over the network.
 
 ## Open points
+
+- Version 1 leaves out bitstream loading, compile-on-board jobs and TLS; the
+  request types are reserved.
 
 - Which non-shared ZCU216 to test on, and when to start (Dave).
 - Whether the generic JSON-configured program is compiled on the PC and sent
