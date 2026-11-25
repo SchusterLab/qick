@@ -6246,6 +6246,11 @@
         <spirit:value spirit:format="long" spirit:resolve="generated" spirit:id="MODELPARAM_VALUE.FIFO_DEPTH">9</spirit:value>
       </spirit:modelParameter>
       <spirit:modelParameter spirit:dataType="integer">
+        <spirit:name>FIFO_GUARD</spirit:name>
+        <spirit:displayName>Fifo Guard</spirit:displayName>
+        <spirit:value spirit:format="long" spirit:resolve="generated" spirit:id="MODELPARAM_VALUE.FIFO_GUARD">8</spirit:value>
+      </spirit:modelParameter>
+      <spirit:modelParameter spirit:dataType="integer">
         <spirit:name>EXT_FLAG</spirit:name>
         <spirit:displayName>Ext Flag</spirit:displayName>
         <spirit:value spirit:format="long" spirit:resolve="generated" spirit:id="MODELPARAM_VALUE.EXT_FLAG">0</spirit:value>
@@ -6693,6 +6698,11 @@
       <spirit:value spirit:format="long" spirit:resolve="user" spirit:id="PARAM_VALUE.FIFO_DEPTH" spirit:choiceRef="choice_pairs_44b09f3c">9</spirit:value>
     </spirit:parameter>
     <spirit:parameter>
+      <spirit:name>FIFO_GUARD</spirit:name>
+      <spirit:displayName>Free FIFO entries kept (core pauses when fewer remain; 0 = pause only when full)</spirit:displayName>
+      <spirit:value spirit:format="long" spirit:resolve="user" spirit:id="PARAM_VALUE.FIFO_GUARD" spirit:minimum="0" spirit:maximum="64" spirit:rangeType="long">8</spirit:value>
+    </spirit:parameter>
+    <spirit:parameter>
       <spirit:name>EXT_FLAG</spirit:name>
       <spirit:displayName>External Flag</spirit:displayName>
       <spirit:value spirit:format="long" spirit:resolve="user" spirit:id="PARAM_VALUE.EXT_FLAG" spirit:choiceRef="choice_list_8af5a703">0</spirit:value>
@@ -6746,7 +6756,7 @@
       </xilinx:xpmLibraries>
       <xilinx:vendorDisplayName>Quantum Instrumentation Control Kit</xilinx:vendorDisplayName>
       <xilinx:vendorURL>https://github.com/openquantumhardware/qick/</xilinx:vendorURL>
-      <xilinx:coreRevision>28</xilinx:coreRevision>
+      <xilinx:coreRevision>29</xilinx:coreRevision>
       <xilinx:coreCreationDateTime>2025-09-11T21:28:22Z</xilinx:coreCreationDateTime>
     </xilinx:coreExtensions>
     <xilinx:packagingInfo>

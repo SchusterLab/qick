@@ -1954,6 +1954,13 @@ class QickSoc(Overlay, QickConfig):
             if self.tproc.get_start_src() == 'internal':
                 self.tproc.start()
 
+    def check_tproc_queues(self):
+        """Raise RuntimeError if a tProc v2 dispatcher queue lost a push during the
+        last run (lab firmware with the queue flags; does nothing otherwise).
+        """
+        if self.TPROC_VERSION == 2:
+            self.tproc.check_queue_overflow()
+
     def stop_tproc(self, lazy=False):
         """
         Stop the tProc.

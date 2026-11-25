@@ -3,6 +3,71 @@
 Running log for the lab fork. Newest entry first. Record dead ends as well as
 results, and say where each number came from.
 
+## 2026-11-25: tProc v2 dispatcher queue overflow (branch `lab/tproc-overflow`)
+
+Report: on a ZCU216 with stock tProc v2 firmware and library 0.2.450, a shot with
+N = 300 readouts (`send_readoutconfig`, `pulse`, `trigger(ros=[ch], pins=[0])`,
+microsecond spacing) put only about 255 readouts per repetition into the
+accumulated buffer, contiguous; the next program's data were shifted too; a
+`wait(0)` every 32 triggers fixed it.
+
+Queue use per operation (tProc v2, one 512-entry queue per port, usable 511):
+a `trigger` takes 2 entries (set and clear) in the queue of each trigger port
+it drives, so `ros=[ch], pins=[0]` takes 2 in port 10's queue and 2 in port 0's;
+a `pulse` takes 1 entry per waveform in its generator's wave queue (a pulse
+built from several waveforms takes several); a `send_readoutconfig` takes 1 in
+the readout's wave queue. With N = 300 the two trigger queues need 600 entries
+each, the wave queues 300. 511 / 2 = 255.5 triggers is the reported count:
+the trigger queue filled and everything pushed after that was dropped until
+`wait_auto` let it drain.
+
+Simulation (`slab/sim/fifo_overflow/`, xsim, qick_processor configured like the
+stock design: 20 trigger, 16 wave, 1 data port, FIFO_DEPTH 9, t_clk 430.08 MHz,
+core 215.04 MHz; N = 300, 2 repetitions, 2 us spacing):
+
+| Sources | TPROC_CFG | readout triggers out | lost pushes | REG9 |
+|---|---|---|---|---|
+| rev 21 (stock 2024-09 design), before this change | 0 | 600 / 600 | 0 | n/a |
+| this fork before this change | 0 | 600 / 600 | 0 | 0x009 |
+| this fork before this change | 0x800 (no pause) | 538 / 600 | 244 trigger | 0x009 (no flags) |
+| this change | 0 | 600 / 600 | 0 | 0x009 |
+| this change | 0x800 (no pause) | 538 / 600 | 244 trigger | 0x109 (trigger flag); 0x009 after the next start |
+
+With this change and the pause on, no queue was ever full (full cycles 0;
+26511 before the change) and nothing was lost for N = 500 unrolled (2000
+trigger pushes) and N = 2000 in a tProc loop (8000 trigger and 4000 wave
+pushes, 2000 / 2000 readout triggers out); the core was paused for 44538 and
+328182 core cycles and resumed each time.
+
+The register-transfer logic pauses the core correctly whenever bit 11 of
+TPROC_CFG is 0 (the library never sets it), in the rev-21 sources as well as
+current ones. So the hardware loss matches a queue that does not pause the core,
+but the cause of the missing pause was not reproduced in simulation. Candidates
+not checked: timing of the combinational path from 37 full flags to the enable
+of the whole core, or a board bitstream that differs from the sources (read
+`soc['tprocs'][0]['revision']` on the board). The docstring for TPROC_CFG[11]
+had the polarity backwards (1 means do not pause); `tfifo_full` is part of
+`some_fifo_full`.
+
+Change: the pause now comes from a registered almost-full flag (`FIFO_GUARD`
+free entries, default 8, at least 5 to cover the pushes in flight), which also
+takes the long combinational path out; sticky lost-push flags per queue type
+are in register 9 and the library raises after each round when one is set.
+
+Next program shifted: the accumulated buffer's write address is reset by the
+library (`config_avg` stops the capture FSM and loads the address; `enable_buf`
+starts it), not by the tProc. `prepare_round` armed the buffers before resetting
+the tProc, and a stopped tProc keeps its trigger outputs and queued entries. A
+program whose trigger-clear was dropped leaves the readout trigger high; the
+re-armed buffer then captures one window at address 0 at once, and every later
+measurement lands one address late. `slab/sim/avg_rearm/` shows it with
+`avg.sv`: arm-then-reset gives 6 writes for 5 triggers, reset-then-arm gives 5.
+`prepare_round` now resets the tProc first. This is inferred from the sources
+and that simulation; it was not seen on hardware. The streamer also reads
+`shots x reads_per_shot` entries per shot counted by the tProc, so in a run that
+loses triggers it reads past the buffer's write pointer and returns old data;
+the new error stops that run instead.
+
 ## 2026-11-24: bare `reset_phases()` at the top of the body (branch `lab/phrst-grid`)
 
 - From user feedback: the common case is one call at the start of `_body`.

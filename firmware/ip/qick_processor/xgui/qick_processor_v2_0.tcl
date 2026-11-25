@@ -44,6 +44,7 @@ proc init_gui { IPINST } {
   ipgui::add_param $IPINST -name "OUT_DPORT_QTY" -parent ${GROUP1}
   ipgui::add_param $IPINST -name "OUT_DPORT_DW" -parent ${GROUP1}
   ipgui::add_param $IPINST -name "FIFO_DEPTH" -parent ${GROUP1} -widget comboBox
+  ipgui::add_param $IPINST -name "FIFO_GUARD" -parent ${GROUP1}
 
   #Adding Group
   set GROUP [ipgui::add_group $IPINST -name "GROUP" -parent ${OUT_Port_Configuration} -display_name {QICK SIGNALS}]
@@ -455,4 +456,18 @@ proc validate_PARAM_VALUE.TIME_SYNC_PERIOD { PARAM_VALUE.TIME_SYNC_PERIOD } {
 proc update_MODELPARAM_VALUE.TIME_SYNC_PERIOD { MODELPARAM_VALUE.TIME_SYNC_PERIOD PARAM_VALUE.TIME_SYNC_PERIOD } {
 	# Procedure called to set VHDL generic/Verilog parameter value(s) based on TCL parameter value
 	set_property value [get_property value ${PARAM_VALUE.TIME_SYNC_PERIOD}] ${MODELPARAM_VALUE.TIME_SYNC_PERIOD}
+}
+
+proc update_PARAM_VALUE.FIFO_GUARD { PARAM_VALUE.FIFO_GUARD } {
+	# Procedure called to update FIFO_GUARD when any of the dependent parameters in the arguments change
+}
+
+proc validate_PARAM_VALUE.FIFO_GUARD { PARAM_VALUE.FIFO_GUARD } {
+	# Procedure called to validate FIFO_GUARD
+	return true
+}
+
+proc update_MODELPARAM_VALUE.FIFO_GUARD { MODELPARAM_VALUE.FIFO_GUARD PARAM_VALUE.FIFO_GUARD } {
+	# Procedure called to set VHDL generic/Verilog parameter value(s) based on TCL parameter value
+	set_property value [get_property value ${PARAM_VALUE.FIFO_GUARD}] ${MODELPARAM_VALUE.FIFO_GUARD}
 }
