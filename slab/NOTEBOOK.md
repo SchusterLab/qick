@@ -76,6 +76,34 @@ results, and say where each number came from.
   testbench config. The reference programs for "no period, no change" were
   compiled with the library on `main` before the change. Not run on a board.
 
+## 2026-11-25: lab ZCU216 build meets timing in Vivado 2024.1
+
+Setup slack 0.000 ns, hold 0.000 ns, no failing endpoints, no routing errors
+("All user specified timing constraints are met"). Sources: commit 91387476.
+Not loaded on a board.
+
+What it took, starting from the default run's -0.075 ns:
+
+| Tried | Worst setup slack |
+|---|---|
+| Strategies Performance_Explore, ExplorePostRoutePhysOpt, ExtraTimingOpt | -0.33, -0.33, -0.10 |
+| Post-route phys_opt on the default run | -0.074 |
+| DONT_TOUCH on the FIFO reset registers | -0.565 |
+| Four overlapping pblocks, one per converter-tile group | -0.753 |
+| place_design directives: AltSpreadLogic low/medium/high, ExtraNetDelay low/high, ExtraPostPlacementOpt, WLDrivenBlockPlacement | -0.07 to -0.27 |
+| place_design -directive EarlyBlockPlacement, AggressiveExplore phys_opt and route | -0.018 |
+| ... then place_design -post_place_opt, route_design, phys_opt_design twice | 0.000 |
+
+- The failing paths were never one slow piece of logic: about 900 endpoints
+  across 174 kinds of path, all short by 0.05-0.075 ns, 85-95% routing delay.
+- The naive floorplan pulled the tProc apart (it talks to every generator);
+  its 430 MHz and core clocks then failed by 0.6-0.75 ns.
+- `place_design -post_place_opt` unroutes what it moves: judge timing only
+  after the following `route_design`.
+- Margin is zero. Any change to the design will need the same treatment, and
+  the result should be the reference for incremental implementation.
+- The stock design under the same strategies reached -0.033 ns (not polished).
+
 ## 2026-11-24: first firmware builds in Vivado 2024.1
 
 Both builds: default implementation strategy, about 3 hours each, bitstream
