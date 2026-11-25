@@ -3,6 +3,27 @@
 Running log for the lab fork. Newest entry first. Record dead ends as well as
 results, and say where each number came from.
 
+## 2026-11-24: helpers for phase resets on legal ticks (branch `lab/phrst-grid`)
+
+- `reset_phases(gens=[...], ros={ch: config}, t=None)`: resets the named
+  generators (built-in "phrst" waveform) and readouts (a readout config with
+  `phrst=1`; a bare reset would also retune the readout) on one legal tick.
+  With `t=None` that is the first tick at which the named channels are free,
+  according to the library's timestamps; an explicit `t` is rounded up. The
+  reference time then moves past the resets, rounded up to the grid. Without
+  a period: issued at `t` and the reference moves past the resets.
+- `AveragerProgramV2(..., align=True)`: initial delay and end-of-shot delay
+  chosen so the loops start and every shot ends on the grid. A swept
+  end-of-shot delay becomes its max value. No effect without a period.
+- `delay(..., align=True)` now lengthens the delay so the reference time
+  after it is on the grid (before: the delay was rounded to a multiple of the
+  period, which is the same when the reference was already on the grid).
+- `phase_reset_times()`: what the checker sees, also on firmware without a
+  period. `TimeGrid` now always runs; without a period it only records and
+  never raises, and the reference programs still compile identically.
+- Usage note: `notes/phase-reset-usage.md`. The examples in it were compiled
+  off-board; not run on a board.
+
 ## 2026-11-24: library schedules phase resets on legal ticks (branch `lab/phrst-grid`)
 
 - The tProc v2 driver reads `TIME_SYNC_PERIOD` into

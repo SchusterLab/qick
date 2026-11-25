@@ -873,10 +873,20 @@ class Delay(TimedMacro):
                 delay = None
             else:
                 delay += max_t
-        if getattr(self, 'align', False) and delay is not None and prog.time_sync_period_us() > 0:
+        grid = prog._time_grid
+        if getattr(self, 'align', False) and delay is not None and grid.strict:
             if delay.is_sweep():
-                raise RuntimeError("a delay with align=True can't be swept, but this one is %s" % (delay))
-            delay = QickParam(prog.round_up_to_sync_tick(float(delay)))
+                # a swept delay can't keep the reference on the grid: use the longest value
+                logger.warning("delay with align=True would be swept (%s), so using its max value of %f us" % (delay, delay.maxval()))
+                delay = QickParam(delay.maxval())
+            cycles = int(np.ceil(np.round(prog.us2cycles(float(delay), as_float=True), 6)))
+            if grid.ref is not None:
+                # round up so that the reference time after the delay is on the grid
+                cycles = grid.next_tick(cycles)
+            else:
+                # absolute time unknown: at least keep the delay a multiple of the period
+                cycles = -(-cycles//grid.period)*grid.period
+            delay = QickParam(prog.cycles2us(cycles))
         delay_rounded = self.convert_time(prog, delay, "t")
         prog.decrement_timestamps(delay_rounded)
     def expand(self, prog):
@@ -1001,7 +1011,7 @@ class Pulse(TimedMacro):
             prog.set_timestamp(t + pulse_length, gen_ch=self.ch)
         else:
             if t<ts:
-                if prog._time_grid is not None and prog._time_grid.has_phrst(pulse, gen_ch=self.ch):
+                if prog._time_grid.strict and prog._time_grid.has_phrst(pulse, gen_ch=self.ch):
                     # the generator would apply the reset when the previous pulse ends, not at t
                     t_max = t.maxval() if isinstance(t, QickParam) else t
                     ts_min = ts.minval() if isinstance(ts, QickParam) else ts
@@ -1137,15 +1147,60 @@ class Trigger(TimedMacro):
                 if imm_time: insts[-1].inst['TIME'] = '@'+str(t_reg+width_reg)
         return insts
 
+class ResetPhases(TimedMacro):
+    # gens (list of int), ros (dict of readout channel: readout config name), t (float or None)
+    # expands to a phase-reset pulse on each generator and a readout config on each readout, all at the same time,
+    # followed by a delay that moves the reference time past the resets
+    def preprocess(self, prog):
+        grid = prog._time_grid
+        if self.t is None:
+            # the earliest time at which all the named channels are free
+            ts = [prog.get_timestamp(gen_ch=ch) for ch in self.gens] + [prog.get_timestamp(ro_ch=ch) for ch in self.ros]
+            t = max([0] + [x.maxval() if isinstance(x, QickParam) else x for x in ts])
+            cycles = int(np.ceil(np.round(prog.us2cycles(t, as_float=True), 6)))
+            # guard against float rounding putting the resets just before the end of a pulse
+            while prog.cycles2us(cycles) < t: cycles += 1
+        else:
+            if isinstance(self.t, QickParam) and self.t.is_sweep():
+                raise RuntimeError("reset_phases() can't take a swept time, but got %s" % (self.t))
+            if grid.strict:
+                cycles = int(np.ceil(np.round(prog.us2cycles(float(self.t), as_float=True), 6)))
+            else:
+                cycles = prog.us2cycles(float(self.t))
+        # on firmware with a period, the next legal tick
+        cycles = grid.next_tick(cycles)
+
+        self.macros = []
+        lengths = [0]
+        for ch in self.gens:
+            name = "phrst_gen%d" % (ch)
+            self.macros.append(Pulse(ch=ch, name=name, t=prog.cycles2us(cycles), tag=None))
+            lengths.append(prog.pulses[name].get_length().maxval())
+        for ch, name in self.ros.items():
+            self.macros.append(ConfigReadout(ch=ch, name=name, t=prog.cycles2us(cycles), tag=None))
+            lengths.append(prog.pulses[name].get_length().maxval())
+        # move the reference time to the end of the resets, rounded up to the grid
+        length = int(np.ceil(np.round(prog.us2cycles(max(lengths), as_float=True), 6)))
+        if grid.strict:
+            length = -(-length//grid.period)*grid.period
+        self.macros.append(Delay(t=prog.cycles2us(cycles + length), auto=False, tag=None))
+        for m in self.macros:
+            m.preprocess(prog)
+        self.t_params = self.macros[-1].t_params
+
+    def expand(self, prog):
+        return self.macros
+
 class TimeGrid:
-    """Checks that every phase reset is issued on a legal tick.
+    """Follows the absolute tProc time of every phase reset, and checks that each one is issued on a legal tick.
 
     On firmware with a time-sync period (the tProc parameter TIME_SYNC_PERIOD), time zero falls on a fixed point of the common period of the tProc, generator and readout clocks.
     A phase reset lands on a reproducible sample only if it is issued at an absolute tProc time (reference time + t) that is a multiple of that period.
     This class follows the reference time through the macro list during preprocessing and raises an error for any phase reset that is not on a legal tick, or whose time is not known at compile time.
     Nothing is moved: a program that breaks the rule is refused.
 
-    It is only used if the period is greater than 1; otherwise the compiler does not create one.
+    If the period is 0 or 1 (no time-sync option), the class only records the times of the phase resets for phase_reset_times(), and never raises:
+    if it fails on an unusual program it stops recording, and the compiled program is unaffected.
     """
     PHRST_BIT = 0b010000
     BRANCHES = {Label: 'label', Jump: 'jump', Call: 'call', CondJump: 'cond_jump'}
@@ -1153,6 +1208,9 @@ class TimeGrid:
     def __init__(self, prog, period):
         self.prog = prog
         self.period = period
+        # enforce the rule only if there is a period; otherwise just record
+        self.strict = period > 1
+        self.mod = period if self.strict else 1
         # reference time (cycles) in the first iteration of every loop, None if not known at compile time
         self.ref = 0
         self.why = None
@@ -1162,6 +1220,10 @@ class TimeGrid:
         self.branch = None
         self.first_phrst = None
         self.off_grid = None
+        # every phase reset seen, for phase_reset_times()
+        self.resets = []
+        # in recording-only mode: why recording stopped, if it did
+        self.failed = None
 
     def _fmt(self, cycles):
         return "%d cycles (%.4f us)" % (cycles, self.prog.cycles2us(cycles))
@@ -1169,10 +1231,19 @@ class TimeGrid:
     def _period_str(self):
         return "the time-sync period of %s" % (self._fmt(self.period))
 
+    def _hint(self):
+        if isinstance(self.prog, AveragerProgramV2) and not self.prog.align:
+            return " With AveragerProgramV2, align=True rounds initial_delay up to the grid and makes every shot a multiple of the period."
+        return ""
+
+    def _raise(self, msg):
+        if self.strict:
+            raise RuntimeError(msg + self._hint())
+
     def _bad_step(self, raw):
         # first loop where a swept value (QickRawParam) steps by a non-multiple of the period
         for loop, steps in raw.steps.items():
-            if steps['step'] % self.period:
+            if steps['step'] % self.mod:
                 return loop, steps['step']
         return None
 
@@ -1181,6 +1252,15 @@ class TimeGrid:
             # for muxed generators this bit of the config word is a tone mask bit
             return False
         return any(int(self.prog._get_wave(w).conf) & self.PHRST_BIT for w in pulse.get_wavenames())
+
+    def next_tick(self, t):
+        """The smallest time >= t (cycles, relative to the reference time) that is on the grid.
+        Without a period, t itself."""
+        if not self.strict:
+            return t
+        if self.ref is None:
+            raise RuntimeError("can't place a phase reset on the grid: the absolute tProc time is not known at compile time (%s)" % (self.why))
+        return -((-(self.ref + t))//self.period)*self.period - self.ref
 
     def set_unknown(self, why):
         self.ref = None
@@ -1195,7 +1275,7 @@ class TimeGrid:
                 self.set_unknown("%s is swept in loop '%s' with step %d cycles, not a multiple of %d" % (what, bad[0], bad[1], self.period))
                 return
             cycles = cycles.start
-        if cycles % self.period and self.off_grid is None:
+        if cycles % self.mod and self.off_grid is None:
             self.off_grid = "%s moves the reference time by %d cycles, not a multiple of %d" % (what, cycles, self.period)
         if self.ref is not None:
             self.ref += cycles
@@ -1210,40 +1290,46 @@ class TimeGrid:
             body = self.ref - loop['ref0']
         if loop['count'] > 1 and loop['phrst'] is not None:
             if body is None:
-                raise RuntimeError("%s has a phase reset inside loop '%s', and the time taken by one iteration of that loop is not known at compile time (%s), so the reset would not be on a legal tick in later iterations"
+                self._raise("%s has a phase reset inside loop '%s', and the time taken by one iteration of that loop is not known at compile time (%s), so the reset would not be on a legal tick in later iterations."
                         % (loop['phrst'], loop['name'], self.why))
-            if body % self.period:
-                raise RuntimeError("%s has a phase reset inside loop '%s', and one iteration of that loop moves the reference time by %s, which is not a multiple of %s; the reset would land on a different tick in each iteration. "
+            elif body % self.mod:
+                self._raise("%s has a phase reset inside loop '%s', and one iteration of that loop moves the reference time by %s, which is not a multiple of %s; the reset would land on a different tick in each iteration. "
                         "Make the loop body a multiple of the period, e.g. with delay_auto(..., align=True)."
                         % (loop['phrst'], loop['name'], self._fmt(body), self._period_str()))
         if body is not None:
             self.ref = loop['ref0'] + loop['count']*body
 
-    def check(self, what, t):
+    def check(self, what, t, chname, ch):
         # what: description of the instruction; t: its time relative to the reference, int or QickRawParam (cycles)
         for loop in self.loops:
             if loop['phrst'] is None: loop['phrst'] = what
         if self.first_phrst is None: self.first_phrst = what
-        if self.ref is None:
-            raise RuntimeError("%s has a phase reset, but its absolute tProc time is not known at compile time: %s" % (what, self.why))
-        if isinstance(t, QickRawParam):
+        swept = isinstance(t, QickRawParam)
+        t0 = t.start if swept else t
+        t_abs = None if self.ref is None else self.ref + t0
+        self.resets.append({'what': what, chname: ch, 't': t0, 'swept': swept,
+                            'cycles': t_abs, 'us': None if t_abs is None else self.prog.cycles2us(t_abs),
+                            'loops': [l['name'] for l in self.loops],
+                            'on_grid': None if not self.strict else (t_abs is not None and t_abs % self.period == 0 and (not swept or self._bad_step(t) is None))})
+        if t_abs is None:
+            self._raise("%s has a phase reset, but its absolute tProc time is not known at compile time: %s." % (what, self.why))
+            return
+        if swept:
             bad = self._bad_step(t)
             if bad is not None:
-                raise RuntimeError("%s has a phase reset, and its time is swept in loop '%s' with step %d cycles, which is not a multiple of %s"
+                self._raise("%s has a phase reset, and its time is swept in loop '%s' with step %d cycles, which is not a multiple of %s."
                         % (what, bad[0], bad[1], self._period_str()))
-            t = t.start
-        t_abs = self.ref + t
-        off = t_abs % self.period
+        off = t_abs % self.mod
         if off:
             lo = t_abs - off
             hi = lo + self.period
             loopnote = " (first iteration of loops %s)" % ([l['name'] for l in self.loops]) if self.loops else ""
-            raise RuntimeError("%s has a phase reset at tProc time %s after time zero%s, which is not a multiple of %s. "
+            self._raise("%s has a phase reset at tProc time %s after time zero%s, which is not a multiple of %s. "
                     "The nearest legal times are %.4f us and %.4f us after time zero, i.e. t=%.4f us or t=%.4f us for this instruction "
-                    "(the reference time is %s). round_up_to_sync_tick() rounds a time up to the grid."
+                    "(the reference time is %s). round_up_to_sync_tick() rounds a time up to the grid, and reset_phases() picks a legal tick for you."
                     % (what, self._fmt(t_abs), loopnote, self._period_str(),
                        self.prog.cycles2us(lo), self.prog.cycles2us(hi),
-                       self.prog.cycles2us(t-off), self.prog.cycles2us(t-off+self.period), self._fmt(self.ref)))
+                       self.prog.cycles2us(t0-off), self.prog.cycles2us(t0-off+self.period), self._fmt(self.ref)))
 
     def _raw(self, t_reg):
         # the time of a timed macro, as an int or a stepped QickRawParam
@@ -1253,8 +1339,20 @@ class TimeGrid:
 
     def observe(self, macro):
         """Update the state after a macro has been preprocessed."""
+        if self.strict:
+            self._observe(macro)
+        elif self.failed is None:
+            try:
+                self._observe(macro)
+            except Exception as e:
+                self.failed = "%s while processing %s" % (repr(e), macro)
+
+    def _observe(self, macro):
         prog = self.prog
-        if isinstance(macro, OpenLoop):
+        if isinstance(macro, ResetPhases):
+            for m in macro.macros:
+                self._observe(m)
+        elif isinstance(macro, OpenLoop):
             self.open_loop(macro.name, macro.n)
         elif isinstance(macro, CloseLoop):
             self.close_loop()
@@ -1267,10 +1365,10 @@ class TimeGrid:
             self.set_unknown("resync() adds a delay that is computed at run time")
         elif isinstance(macro, Pulse):
             if self.has_phrst(prog.pulses[macro.name], gen_ch=macro.ch):
-                self.check("pulse '%s' on gen %d" % (macro.name, macro.ch), self._raw(macro.t_regs['t']))
+                self.check("pulse '%s' on gen %d" % (macro.name, macro.ch), self._raw(macro.t_regs['t']), 'gen', macro.ch)
         elif isinstance(macro, ConfigReadout):
             if self.has_phrst(prog.pulses[macro.name]):
-                self.check("readout config '%s' on readout %d" % (macro.name, macro.ch), self._raw(macro.t_regs['t']))
+                self.check("readout config '%s' on readout %d" % (macro.name, macro.ch), self._raw(macro.t_regs['t']), 'ro', macro.ch)
         elif type(macro) in self.BRANCHES:
             if self.branch is None: self.branch = "%s('%s')" % (self.BRANCHES[type(macro)], macro.label)
         elif isinstance(macro, AsmInst):
@@ -1291,7 +1389,7 @@ class TimeGrid:
         # with labels, jumps or calls the macro list is not the order of execution
         # the reference time is then on the grid at every point only if every change to it is a multiple of the period
         if self.branch is not None and self.first_phrst is not None and self.off_grid is not None:
-            raise RuntimeError("%s has a phase reset, and the program uses %s, so the library can't follow the time along every path. "
+            self._raise("%s has a phase reset, and the program uses %s, so the library can't follow the time along every path. "
                     "That is allowed only if every change of the reference time is a multiple of %s, but %s."
                     % (self.first_phrst, self.branch, self._period_str(), self.off_grid))
 
@@ -1582,8 +1680,9 @@ class AsmV2:
         tag: str
             arbitrary name for use with get_time_param()
         align : bool
-            On firmware with a time-sync period (see time_sync_period_us()), round the delay up to a multiple of the period,
-            so a reference time on the grid stays on it. The delay must not be swept. No effect on other firmware.
+            On firmware with a time-sync period (see time_sync_period_us()), lengthen the delay so the reference time after it is on the grid
+            (if the absolute time is not known at compile time, round the delay up to a multiple of the period).
+            A swept delay is replaced by its max value. No effect on other firmware.
         """
         # align is only stored if set, so programs that don't use it print as before
         self.append_macro(Delay(t=t, auto=False, tag=tag, **({'align': True} if align else {})))
@@ -1603,8 +1702,9 @@ class AsmV2:
         tag: str
             arbitrary name for use with get_time_param()
         align : bool
-            On firmware with a time-sync period (see time_sync_period_us()), round the delay up to a multiple of the period,
-            so a reference time on the grid stays on it. The delay must not be swept. No effect on other firmware.
+            On firmware with a time-sync period (see time_sync_period_us()), lengthen the delay so the reference time after it is on the grid
+            (if the absolute time is not known at compile time, round the delay up to a multiple of the period).
+            A swept delay is replaced by its max value. No effect on other firmware.
         """
         # align is only stored if set, so programs that don't use it print as before
         self.append_macro(Delay(t=t, auto=True, gens=gens, ros=ros, tag=tag, **({'align': True} if align else {})))
@@ -1701,6 +1801,47 @@ class AsmV2:
             arbitrary name for use with get_time_param()
         """
         self.append_macro(ConfigReadout(ch=ch, name=name, t=t, tag=tag))
+
+    def reset_phases(self, gens=None, ros=None, t=None):
+        """Reset the phase of the named generators and readouts, all at the same time.
+
+        On firmware with a time-sync period (see time_sync_period_us()), the time is a legal tick: an absolute tProc time that is a multiple of the period.
+        On other firmware the resets are issued at the time given, with no rounding.
+
+        Afterwards the reference time is moved to the end of the resets (rounded up to the grid, if there is a period),
+        so t=0 is free on every named channel, and on the grid.
+        Generators get the built-in "phrst" waveform: zero gain for 3 fabric cycles.
+        Readouts get the readout config you name, which must have been defined with add_readoutconfig(..., phrst=1):
+        a readout config also sets the frequency and phase, so the library can't send a bare reset to a readout.
+
+        Parameters
+        ----------
+        gens : int or list of int
+            generator channels (index in 'gens' list)
+        ros : dict
+            readout channel (index in 'readouts' list): name of a readout config with phrst=1
+        t : float or None
+            time (us) relative to the reference time; rounded up to the next legal tick if there is a period.
+            If None, the earliest legal tick at which the named generators have finished their pulses and the named readouts their windows.
+        """
+        if gens is None: gens = []
+        elif isinstance(gens, Number): gens = [gens]
+        ros = {} if ros is None else dict(ros)
+        if not gens and not ros:
+            raise RuntimeError("reset_phases() needs at least one generator or readout")
+        for ch in gens:
+            if ch not in self.gen_chs:
+                raise RuntimeError("reset_phases() on generator %d, but only generators %s are declared" % (ch, list(self.gen_chs.keys())))
+            self._gen_mgrs[ch].check_phrst()
+            name = "phrst_gen%d" % (ch)
+            if name not in self.pulses:
+                self.add_raw_pulse(name, ["phrst"], gen_ch=ch)
+        for ch, name in ros.items():
+            if name not in self.pulses:
+                raise RuntimeError("reset_phases() on readout %d with readout config %s, which isn't defined" % (ch, name))
+            if not any(int(self._get_wave(w).conf) & TimeGrid.PHRST_BIT for w in self.pulses[name].get_wavenames()):
+                raise RuntimeError("readout config %s has no phase reset: define it with add_readoutconfig(..., phrst=1)" % (name))
+        self.append_macro(ResetPhases(gens=gens, ros=ros, t=t))
 
     def trigger(self, ros=None, tts=None, pins=None, t=0, width=None, ddr4=False, mr=False, tag=None):
         """Pulse readout triggers and output pins.
@@ -1827,6 +1968,15 @@ class AbsGenManager(AbsRegisterManager):
     PARAMS_REQUIRED = {}
     PARAMS_OPTIONAL = {}
     PARAMS_NUMERIC = []
+    # generators that support phase reset
+    PHRST_GENS = ['axis_signal_gen_v6', 'axis_sg_int4_v1', 'axis_sg_int4_v2']
+
+    def check_phrst(self):
+        """Raise the same errors as add_pulse(..., phrst=1) if this generator can't do a phase reset."""
+        if self.chcfg['type'] not in self.PHRST_GENS:
+            raise RuntimeError("phrst not supported for %s, only for %s" % (self.chcfg['type'], self.PHRST_GENS))
+        if not self.chcfg['has_dds']:
+            raise RuntimeError("gen %d has a pulse with phrst, but this generator has no DDS" % (self.ch))
 
     def __init__(self, prog, gen_ch):
         self.ch = gen_ch
@@ -1935,7 +2085,7 @@ class StandardGenManager(AbsGenManager):
         par : dict
             Pulse parameters
         """
-        phrst_gens = ['axis_signal_gen_v6', 'axis_sg_int4_v1', 'axis_sg_int4_v2']
+        phrst_gens = self.PHRST_GENS
         if par.get('phrst') is not None and self.chcfg['type'] not in phrst_gens:
             raise RuntimeError("phrst not supported for %s, only for %s" % (self.chcfg['type'], phrst_gens))
 
@@ -2301,7 +2451,8 @@ class QickProgramV2(AsmV2, AbsQickProgram):
 
         # on firmware with a time-sync period, phase resets must be issued on multiples of the period
         period = self.tproccfg.get('time_sync_period', 0)
-        self._time_grid = TimeGrid(self, period) if period > 1 else None
+        # without a period it only records the times of the phase resets, for phase_reset_times()
+        self._time_grid = TimeGrid(self, period)
 
         # low-level ASM management
 
@@ -2393,8 +2544,8 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         # this means stepping through the timeline (evaluating "auto" times etc.)
         for i, macro in enumerate(self.macro_list):
             macro.preprocess(self)
-            if self._time_grid is not None: self._time_grid.observe(macro)
-        if self._time_grid is not None: self._time_grid.finish()
+            self._time_grid.observe(macro)
+        self._time_grid.finish()
         # initialize sweep registers
         for k,v in self.reg_dict.items():
             if v.init is not None:
@@ -2703,6 +2854,26 @@ class QickProgramV2(AsmV2, AbsQickProgram):
         inst = self.time_dict[tag]
         return inst.list_time_params()
 
+    def phase_reset_times(self):
+        """List the phase resets in this program and when they are issued, as the compiler sees them.
+
+        Times are absolute (from time zero) and are those of the first iteration of any enclosing loops.
+        Works on any firmware; "on_grid" is only filled in if the firmware has a time-sync period
+        (on such firmware a program with a reset off the grid does not compile, so it is then always True).
+
+        Returns
+        -------
+        list of dict
+            One per phase reset, in program order, with keys:
+            "what" (description), "gen" or "ro" (channel), "t" (cycles, relative to the reference time; start value if swept),
+            "swept", "cycles" and "us" (absolute time, None if not known at compile time), "loops" (enclosing loops), "on_grid".
+        """
+        if self.binprog is None:
+            self.compile()
+        if self._time_grid.failed is not None:
+            raise RuntimeError("the library could not follow the time in this program: %s" % (self._time_grid.failed))
+        return [dict(r) for r in self._time_grid.resets]
+
     def get_time_param(self, tag, parname, as_array=False):
         """Get the fully rounded value of a time parameter of a timed instruction, in microseconds.
         You must have supplied a "tag" for the timed instruction.
@@ -2909,11 +3080,17 @@ class AveragerProgramV2(AcquireProgramV2):
         Instructions to execute before the contents of the "reps" loop.
     after_reps : AsmV2
         Instructions to execute after the contents of the "reps" loop.
+    align : bool
+        On firmware with a time-sync period (see time_sync_period_us()), round initial_delay up so the loops start on the grid,
+        and lengthen final_delay so that every shot ends on the grid; a phase reset in the shot (e.g. reset_phases()) is then on the same tick in every shot.
+        If final_delay is swept, its max value is used.
+        No effect on other firmware.
     """
 
     COUNTER_ADDR = 1
-    def __init__(self, soccfg, reps, final_delay, final_wait=0, initial_delay=1.0, reps_innermost=False, before_reps=None, after_reps=None, cfg=None):
+    def __init__(self, soccfg, reps, final_delay, final_wait=0, initial_delay=1.0, reps_innermost=False, before_reps=None, after_reps=None, cfg=None, align=False):
         self.cfg = {} if cfg is None else cfg.copy()
+        self.align = align
         self.reps = reps
         self.final_delay = final_delay
         self.final_wait = final_wait
@@ -3014,7 +3191,7 @@ class AveragerProgramV2(AcquireProgramV2):
         self.set_ext_counter(addr=self.COUNTER_ADDR)
         self._initialize(self.cfg)
         if self.initial_delay is not None:
-            self.delay_auto(self.initial_delay)
+            self.delay_auto(self.initial_delay, align=self.align)
 
         for name, count, before, after in self.loops:
             self.open_loop(count, name=name)
@@ -3025,7 +3202,7 @@ class AveragerProgramV2(AcquireProgramV2):
         if self.final_wait is not None:
             self.wait_auto(self.final_wait, no_warn=True)
         if self.final_delay is not None:
-            self.delay_auto(self.final_delay)
+            self.delay_auto(self.final_delay, align=self.align)
         self.inc_ext_counter(addr=self.COUNTER_ADDR)
 
         # close the loops in reverse order

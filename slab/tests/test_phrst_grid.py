@@ -14,6 +14,7 @@ import json
 import os
 import sys
 
+import numpy as np
 import pytest
 
 from qick import QickConfig
@@ -439,6 +440,146 @@ def test_branch_then_off_grid_delay_with_phrst_before_rejected():
     prog.jump('top')
     with pytest.raises(RuntimeError, match='jump|label'):
         prog.compile()
+
+
+# --- convenience layer: reset_phases, AveragerProgramV2(align=True), phase_reset_times -------
+
+def declare_rst(prog):
+    declare(prog)
+    prog.add_readoutconfig(ch=0, name='ro_rst', freq=100, gen_ch=0, phrst=1)
+
+
+def test_reset_phases_next_tick_after_busy_generator():
+    soccfg = make_soccfg(P)
+    prog = QickProgramV2(soccfg)
+    declare_rst(prog)
+    prog.delay(cyc(soccfg, 13))                 # reference time off the grid
+    prog.pulse(ch=0, name='p', t=0)             # 0.1 us pulse, no reset
+    prog.reset_phases(gens=[0], ros={0: 'ro_rst'})
+    prog.pulse(ch=0, name='p', t=0)
+    prog.end()
+    prog.compile()
+    resets = prog.phase_reset_times()
+    assert [('gen' in r, r.get('gen', r.get('ro'))) for r in resets] == [(True, 0), (False, 0)]
+    t_abs = resets[0]['cycles']
+    assert resets[1]['cycles'] == t_abs
+    assert t_abs % P == 0 and all(r['on_grid'] for r in resets)
+    # not before the end of the pulse: 13 + 0.1 us
+    assert t_abs >= 13 + soccfg.us2cycles(0.1, as_float=True)
+    assert t_abs - P < 13 + soccfg.us2cycles(0.1, as_float=True)
+
+
+def test_reset_phases_leaves_reference_on_grid():
+    soccfg = make_soccfg(P)
+    prog = QickProgramV2(soccfg)
+    declare(prog, gen_phrst=1)
+    prog.delay(cyc(soccfg, 13))
+    prog.reset_phases(gens=0)
+    # t=0 after the reset is legal: this pulse carries its own reset and would be refused off the grid
+    prog.pulse(ch=0, name='p', t=0)
+    prog.end()
+    prog.compile()
+    r = prog.phase_reset_times()
+    assert r[0]['cycles'] == P
+    assert r[1]['cycles'] % P == 0 and r[1]['cycles'] > r[0]['cycles']
+
+
+def test_reset_phases_explicit_time_rounded_up():
+    soccfg = make_soccfg(P)
+    prog = QickProgramV2(soccfg)
+    declare_rst(prog)
+    prog.reset_phases(gens=[0], ros={0: 'ro_rst'}, t=cyc(soccfg, 5 * P + 3))
+    prog.end()
+    prog.compile()
+    assert [r['cycles'] for r in prog.phase_reset_times()] == [6 * P, 6 * P]
+
+
+def test_reset_phases_without_period():
+    soccfg = make_soccfg()
+    prog = QickProgramV2(soccfg)
+    declare_rst(prog)
+    prog.reset_phases(gens=[0], ros={0: 'ro_rst'}, t=cyc(soccfg, 5 * P + 3))
+    prog.pulse(ch=0, name='p', t=0)
+    prog.reset_phases(gens=[0])
+    prog.end()
+    prog.compile()
+    r = prog.phase_reset_times()
+    assert [x['cycles'] for x in r[:2]] == [5 * P + 3] * 2
+    assert all(x['on_grid'] is None for x in r)
+    # reference moved past the first reset (3 cycles of the generator or readout, in tProc cycles, rounded up);
+    # the second reset waits for the 0.1 us pulse
+    after_first = 5 * P + 3 + int(np.ceil(max(3 / soccfg['gens'][0]['f_fabric'], 3 / soccfg['readouts'][0]['f_output']) * 430.08 - 1e-6))
+    assert r[2]['cycles'] == after_first + int(np.ceil(soccfg.us2cycles(0.1, as_float=True) - 1e-6))
+
+
+def test_reset_phases_unsupported_generator_same_error():
+    with open(CFG_PATH) as f:
+        cfg = json.load(f)
+    cfg['gens'][0]['type'] = 'axis_signal_gen_v5'
+    soccfg = QickConfig(cfg)
+    prog = QickProgramV2(soccfg)
+    prog.declare_gen(ch=0, nqz=1)
+    with pytest.raises(RuntimeError) as e1:
+        prog.add_pulse(ch=0, name='x', style='const', freq=100, phase=0, gain=0.5, length=0.1, phrst=1)
+    with pytest.raises(RuntimeError) as e2:
+        prog.reset_phases(gens=[0])
+    assert str(e1.value) == str(e2.value) and 'phrst not supported' in str(e2.value)
+
+
+def test_reset_phases_readout_config_needs_phrst():
+    soccfg = make_soccfg(P)
+    prog = QickProgramV2(soccfg)
+    declare(prog)
+    with pytest.raises(RuntimeError, match='phrst=1'):
+        prog.reset_phases(ros={0: 'ro'})
+
+
+class ResetShotProg(AveragerProgramV2):
+    """Resets the phases at the start of every shot; the shot has an off-grid delay."""
+    def _initialize(self, cfg):
+        declare_rst(self)
+        if 'sweep' in cfg:
+            self.add_loop('sweep', 5)
+
+    def _body(self, cfg):
+        self.reset_phases(gens=[0], ros={0: 'ro_rst'})
+        self.pulse(ch=0, name='p', t=0)
+        self.delay(cfg.get('body_delay', 0.0123))
+        if 'sweep' in cfg:
+            self.pulse(ch=0, name='p', t=cfg['sweep'])
+        self.trigger(ros=[0], t=0.05)
+
+
+def test_averager_align_accepts_per_shot_reset():
+    soccfg = make_soccfg(P)
+    prog = ResetShotProg(soccfg, reps=10, final_delay=1.0, align=True)
+    r = prog.phase_reset_times()
+    assert all(x['on_grid'] and x['cycles'] % P == 0 for x in r)
+    assert r[0]['loops'] == ['reps']
+    # the same with a swept pulse time, which makes the end-of-shot delay swept (its max is used)
+    ResetShotProg(soccfg, reps=10, final_delay=1.0, align=True, cfg={'sweep': QickSweep1D('sweep', 0.2, 0.6)})
+
+
+def test_averager_without_align_rejected_and_hint():
+    soccfg = make_soccfg(P)
+    with pytest.raises(RuntimeError, match='align=True'):
+        ResetShotProg(soccfg, reps=10, final_delay=1.0)
+
+
+def test_averager_align_no_effect_without_period():
+    soccfg = make_soccfg()
+    for cls, cfg in [(ResetShotProg, {}), (ShotProg, {'gen_phrst': 1})]:
+        a = cls(soccfg, reps=10, final_delay=1.0, cfg=cfg)
+        b = cls(soccfg, reps=10, final_delay=1.0, cfg=cfg, align=True)
+        assert dump(a) == dump(b)
+
+
+def test_phase_reset_times_without_period():
+    soccfg = make_soccfg()
+    prog = flat_prog(soccfg, t_pulse=cyc(soccfg, 5 * P + 3), delay=cyc(soccfg, 7), ro_phrst=1, t_ro=cyc(soccfg, 2))
+    r = prog.phase_reset_times()
+    assert [(x.get('ro'), x.get('gen'), x['cycles'], x['on_grid']) for x in r] == [(0, None, 9, None), (None, 0, 5 * P + 10, None)]
+    assert r[1]['us'] == pytest.approx(cyc(soccfg, 5 * P + 10))
 
 
 if __name__ == '__main__':
