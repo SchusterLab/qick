@@ -3,6 +3,48 @@
 Running log for the lab fork. Newest entry first. Record dead ends as well as
 results, and say where each number came from.
 
+## 2026-11-26: weighted readout buffer simulated against a numpy model (branch `lab/weighted-buffer-sim`)
+
+Question from the measurement side: what exactly does `axis_weighted_buffer`
+v1.3 compute, so optimal-filter weights can be designed without guessing.
+Simulation only, nothing on a board. Summary and usage in
+`slab/notes/weighted-readout.md`; bench in `slab/sim/weighted_buffer/`.
+
+- Bench: the whole IP in xsim (AXI-Lite registers, weight stream as
+  `load_weights` sends it, both buffers, read-back streams), N_AVG 13, N_BUF
+  12, N_WGT 13 and 14. The DSP macro is Xilinx's simulation model generated
+  from the `.xci` (upgraded rev 3 to rev 6 in 2024.1; Automatic pipelining
+  gives 4 registers A1, A2, M, P, although `matched_filter.vhd` says
+  `DSP_LATENCY = 3`; the mismatch only moves which sample opens the window).
+  The N_WGT 13 cases were repeated on the post-synthesis netlist (DSP48E2 and
+  block RAM primitives); same results.
+- Formula, bit-exact on 2304 extreme pairs and random data: with `wI` = column
+  0 (lower 16 bits) and `wQ` = column 1, `y_I = (I*wQ + Q*wI) >> 16`,
+  `y_Q = (Q*wQ - I*wI) >> 16`, i.e. `y = (I + jQ)(wQ - j wI) / 2**16`,
+  floored. Not `x * (wI + j wQ)` as the column names suggest: the library
+  default `(32766, 0)` multiplies by -j/2 (90 degree rotation), not by a real
+  0.49997. To multiply by `conj(h)` load `(h.imag, h.real)`.
+- Window: weight n on window sample n, exactly `length` samples, sample 0 one
+  readout clock after the trigger's rising edge at the IP. Each trigger
+  restarts at weight 0; past 2**N_WGT the index wraps. After the window the
+  decimated buffer sees `w[length..length+2]` and then `w[0]`.
+- Triggers need a spacing of at least length + 4 readout cycles; at length + 3
+  or less the accumulated buffer silently skips triggers and misweights. 300
+  windows at length + 4: 300 identical, correct entries. A trigger held high
+  longer than length + 4 cycles restarts the weights.
+- No wrap with |w| <= 32766 at full-scale I and Q; only (-32768, -32768) x
+  (-32768, -32768) wraps. Floor bias -0.5 LSB per non-zero-weight sample on I
+  and Q alike: -768 +- 11 at N = 1536, -4096 +- 25 at N = 8192.
+- Reload and partial load at an address work. In RTL simulation they did not
+  at first: xsim mis-connects the 13-bit start address to the 32-bit VHDL port
+  `DW_ADDR_REG` (a load at 128 landed at 0). Synthesis connects the low bits
+  (Synth 8-689) and the netlist loads correctly, so `run.sh` zero-extends the
+  port in its simulation copy only.
+- With gaps in tvalid the weights misalign (tvalid delayed 7 cycles, data 9).
+  The lab's readouts should give continuous tvalid (not simulated).
+- Not checked: hardware, DMA/driver path, trigger timing relative to the tProc,
+  edge counting, the m2 port.
+
 ## 2026-11-25: lab ZCU216 build with the overflow fix meets timing; survey of upstream branches
 
 - Built `slab_tprocv2_216` from `lab/tproc-overflow` (`bad1a662`) in Vivado
