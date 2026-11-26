@@ -22,6 +22,7 @@ module qick_processor # (
    parameter TIME_READ      =  1 ,
    parameter TIME_SYNC_PERIOD = 0 ,
    parameter FIFO_DEPTH     =  8 ,
+   parameter FIFO_GUARD     =  8 ,
    parameter PMEM_AW        =  8 ,
    parameter DMEM_AW        =  8 ,
    parameter WMEM_AW        =  8 ,
@@ -126,6 +127,10 @@ wire [47:0]    time_abs               ; // Absolute Time Counter Value "out_abs_
 reg  [47:0]    c_time_ref_dt           ; // Reference time "ref_time"
 wire [31:0]    c_time_usr  ; // User time "current_user_time"
 
+// DISPATCHER queue state
+wire           fifo_stall             ; // pause the core (queue full or nearly full)
+wire [2:0]     c_fifo_ovf, ps_fifo_ovf; // sticky lost-push flags {wave, data, trigger}
+
 // AXI REGISTERS
 wire [15:0]    xreg_TPROC_CTRL  , xreg_TPROC_CFG       ;
 wire [15:0]    xreg_MEM_ADDR    , xreg_MEM_LEN         ;
@@ -199,7 +204,7 @@ qproc_ctrl # (
    .PS_TPROC_CFG    ( xreg_TPROC_CFG[11:9]),
    .xreg_TPROC_W_DT ( xreg_TPROC_W_DT[0] ),
    .all_fifo_full_i ( all_fifo_full      ),
-   .some_fifo_full_i( some_fifo_full     ),
+   .some_fifo_full_i( fifo_stall         ),
    .core_rst_o      ( core_rst           ),
    .core_en_o       ( core_en            ),
    .time_rst_o      ( time_rst           ),
@@ -423,6 +428,7 @@ qproc_axi_reg QPROC_xREG (
    .TPROC_R_DT1      ( xreg_TPROC_R_DT[0]  ) ,
    .TPROC_R_DT2      ( xreg_TPROC_R_DT[1]  ) ,
    .TIME_USR         ( c_time_usr        ) ,
+   .TPROC_ERR        ( ps_fifo_ovf         ) ,
    .TPROC_STATUS     ( xreg_TPROC_STATUS   ) ,
    .TPROC_DEBUG      ( xreg_TPROC_DEBUG    ) );
 
@@ -702,9 +708,16 @@ endgenerate
 
 wire [31:0] fifo_dt_ds, axi_fifo_ds;
 wire [15:0] c_fifo_ds, t_fifo_ds ;
+// Sticky lost-push flags {wave, data, trigger}, readable in AXI register 9.
+sync_reg # (.DW ( 3 ) ) sync_fifo_ovf_ps (
+   .dt_i      ( c_fifo_ovf  ) ,
+   .clk_i     ( ps_clk_i    ) ,
+   .rst_ni    ( ps_rst_ni   ) ,
+   .dt_o      ( ps_fifo_ovf ) );
 
 qproc_dispatcher # (
    .FIFO_DEPTH     ( FIFO_DEPTH    ),
+   .FIFO_GUARD     ( FIFO_GUARD    ),
    .IN_PORT_QTY    ( IN_PORT_QTY   ),
    .OUT_TRIG_QTY   ( OUT_TRIG_QTY  ),
    .OUT_DPORT_QTY  ( OUT_DPORT_QTY ),
@@ -724,6 +737,8 @@ qproc_dispatcher # (
    .time_abs_i     ( time_abs      ) ,
    .all_fifo_full  ( all_fifo_full ) ,
    .some_fifo_full ( some_fifo_full ),
+   .fifo_stall     ( fifo_stall    ) ,
+   .fifo_ovf       ( c_fifo_ovf    ) ,
    .port_we        ( port_we       ) ,
    .out_port_data  ( out_port_data ) ,
    // TRIGGERS

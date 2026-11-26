@@ -32,6 +32,7 @@ module axis_qick_processor # (
    parameter TIME_READ      =  1 , // Time in sreg and AXI-Reg 0-No 1-Yes
    parameter TIME_SYNC_PERIOD = 0 , // t_clk cycles in the common period of the clocks; time resets wait for its start (0: off)
    parameter FIFO_DEPTH     =  9 , // 9 Bits in Dispatcher FIFOs address
+   parameter FIFO_GUARD     =  8 , // Free entries kept in each dispatcher FIFO (core pauses when fewer remain); 0: pause only when full
    parameter PMEM_AW        =  8 , // Bits in Program Memory address
    parameter DMEM_AW        =  8 , // Bits in Data Memory address
    parameter WMEM_AW        =  8 , // Bits in WaveParam Memory address
@@ -402,6 +403,7 @@ qick_processor# (
    .TIME_READ      ( TIME_READ      ),
    .TIME_SYNC_PERIOD ( TIME_SYNC_PERIOD ),
    .FIFO_DEPTH     ( FIFO_DEPTH     ),
+   .FIFO_GUARD     ( FIFO_GUARD     ),
    .PMEM_AW        ( PMEM_AW        ),
    .DMEM_AW        ( DMEM_AW        ),
    .WMEM_AW        ( WMEM_AW        ),

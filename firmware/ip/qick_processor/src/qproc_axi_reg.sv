@@ -18,7 +18,8 @@ module qproc_axi_reg(
    input  wire  [31:0]   MEM_DT_O     ,    
    input  wire  [31:0]   TPROC_R_DT1  ,    
    input  wire  [31:0]   TPROC_R_DT2  ,    
-   input  wire  [31:0]   TIME_USR     ,    
+   input  wire  [31:0]   TIME_USR     ,
+   input  wire  [2:0]    TPROC_ERR    ,    
    input  wire  [31:0]   TPROC_STATUS ,    
    input  wire  [31:0]   TPROC_DEBUG     
 );
@@ -59,6 +60,7 @@ axi_slv_qproc QPROC_xREG (
    .TPROC_R_DT1   ( TPROC_R_DT1               ) ,
    .TPROC_R_DT2   ( TPROC_R_DT2               ) ,
    .TIME_USR      ( TIME_USR                  ) ,
+   .TPROC_ERR     ( TPROC_ERR                 ) ,
    .TPROC_STATUS  ( TPROC_STATUS              ) ,
    .TPROC_DEBUG   ( TPROC_DEBUG               ) );
 

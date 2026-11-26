@@ -2317,6 +2317,13 @@ class AcquireMixin:
         """
         soc = self.acquire_params['soc']
 
+        # Reset the tProc before arming the readout buffers: for tProc v2 this also
+        # clears its trigger outputs and dispatcher queues, which a stopped program
+        # can leave set; a readout trigger still high when the buffer is enabled
+        # would be captured as a spurious first measurement and shift all the data.
+        # For tProc v1 this zeroes the shot counter, as before.
+        soc.clear_tproc_counter(addr=self.counter_addr)
+
         if self.acquire_params['type'] == 'decimated':
             # initialize buffers
             # accumulated data (for convenience/debug)
@@ -2336,8 +2343,6 @@ class AcquireMixin:
 
         # Reload data memory.
         soc.reload_mem()
-        # make sure count variable is reset to 0
-        soc.clear_tproc_counter(addr=self.counter_addr)
         # do any other pre-execution setup
         soc.prepare_round()
         # configure tproc for internal/external start
@@ -2403,6 +2408,11 @@ class AcquireMixin:
 
         # do any post-execution cleanup
         soc.cleanup_round()
+
+        # lab firmware: fail loudly if the tProc dropped timed instructions (a full
+        # dispatcher queue). Firmware/libraries without the flags don't have the key.
+        if self.tproccfg.get('queue_flags', False):
+            soc.check_tproc_queues()
 
         self.rounds_pbar.update()
         self.acquire_params['rounds_remaining'] -= 1

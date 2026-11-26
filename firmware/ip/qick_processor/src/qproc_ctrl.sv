@@ -209,7 +209,8 @@ always_comb begin
       end
       default:;
    endcase
-   // Pause Core on Dispatcher FIFO full; with 1 in TPROC_CFG[11] continue
+   // Pause Core on Dispatcher FIFO full (or nearly full, see FIFO_GUARD in the
+   // dispatcher); with 1 in TPROC_CFG[11] continue (pushes into a full FIFO are lost)
    if (some_fifo_full_i & ~(xreg_TPROC_CFG[11])) begin
       core_en_o = 0;
    end

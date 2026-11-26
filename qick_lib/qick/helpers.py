@@ -281,3 +281,22 @@ def nyquist_image(f, fs, nqz):
 
 class ADCInterruptError(Exception):
     pass
+
+# Lab firmware (qick_processor with a FIFO_GUARD parameter): sticky flags in tProc v2
+# AXI register 9, set when a push into a full dispatcher queue was lost and cleared
+# when the core is reset or started. Bits 3:0 of that register always read 9.
+TPROC_QUEUE_FLAG_BITS = {8: 'trigger', 9: 'data', 10: 'wave'}
+
+def tproc_queue_overflows(reg):
+    """Names of the dispatcher queue types whose lost-push flag is set in the
+    value of tProc v2 register 9 (lab firmware); empty if none."""
+    return [name for bit, name in sorted(TPROC_QUEUE_FLAG_BITS.items()) if (int(reg) >> bit) & 1]
+
+def tproc_queue_overflow_message(names):
+    """Text of the error raised when tproc_queue_overflows() is not empty."""
+    return ("tProc dispatcher queue overflow (%s port queue%s): at least one timed %s instruction was "
+            "dropped because its queue was full, so the program did not run as written and the data "
+            "are incomplete. The tProc ran too far ahead of real time; add wait()/wait_auto() "
+            "or fewer instructions per stretch of time."
+            % (", ".join(names), "s" if len(names) > 1 else "",
+               "/".join(names)))

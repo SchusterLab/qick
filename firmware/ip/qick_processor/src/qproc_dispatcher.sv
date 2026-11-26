@@ -6,7 +6,11 @@ module qproc_dispatcher # (
    parameter OUT_TRIG_QTY   =  1 ,
    parameter OUT_DPORT_QTY  =  1 ,
    parameter OUT_DPORT_DW   =  4 ,
-   parameter OUT_WPORT_QTY  =  1 
+   parameter OUT_WPORT_QTY  =  1 ,
+   // Free entries kept in every queue: the core is paused when fewer remain,
+   // so that pushes already on their way still fit. 0: pause only on a full
+   // queue (combinational, the original behaviour). Otherwise at least 5.
+   parameter FIFO_GUARD     =  8
 )(
    input  wire          c_clk_i        ,
    input  wire          c_rst_ni       ,
@@ -23,6 +27,8 @@ module qproc_dispatcher # (
    input  PORT_DT       out_port_data  ,
    output wire          all_fifo_full  ,
    output wire          some_fifo_full ,
+   output wire          fifo_stall     , // pause the core (c_clk)
+   output wire  [2:0]   fifo_ovf       , // sticky: a push into a full {wave, data, trigger} queue was lost
    // TRIGGERS 
    output wire          port_trig_o  [OUT_TRIG_QTY] ,
    // DATA OUTPUT INTERFACE
@@ -88,6 +94,10 @@ wire [OUT_WPORT_QTY-1:0]   t_fifo_wave_empty , c_fifo_wave_full ;
 reg  [OUT_WPORT_QTY-1:0]   t_fifo_wave_empty_r;
 
 wire                       dfifo_full, wfifo_full;
+wire [OUT_TRIG_QTY-1:0]    c_fifo_trig_afull ;
+wire [OUT_DPORT_QTY-1:0]   c_fifo_data_afull ;
+wire [OUT_WPORT_QTY-1:0]   c_fifo_wave_afull ;
+localparam GUARD = (FIFO_GUARD > 0 && FIFO_GUARD < 5) ? 5 : FIFO_GUARD ; // XPM prog_full limit
 
 ///////////////////////////////////////////////////////////////////////////////
 /// FIFO & DISPATCHER
@@ -106,6 +116,30 @@ assign tfifo_full = |c_fifo_trig_full ;
 assign dfifo_full = |c_fifo_data_full ; 
 assign wfifo_full = |c_fifo_wave_full ; 
 assign some_fifo_full = tfifo_full | dfifo_full | wfifo_full ;
+
+// Pause request. With a guard, registered (no combinational path from the
+// queue flags to the core enable); the guard covers the pushes in flight.
+generate
+   if (GUARD > 0) begin : STALL_GUARD
+      reg some_fifo_afull_r;
+      always_ff @(posedge c_clk_i, negedge c_rst_ni)
+         if (!c_rst_ni) some_fifo_afull_r <= 1'b1;
+         else           some_fifo_afull_r <= (|c_fifo_trig_afull) | (|c_fifo_data_afull) | (|c_fifo_wave_afull);
+      assign fifo_stall = some_fifo_afull_r;
+   end else begin : STALL_FULL
+      assign fifo_stall = some_fifo_full;
+   end
+endgenerate
+
+// Lost pushes: a push presented to a queue that is full ignores it.
+reg [2:0] fifo_ovf_r;
+always_ff @(posedge c_clk_i, negedge c_rst_ni)
+   if (!c_rst_ni)     fifo_ovf_r <= 3'b000;
+   else if (core_rst) fifo_ovf_r <= 3'b000;
+   else               fifo_ovf_r <= fifo_ovf_r | { |(c_fifo_wave_push_s & c_fifo_wave_full),
+                                                   |(c_fifo_data_push_s & c_fifo_data_full),
+                                                   |(c_fifo_trig_push_s & c_fifo_trig_full) };
+assign fifo_ovf = fifo_ovf_r;
 
 // CLOCK DOMAIN CHANGE
 always_ff @(posedge c_clk_i) begin
@@ -207,7 +241,8 @@ generate
       // TRIGGER FIFO
       BRAM_FIFO_DC_2 # (
          .FIFO_DW (1+48) , 
-         .FIFO_AW (FIFO_DEPTH) 
+         .FIFO_AW (FIFO_DEPTH) ,
+         .AFULL_MARGIN (GUARD)
       ) trig_fifo_inst ( 
          .wr_clk_i   ( c_clk_i      ) ,
          .wr_rst_ni  ( c_rst_ni     ) ,
@@ -221,7 +256,8 @@ generate
          .pop_i      ( trig_pop_r        [ind_tfifo] ) ,
          .data_o     ( {t_fifo_trig_dt[ind_tfifo], t_fifo_trig_time[ind_tfifo]} ) ,
          .async_empty_o ( t_fifo_trig_empty [ind_tfifo] ) , // SYNC with RD_CLK
-         .async_full_o  ( c_fifo_trig_full  [ind_tfifo] )   // SYNC with WR_CLK
+         .async_full_o  ( c_fifo_trig_full  [ind_tfifo] ) ,  // SYNC with WR_CLK
+         .async_afull_o ( c_fifo_trig_afull [ind_tfifo] )    // SYNC with WR_CLK
       );
       // Time Comparator
       always @(posedge t_clk_i) begin
@@ -248,7 +284,8 @@ generate
       // WaveForm FIFO
       BRAM_FIFO_DC_2 # (
          .FIFO_DW (168+48) , 
-         .FIFO_AW (FIFO_DEPTH) 
+         .FIFO_AW (FIFO_DEPTH) ,
+         .AFULL_MARGIN (GUARD)
       ) wave_fifo_inst ( 
          .wr_clk_i   ( c_clk_i   ) ,
          .wr_rst_ni  ( c_rst_ni  ) ,
@@ -262,7 +299,8 @@ generate
          .pop_i      ( wave_pop_r         [ind_wfifo] ) ,
          .data_o     ( {t_fifo_wave_dt[ind_wfifo],t_fifo_wave_time[ind_wfifo]} ) ,
          .async_empty_o ( t_fifo_wave_empty [ind_wfifo] ) , // SYNC with RD_CLK
-         .async_full_o  ( c_fifo_wave_full  [ind_wfifo] )   // SYNC with WR_CLK
+         .async_full_o  ( c_fifo_wave_full  [ind_wfifo] ) ,  // SYNC with WR_CLK
+         .async_afull_o ( c_fifo_wave_afull [ind_wfifo] )    // SYNC with WR_CLK
       );
       // Time Comparator
       always @(posedge t_clk_i) begin
@@ -288,7 +326,8 @@ generate
       // DATA FIFO
       BRAM_FIFO_DC_2 # (
          .FIFO_DW (OUT_DPORT_DW+48) , 
-         .FIFO_AW (FIFO_DEPTH) 
+         .FIFO_AW (FIFO_DEPTH) ,
+         .AFULL_MARGIN (GUARD)
       ) data_fifo_inst ( 
          .wr_clk_i   ( c_clk_i      ) ,
          .wr_rst_ni  ( c_rst_ni     ) ,
@@ -302,7 +341,8 @@ generate
          .pop_i      ( data_pop_r        [ind_dfifo] ) ,
          .data_o     ( {t_fifo_data_dt[ind_dfifo], t_fifo_data_time[ind_dfifo]} ) ,
          .async_empty_o ( t_fifo_data_empty [ind_dfifo] ) , // SYNC with RD_CLK
-         .async_full_o  ( c_fifo_data_full  [ind_dfifo] )   // SYNC with WR_CLK
+         .async_full_o  ( c_fifo_data_full  [ind_dfifo] ) ,  // SYNC with WR_CLK
+         .async_afull_o ( c_fifo_data_afull [ind_dfifo] )    // SYNC with WR_CLK
       );
       // Time Comparator
       always @(posedge t_clk_i) begin

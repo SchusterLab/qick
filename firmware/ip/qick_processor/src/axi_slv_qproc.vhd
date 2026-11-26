@@ -56,6 +56,7 @@ entity axi_slv_qproc is
         TPROC_R_DT1      : in  std_logic_vector (31 downto 0) ;
         TPROC_R_DT2      : in  std_logic_vector (31 downto 0) ;
         TIME_USR         : in  std_logic_vector (31 downto 0) ;
+        TPROC_ERR        : in  std_logic_vector (2 downto 0) ;
         TPROC_STATUS     : in  std_logic_vector (31 downto 0) ;
         TPROC_DEBUG      : in  std_logic_vector (31 downto 0) );
         end axi_slv_qproc;
@@ -460,7 +461,7 @@ begin
 	-- 4 : TAVG_LOW_REG	(r).
 	-- 5 : TAVG_HIGH_REG(r).
 
-	process (slv_reg0, slv_reg1, slv_reg2, slv_reg3, slv_reg4, slv_reg5, slv_reg6, slv_reg7, slv_reg8, MEM_DT_O, TPROC_R_DT1, TPROC_R_DT2, TIME_USR, TPROC_STATUS, TPROC_DEBUG, axi_araddr, aresetn, slv_reg_rden)
+	process (slv_reg0, slv_reg1, slv_reg2, slv_reg3, slv_reg4, slv_reg5, slv_reg6, slv_reg7, slv_reg8, MEM_DT_O, TPROC_R_DT1, TPROC_R_DT2, TIME_USR, TPROC_ERR, TPROC_STATUS, TPROC_DEBUG, axi_araddr, aresetn, slv_reg_rden)
 	variable loc_addr :std_logic_vector(OPT_MEM_ADDR_BITS downto 0);
 	begin
 	    -- Address decoding for reading registers
@@ -485,7 +486,9 @@ begin
 	      when b"1000" =>
 	        reg_data_out <= slv_reg8;
 	      when b"1001" =>
-	        reg_data_out <= "00000000000000000000000000001001";
+	        -- bits 3:0 read 9 as before; bits 10:8 are the sticky lost-push flags
+	        -- {wave, data, trigger} of the dispatcher queues (cleared on core reset/start)
+	        reg_data_out <= "000000000000000000000" & TPROC_ERR & "00001001";
 	      when b"1010" =>
 	        reg_data_out <= MEM_DT_O;
 	      when b"1011" =>

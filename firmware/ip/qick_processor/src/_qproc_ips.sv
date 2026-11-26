@@ -235,7 +235,10 @@ endmodule
 
 module BRAM_FIFO_DC_2 # (
    parameter FIFO_DW = 16 , 
-   parameter FIFO_AW = 8 
+   parameter FIFO_AW = 8 ,
+   // async_afull_o is high when fewer than AFULL_MARGIN free entries remain
+   // (and whenever async_full_o is high). 0: async_afull_o = async_full_o.
+   parameter AFULL_MARGIN = 0
 ) ( 
    input  wire                   wr_clk_i       ,
    input  wire                   wr_rst_ni      ,
@@ -249,7 +252,8 @@ module BRAM_FIFO_DC_2 # (
    input  wire                   flush_i        ,
    output logic  [FIFO_DW - 1:0] data_o         ,
    output logic                  async_empty_o  ,
-   output logic                  async_full_o   
+   output logic                  async_full_o   ,
+   output logic                  async_afull_o    // SYNC with WR_CLK
 );
 
    // XPM_FIFO instantiation template for Asynchronous FIFO configurations
@@ -540,11 +544,15 @@ module BRAM_FIFO_DC_2 # (
    // +---------------------------------------------------------------------------------------------------------------------+
 
    logic rd_rst_busy, wr_rst_busy;
-   logic wr_full, rd_empty;
+   logic wr_full, rd_empty, wr_prog_full;
    logic [FIFO_DW - 1:0] dout;
 
    // Hold full high during Flush or Reset
    assign async_full_o = wr_full | flush_i | wr_rst_busy;
+   // prog_full: at least 2**FIFO_AW - AFULL_MARGIN words written and not yet read
+   // (as seen from the write side, so conservative).
+   assign async_afull_o = async_full_o | ((AFULL_MARGIN > 0) ? wr_prog_full : 1'b0);
+   localparam PF_THRESH = (AFULL_MARGIN > 0) ? (2**FIFO_AW - AFULL_MARGIN) : 10;
 
    assign async_empty_o = rd_empty;
 
@@ -564,14 +572,14 @@ module BRAM_FIFO_DC_2 # (
       .FIFO_WRITE_DEPTH          (2**FIFO_AW),  // DECIMAL
       .FULL_RESET_VALUE          (1),           // DECIMAL
       .PROG_EMPTY_THRESH         (10),          // DECIMAL
-      .PROG_FULL_THRESH          (10),          // DECIMAL
+      .PROG_FULL_THRESH          (PF_THRESH),   // DECIMAL
       .RD_DATA_COUNT_WIDTH       (1),           // DECIMAL
       .READ_DATA_WIDTH           (FIFO_DW),     // DECIMAL
       // .READ_MODE                 ("std"),       // String
       .READ_MODE                 ("fwft"),      // String
       .RELATED_CLOCKS            (0),           // DECIMAL
       .SIM_ASSERT_CHK            (0),           // DECIMAL; 0=disable simulation messages, 1=enable simulation messages
-      .USE_ADV_FEATURES          ("0000"),      // String
+      .USE_ADV_FEATURES          ((AFULL_MARGIN > 0) ? "0002" : "0000"), // String: 0002 enables prog_full
       .WAKEUP_TIME               (0),           // DECIMAL
       .WRITE_DATA_WIDTH          (FIFO_DW),     // DECIMAL
       .WR_DATA_COUNT_WIDTH       (1)            // DECIMAL
@@ -611,7 +619,7 @@ module BRAM_FIFO_DC_2 # (
                                                                                  // empty threshold value. It is de-asserted when the number of words in
                                                                                  // the FIFO exceeds the programmable empty threshold value.
 
-      .prog_full                 (),                                             // 1-bit output: Programmable Full: This signal is asserted when the
+      .prog_full                 (wr_prog_full),                                             // 1-bit output: Programmable Full: This signal is asserted when the
                                                                                  // number of words in the FIFO is greater than or equal to the
                                                                                  // programmable full threshold value. It is de-asserted when the number of
                                                                                  // words in the FIFO is less than the programmable full threshold value.
@@ -680,7 +688,8 @@ endmodule
 ///////////////////////////////////////////////////////////////////////////////
 module BRAM_FIFO_DC_2 # (
    parameter FIFO_DW = 16 , 
-   parameter FIFO_AW = 8 
+   parameter FIFO_AW = 8 ,
+   parameter AFULL_MARGIN = 0   // see the XPM version above
 ) ( 
    input  wire                   wr_clk_i       ,
    input  wire                   wr_rst_ni      ,
@@ -694,7 +703,8 @@ module BRAM_FIFO_DC_2 # (
    output wire  [FIFO_DW - 1:0]  data_o         ,
    input  wire                   flush_i        ,
    output wire                   async_empty_o  ,
-   output wire                   async_full_o   );
+   output wire                   async_full_o   ,
+   output reg                    async_afull_o  );
 
 // The WRITE_POINTER is on the Last Empty Value
 // The READ_POINTER is on the Last Value
@@ -756,6 +766,21 @@ assign async_empty_o = async_empty_r | busy; // While RESETTING, Shows EMPTY
 
 assign async_full_o  = async_full  | busy;
 assign data_o  = mem_dt;
+
+// Words in the FIFO as seen from the write side (gray pointers to binary).
+reg [FIFO_AW-1:0] wr_bin, rd_bin_w;
+integer ib;
+always_comb begin
+   wr_bin[FIFO_AW-1]   = wr_gptr[FIFO_AW-1];
+   rd_bin_w[FIFO_AW-1] = rd_gptr_r[FIFO_AW-1];
+   for (ib = FIFO_AW-2; ib >= 0; ib = ib - 1) begin
+      wr_bin[ib]   = wr_bin[ib+1]   ^ wr_gptr[ib];
+      rd_bin_w[ib] = rd_bin_w[ib+1] ^ rd_gptr_r[ib];
+   end
+end
+wire [FIFO_AW-1:0] wr_words = wr_bin - rd_bin_w;
+always_comb
+   async_afull_o = async_full_o | ((AFULL_MARGIN > 0) ? (wr_words >= 2**FIFO_AW - AFULL_MARGIN) : 1'b0);
 
 gcc #(
    .DW	( FIFO_AW )

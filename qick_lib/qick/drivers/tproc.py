@@ -5,6 +5,7 @@ Drivers for the QICK Timed Processor (tProc).
 from pynq.buffer import allocate
 import numpy as np
 from qick.ip import SocIP
+from qick.helpers import tproc_queue_overflows, tproc_queue_overflow_message
 
 class AxisTProc64x32_x8(SocIP):
     """
@@ -343,8 +344,13 @@ class Axis_QICK_Proc(SocIP):
     TPROC_CFG[4]    - MEM_SOURCE (0-AXI, 1-SINGLE)
     TPROC_CFG[6:5]  - MEM_BANK (TPROC, CORE0, CORE1)
     TPROC_CFG[10]  - Disable INPUT CTRL
-    TPROC_CFG[11]  - WFIFO_Full Pause Core
-    TPROC_CFG[12]  - DFIFO_Full Pause Core
+    TPROC_CFG[11]  - 1: do NOT pause the core when a dispatcher FIFO is full
+                     (0, the default, pauses it; with 1, pushes into a full FIFO are lost)
+    TPROC_CFG[12]  - (unused by the firmware)
+    ####################
+    Register 9 (lab firmware, which has the FIFO_GUARD parameter):
+    bits 3:0 read 9; bits 10:8 are sticky flags {wave, data, trigger}, set when a
+    push into a full dispatcher queue was lost, cleared by a core reset or start.
     
     
     :param mem: memory address
@@ -375,6 +381,7 @@ class Axis_QICK_Proc(SocIP):
             'axi_w_dt2'   :6,
             'core_cfg'      :7,
             'read_sel'      :8,
+            'queue_flags'   :9,
             'mem_dt_o'      :10,
             'axi_r_dt1'   :11 ,
             'axi_r_dt2'   :12 ,
@@ -405,6 +412,10 @@ class Axis_QICK_Proc(SocIP):
         self.cfg['debug']  = int(description['parameters']['DEBUG'])
         # lab firmware: time resets wait for the start of this many t_clk cycles (0: off, or older firmware)
         self.cfg['time_sync_period'] = int(description['parameters'].get('TIME_SYNC_PERIOD', 0))
+        # lab firmware: dispatcher queues keep FIFO_GUARD entries free, and register 9 has
+        # sticky lost-push flags. Absent on other firmware.
+        self.cfg['queue_flags'] = 'FIFO_GUARD' in description['parameters']
+        self.cfg['fifo_guard'] = int(description['parameters'].get('FIFO_GUARD', 0))
 
         #Compatible with previous Version
         self.DMEM_N = int(description['parameters']['DMEM_AW']) 
@@ -565,6 +576,22 @@ class Axis_QICK_Proc(SocIP):
             self.tproc_cfg |=  (1 << 10)
         else:
             raise RuntimeError("start_src must be internal or external, got %s"%(src))
+    def get_queue_overflows(self):
+        """Dispatcher queue types (trigger, data, wave) that lost a push since the
+        last core reset or start. Always empty on firmware without the flags.
+        """
+        if not self['queue_flags']:
+            return []
+        return tproc_queue_overflows(self.queue_flags)
+
+    def check_queue_overflow(self):
+        """Raise RuntimeError if a dispatcher queue lost a push since the last core
+        reset or start (lab firmware; does nothing on other firmware).
+        """
+        names = self.get_queue_overflows()
+        if names:
+            raise RuntimeError(tproc_queue_overflow_message(names))
+
     def get_start_src(self):
         if self.tproc_cfg & (1 << 10):
             return 'external'
