@@ -3,6 +3,23 @@
 Running log for the lab fork. Newest entry first. Record dead ends as well as
 results, and say where each number came from.
 
+## 2026-11-25: lab ZCU216 build with the overflow fix meets timing; survey of upstream branches
+
+- Built `slab_tprocv2_216` from `lab/tproc-overflow` (`bad1a662`) in Vivado
+  2024.1 with place directive `EarlyBlockPlacement`, `AggressiveExplore` for
+  phys-opt and route, and post-route phys-opt. Result without any manual
+  step: WNS +0.003 ns, WHS +0.010 ns, 2 h 38 min for implementation. Merged
+  the branch into `main`. Not yet run on a board.
+- Upstream's open pull request 446 (`fusesoc-hog`) rewrites the firmware tree
+  (FuseSoC cores, Hog projects, `firmware/projects` removed) and its tProc
+  notes mention a revision 29 with a different meaning (a QP2 flag). Our
+  library detects the lab firmware by the `FIFO_GUARD` parameter, not by the
+  revision number, so the two cannot be confused, but the number will need
+  changing when that branch lands.
+- Upstream has no public QICK-II or Versal branch. The Harvey Mudd / HRL work
+  that puts the RISC-Q core in front of QICK's generators is public at
+  `github.com/juliacygong/HRL_clinic`.
+
 ## 2026-11-25: tProc v2 dispatcher queue overflow (branch `lab/tproc-overflow`)
 
 Report: on a ZCU216 with stock tProc v2 firmware and library 0.2.450, a shot with
