@@ -483,18 +483,41 @@ class BoardServer:
                              'hwh_sha256': (self.current_image or {}).get('hwh_sha256')},
                    board=cfg.get('board') if cfg else None,
                    python=platform.python_version(),
-                   capabilities={'job_kinds': ['qick_prog'], 'modes': ['acc', 'dec'], 'reduce': False,
-                                 'image_store': self.images is not None,
-                                 'allow_job_image_load': bool(self.cfg['allow_job_image_load']),
-                                 'time_sync_period': tp.get('time_sync_period', 0),
-                                 'queue_flags': bool(tp.get('queue_flags', False)),
-                                 'rf': getattr(self.backend, 'rf', None) is not None,
-                                 'rf_safe_on_load': bool(self.cfg['rf_safe_on_load']),
-                                 'idle_after': True},
+                   capabilities=self._capabilities(),
                    limits={'max_header': P.MAX_HEADER, 'max_body': P.MAX_BODY,
                            'max_queue_bytes': self.cfg['max_queue_bytes'],
                            'max_retention_s': self.cfg['max_retention_s']},
                    wall_time=time.time(), monotonic=self.clock())
+
+    def _capabilities(self):
+        """What the server and the loaded image offer now (changes with every load:
+        sent in welcome, config, state and image_loaded)."""
+        cfg = self.backend.soccfg
+        tp = cfg['tprocs'][0] if cfg else {}
+        ros = (cfg or {}).get('readouts', [])
+        return {'job_kinds': ['qick_prog'], 'modes': ['acc', 'dec'], 'reduce': False,
+                'image_store': self.images is not None,
+                'allow_job_image_load': bool(self.cfg['allow_job_image_load']),
+                'time_sync_period': tp.get('time_sync_period', 0),
+                'queue_flags': bool(tp.get('queue_flags', False)),
+                'tproc_revision': tp.get('revision'),
+                'weights': [i for i, r in enumerate(ros) if r.get('has_weights')],
+                'rf': getattr(self.backend, 'rf', None) is not None,
+                'rf_safe_on_load': bool(self.cfg['rf_safe_on_load']),
+                'rf_limits': bool(self._rf_limits()),
+                'idle_after': True}
+
+    def _rf_limits(self):
+        """The limits table of the loaded image's safe-state file, or None."""
+        ci = self.current_image or {}
+        if self.images is None or ci.get('state') != 'loaded':
+            return None
+        doc = self.images.rf_safe(ci['name']) or {}
+        try:
+            return RF.check_limits_table(doc.get('limits'))
+        except RequestError as e:
+            log.error('rf_safe.json of %s: limits ignored: %s', ci['name'], e)
+            return None
 
     def h_bye(self, conn, req, body):
         conn.reply(req, 'bye')
@@ -504,13 +527,15 @@ class BoardServer:
 
     def h_get_config(self, conn, req, body):
         self._need_image()
-        conn.reply(req, 'config', soccfg=self.backend.soccfg, image=self._image_summary())
+        conn.reply(req, 'config', soccfg=self.backend.soccfg, image=self._image_summary(),
+                   capabilities=self._capabilities())
 
     def h_get_state(self, conn, req, body):
         st = self.backend.get_state() if self.backend.soccfg is not None else {'image_loaded': False}
         st.update({'image': self._image_summary(), 'loading': self.loading_info,
                    'outputs_idle_at': self.jobs.outputs_idle_at, 'last_idle': self.jobs.last_idle,
                    'monotonic': self.clock()})
+        st['capabilities'] = self._capabilities()
         conn.reply(req, 'state', state=st)
 
     def h_status(self, conn, req, body):
@@ -745,16 +770,16 @@ class BoardServer:
         self._need_rf()
         items = RF.check_items(req.get('settings'))
         settle = RF.check_settle(req.get('settle_s', self.cfg['rf_settle_s']))
+        limits = self._rf_limits()
+        try:
+            RF.check_limits(items, limits, self.backend.rf)
+        except RequestError as e:
+            log.warning('rf_set by %s refused: %s', conn.label, e)
+            raise
         if not self.rf_lock.acquire(blocking=False):
             raise RequestError('board_loading', 'an image load or another RF change is in progress')
         try:
-            with self.jobs.lock:
-                if self.jobs.loading:
-                    raise RequestError('board_loading', 'an image load is in progress')
-                j = self.jobs.running
-                if j is not None and j.owner_label != conn.label:
-                    raise RequestError('job_running', 'job %s (%s, ref %r) of another client is running'
-                                       % (j.id, j.owner_label, j.ref), job=j.id, submitter=j.owner_label, ref=j.ref)
+            self._rf_check_jobs(conn)
             log.info('rf_set by %s: %s', conn.label, json.dumps(items, sort_keys=True))
             rec = self.backend.rf_set(items, settle)
         finally:
@@ -763,27 +788,64 @@ class BoardServer:
                  [e['what'] for e in rec['order']], rec.get('ok'), rec.get('problems'), rec.get('actions'))
         rec['by'] = conn.label
         if not rec.get('ok'):
-            raise RequestError('adc_flags' if 'flags_idle' in rec else 'rf_failed',
-                               'rf_set by %s: %s' % (conn.label, '; '.join(rec.get('problems') or ['failed'])),
-                               record=rec)
+            if 'flags_idle' in rec:
+                raise RequestError('adc_flags', 'rf_set by %s: %s' % (conn.label, '; '.join(rec.get('problems') or [])),
+                                   record=rec, flags=rec['flags_after_change'], flagged=rec['flagged'],
+                                   flags_latched_before=rec['flags_latched_before'])
+            raise RequestError('rf_failed', 'rf_set by %s: %s' % (conn.label, '; '.join(rec.get('problems') or
+                                                                                      ['failed'])), record=rec)
         conn.reply(req, 'rf_applied', **rec)
+
+    def _rf_check_jobs(self, conn):
+        with self.jobs.lock:
+            if self.jobs.loading:
+                raise RequestError('board_loading', 'an image load is in progress')
+            j = self.jobs.running
+            if j is not None and j.owner_label != conn.label:
+                raise RequestError('job_running', 'job %s (%s, ref %r) of another client is running'
+                                   % (j.id, j.owner_label, j.ref), job=j.id, submitter=j.owner_label, ref=j.ref)
+
+    def h_rf_clear_flags(self, conn, req, body):
+        self._need_image()
+        self._need_rf()
+        settle = RF.check_settle(req.get('settle_s', 0.0))
+        if not self.rf_lock.acquire(blocking=False):
+            raise RequestError('board_loading', 'an image load or an RF change is in progress')
+        try:
+            self._rf_check_jobs(conn)
+            rec = self.backend.rf_clear_flags(settle)
+        finally:
+            self.rf_lock.release()
+        log.info('rf_clear_flags by %s: before %s, after %s', conn.label,
+                 [f['block'] for f in rec['flags_before'] if f.get('over_range') or f.get('over_voltage')],
+                 [f['block'] for f in rec['flags_after'] if f.get('over_range') or f.get('over_voltage')])
+        conn.reply(req, 'rf_flags_cleared', by=conn.label, **rec)
 
     def h_put_rf_safe(self, conn, req, body):
         """Store (or with settings null, remove) the RF safe state of a store image."""
         self._need_store()
         meta = self.images.resolve(req.get('image'))
-        if req.get('settings') is None:
+        if req.get('settings') is None and req.get('limits') is None:
             self.images.set_rf_safe(meta['name'], None)
             log.info('rf safe state of %s removed by %s', meta['name'], conn.label)
-            conn.reply(req, 'rf_safe_stored', image=meta['name'], settings=None)
+            conn.reply(req, 'rf_safe_stored', image=meta['name'], settings=None, limits=None)
             return
-        items = RF.check_items(req.get('settings'))
-        doc = {'settings': items, 'stored_by': conn.label, 'wall_time': time.time()}
+        items = RF.check_items(req.get('settings') or [], allow_empty=True)
+        limits = RF.check_limits_table(req.get('limits'))
+        if limits:
+            # the safe state itself must respect the limits (no board needed for that check
+            # except the readout -> ADC block map, which uses the image's cached soccfg)
+            cfg = self.images.cached_soccfg(meta['name'])
+            if cfg is not None:
+                RF.check_limits(items, limits, RF.RfFrontEnd(RF.MapOnly(cfg), cfg))
+        doc = {'settings': items, 'limits': limits, 'stored_by': conn.label, 'wall_time': time.time()}
         if req.get('settle_s') is not None:
             doc['settle_s'] = RF.check_settle(req.get('settle_s'))
         self.images.set_rf_safe(meta['name'], doc)
-        log.info('rf safe state of %s stored by %s: %s', meta['name'], conn.label, json.dumps(items, sort_keys=True))
-        conn.reply(req, 'rf_safe_stored', image=meta['name'], settings=items, settle_s=doc.get('settle_s'))
+        log.info('rf safe state of %s stored by %s: %s; limits %s', meta['name'], conn.label,
+                 json.dumps(items, sort_keys=True), json.dumps(limits, sort_keys=True))
+        conn.reply(req, 'rf_safe_stored', image=meta['name'], settings=items, limits=limits,
+                   settle_s=doc.get('settle_s'))
 
     # --- images ---
 
@@ -848,6 +910,7 @@ class BoardServer:
             self.rf_lock.release()
         rec = dict(rec)
         rec['cancelled_jobs'] = cancelled
+        rec['capabilities'] = self._capabilities()
         conn.reply(req, 'image_loaded', **rec)
 
     def _rf_policy(self, meta, skip_rf_safe=False):
@@ -855,7 +918,7 @@ class BoardServer:
         items, settle, problem = None, self.cfg['rf_settle_s'], None
         if safe is not None:
             try:
-                items = RF.check_items(safe.get('settings') or [])
+                items = RF.check_items(safe.get('settings') or [], allow_empty=True)
                 if safe.get('settle_s') is not None:
                     settle = RF.check_settle(safe.get('settle_s'))
             except RequestError as e:

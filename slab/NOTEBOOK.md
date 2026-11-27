@@ -3,6 +3,33 @@
 Running log for the lab fork. Newest entry first. Record dead ends as well as
 results, and say where each number came from.
 
+## 2026-11-26: board server, third round: from the engine side's client run (branch `lab/board-server`)
+
+All against the fake board; additive on the wire. 78 tests in
+`slab/tests/test_boardserver.py` (133 in `slab/tests/`) pass.
+
+- Fake fixed to match the firmware: on a weighted readout the accumulated
+  value is now the 32-bit sum of its window's weighted samples (it was
+  unweighted); `fake-w` is now tProc revision 29 with 8192 weights, `fake-w27`
+  keeps revision 27 / 1024 weights; `fake-rf` gained ADC block 23 (its DC In
+  port 7 had no converter block) and a generator on the DC Out card.
+- Readouts are mapped to ports through `rf.adcs[name].index`, as
+  `RFQickSoc216V1` does, not through the name's digits.
+- `capabilities` were only in `welcome`, so a client kept the ones of the image
+  loaded when it connected. They are now also in `image_loaded`, `config`
+  and `state`.
+- ADC flags as per-block lists, with `flags_latched_before` (read before the
+  request changes anything) and `flags_after_change`; `rf_clear_flags`.
+- Filters decoded with the library's ADMV8818 table (copied: that module needs
+  pynq); the request "as written" when the registers do not decode.
+- Per-image limits table (bias ranges, attenuation floors, DC In gain
+  ceiling) enforced on every `rf_set` (`rf_limit`).
+- DC Out: the library can power a channel up (`rfb_set_gen_dc`) but has no
+  `rfb_*` call to power it down; the server calls `DacDcChain216.disable()`.
+- Confirmed from the library: every load of an RF image writes all eight bias
+  outputs to 0 V and enables them (`BiasDAC11001.__init__`, then
+  `rfb_enable_bias`). Now stated in the reset record as data.
+
 ## 2026-11-26: board server, second round: RF cards, idle_after, image changes (branch `lab/board-server`)
 
 Requested by the engine side, which wrote its own stdlib client, so every

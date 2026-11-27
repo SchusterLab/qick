@@ -12,14 +12,20 @@ It creates four fake images and loads `fake-a`:
 - `fake-b`: other `fw_timestamp`, accumulated ring 1024, decimated buffer 2048,
   and its load reports `clocks_reprogrammed: true`;
 - `fake-rf`: `fake-a` on a QICK box with RF cards (RF Out on DAC slot 0, DC Out
-  on slot 1, RF In on ADC slot 2 = ports 4, 5, DC In on slot 3 = ports 6, 7;
-  readout 0 on ADC 20 = RF In, readout 1 on ADC 22 = DC In). Its fake cards
+  on slot 1, RF In on ADC slot 2 = ports 4, 5 = ADC blocks 20, 21, DC In on
+  slot 3 = ports 6, 7 = blocks 22, 23; readout 0 on ADC 20 = RF In, readout 1
+  on ADC 22 = DC In; generator 0 on DAC 00 = RF Out, generator 1 on DAC 10 =
+  DC Out). Its fake cards
   model the bad case below (amplifier state survives a load, the RF-ADC
   attenuator returns to 0 dB, over range while an RF In amplifier is on with
   the RF-ADC attenuator under 10 dB);
-- `fake-w`: `fake-a` with a weighted readout buffer (`has_weights`,
-  `wgt_maxlen` 1024); its decimated data is the fake trace times the loaded
-  weights by the firmware formula of `slab/sim/weighted_buffer/model.py`.
+- `fake-w`: `fake-a` with a weighted readout buffer as the lab firmware has
+  it (tProc revision 29 with queue flags, `wgt_maxlen` 8192); `fake-w27`: the
+  same as an upstream-style image (revision 27, no queue flags, 1024 weights).
+  As in the firmware, both buffers are weighted: the decimated data is the fake
+  trace times the loaded weights by the formula of
+  `slab/sim/weighted_buffer/model.py`, and each accumulated value is exactly
+  the 32-bit sum of its window's weighted samples.
 
 Add `--allow-job-image-load` to try `run.image` loading;
 `--insecure-fake` (only together with `--fake`) accepts any client without a token.
@@ -42,6 +48,10 @@ and requests, so clients of the first round keep working: `load_id` and
 `image_changed` rule for jobs that name no image, the RF cards (`rf_get`,
 `rf_set`, `put_rf_safe`, the procedure around `load_image`), and the fake
 images `fake-rf` and `fake-w`. The RF code on the real path is unverified too.
+A third round added: `capabilities` in every reply that follows a load
+(`image_loaded`, `config`, `state`), structured ADC flags, `rf_clear_flags`,
+decoded filters, per-image RF limits (`rf_limit`), DC Out power-down, and the
+fakes made consistent with the firmware.
 
 ## Why
 
@@ -195,7 +205,8 @@ Client to board:
 | `current_image` | the record of the last load | | `current_image` {`image`} |
 | `rf_get` | everything readable about the RF cards | | `rf` {`rf`, `image`} |
 | `rf_set` | apply RF settings in the safe order (`run` role, logged) | `settings`, `settle_s` | `rf_applied` |
-| `put_rf_safe` | store (or with `settings` null remove) an image's RF safe state | `image`, `settings`, `settle_s` | `rf_safe_stored` |
+| `put_rf_safe` | store (or with `settings` and `limits` null remove) an image's RF safe state and limits | `image`, `settings`, `limits`, `settle_s` | `rf_safe_stored` |
+| `rf_clear_flags` | read and clear the ADC flags only (`run` role, logged) | `settle_s` (default 0) | `rf_flags_cleared` {`flags_before`, `flags_after`, `settle_s`, `by`} |
 | `bye` | close | | `bye` |
 
 Board to client:
@@ -203,7 +214,7 @@ Board to client:
 | Type | When | Main fields |
 |---|---|---|
 | `challenge` | reply to `hello` | `nonce`, `protocol` |
-| `welcome` | reply to a correct `auth` | `protocol`, `qick_version`, `server_code_hash` (SHA-256 of the server's own modules), `session`, `role`, `insecure`, `fake`, `firmware` {`image`, `fw_timestamp`, `hwh_sha256`}, `board`, `python`, `capabilities` {`job_kinds`, `modes`, `reduce` (false), `image_store`, `allow_job_image_load`, `time_sync_period`, `queue_flags`, `rf` (the loaded image has RF cards), `rf_safe_on_load`, `idle_after` (true: `run.idle_after` understood)}, `limits` {`max_header`, `max_body`, `max_queue_bytes`, `max_retention_s`}, `wall_time`, `monotonic` |
+| `welcome` | reply to a correct `auth` | `protocol`, `qick_version`, `server_code_hash` (SHA-256 of the server's own modules), `session`, `role`, `insecure`, `fake`, `firmware` {`image`, `fw_timestamp`, `hwh_sha256`}, `board`, `python`, `capabilities` {`job_kinds`, `modes`, `reduce` (false), `image_store`, `allow_job_image_load`, `time_sync_period`, `queue_flags`, `tproc_revision`, `weights` (readout indices with a weighted buffer), `rf` (the loaded image has RF cards), `rf_safe_on_load`, `rf_limits` (the loaded image has a limits table), `idle_after` (true: `run.idle_after` understood)} (the same `capabilities` are in `image_loaded`, `config` and `state`, since they change with the image), `limits` {`max_header`, `max_body`, `max_queue_bytes`, `max_retention_s`}, `wall_time`, `monotonic` |
 | `accepted` | reply to `submit` | `job`, `ref`, `position`, `run` and `limits` in effect, `layout`, `prog_hash`, `image_load_first` (hash, if the job will load an image) |
 | `chunk` | pushed | `job`, `seq`, `round`, `buffer` (`acc` or `dec`), `shots` [first, last), `arrays`, `queued_bytes` |
 | `event` | pushed | `job`, `eseq`, `kind`, `t`, and per kind (below) |
@@ -367,7 +378,9 @@ product of `loop_dims`. The test
 
 Readout weights (`declare_readout(..., weights=w)`, int16 (length, 2)) travel
 in the program dictionary like envelopes and reach `soc.load_weights` intact
-(test `test_weights_round_trip` on `fake-w`).
+(test `test_weights_round_trip` on `fake-w`). On the fakes the accumulated
+value of a weighted readout equals the sum of its window's decimated samples
+(`test_weighted_accumulated_is_sum_of_window`, on `fake-w` and `fake-w27`).
 
 ### RF cards (QICK box daughter cards, ZCU216)
 
@@ -390,20 +403,41 @@ What can be read (from the library and the converter), and what cannot:
 | ADC over-range / over-voltage | the converter's interrupt word (`XRFdc_GetIntrStatus`, the bits `clear_interrupts` decodes); not part of `rfb_*` |
 | RF In amplifier, DC In power-down | card GPIO register (MCP23S08) |
 | DC In gain (LMH6401) | read back |
-| Filters (ADMV8818) | `WR0_SW`, `WR0_FILTER` registers read back (raw) |
+| Filters (ADMV8818) | `WR0_SW`, `WR0_FILTER` registers read back (raw) and decoded (`filter_setting`) |
+| DC Out power-down | card GPIO register |
 | Bias outputs (DAC11001) | setpoint read back |
 | Step attenuators on RF Out (2 per channel) and RF In (1) (PE43705) | **write-only**: reported as {`value`, `by`} with `by` = `constructor`, `rf_set` or `amplifier off` |
 | RF Out 5 V supply | not read; reported as last written |
 
 `rf_get` -> `rf` {`cards` {`adc`, `dac`: per slot null or {`kind`
 (`rf_in`, `dc_in`, `balun_in`, `rf_out`, `dc_out`, `balun_out`), `name`,
-`ports`}}, `gens`/`ros` (per soccfg index: `dac`/`adc` block, `port`, `slot`,
-`kind`), `adc_ports` (per ADC port on a card: `amp_on`, `att`, `filter`,
-`gain`), `dac_ports` (per DAC port: `att`, `supply_on`, `filter`), `adc_att`
-(per RF-ADC block, from the converter), `bias` (8 setpoints), `flags` (per
-RF-ADC block {`word`, `over_range`, `over_voltage`, `other`}, read without
-clearing), `readback` (which fields are read and which are last written)}.
-`get_state.rf` is the same record.
+`ports`}}, `gens`/`ros` (per soccfg index: `dac`/`adc` block, `tile`,
+`block`, `port`, `slot`, `kind`; a readout's tile and block are taken from
+`rf.adcs[<name>].index`, the converter's own numbering, and from the name's
+digits only when the index is missing), `adc_ports` (per ADC port on a card:
+`amp_on`, `att`, `filter`, `filter_setting`, `gain`), `dac_ports` (per DAC
+port: `att`, `supply_on`, `filter`, `filter_setting`; DC Out: `powered`),
+`adc_att` (per RF-ADC block, from the converter), `bias` (8 setpoints),
+`flags` (per RF-ADC block {`word`, `word_hex`, `over_range`, `over_voltage`,
+`other`}, read without clearing), `flags_list` (the same as a list sorted by
+block, each with `block`), `readback` (which fields are read and which are
+last written)}. `get_state.rf` is the same record.
+
+**ADC flags as data.** Everywhere a reply has a flag *list* its entries are
+{`block`, `over_range`, `over_voltage`, `word`, `word_hex`, `other`} (or
+{`block`, `error`}). The older per-block dicts (`flags`, `flags_idle`,
+`flags_before_clear`) stay as they were.
+
+`filter_setting`: decoded from the registers with the library's ADMV8818 step
+table (`FilterADMV8818.freq2steps`, copied into `rf.py`): {`source`:
+`decoded from the registers`, `ftype` (bypass when both sections are
+bypassed, lowpass / highpass when one is, bandpass when both are), `fc`, `bw`
+(GHz; bandpass: centre and width between the two cutoffs, as `set_filter`
+computes them from fc ± bw/2), `hpf`, `lpf` (steps, -1 bypass), `hpf_ghz`,
+`lpf_ghz`, `last_request`}. If the registers do not hold a setting
+`set_filter_raw` can write: {`source`: `as written`, `request`} (the last
+request since the load) or {`source`: `unknown`}. The decoded cutoffs are
+the table's nominal values, not a measured response.
 
 `rf_set` {`settings`: [...], `settle_s` (default 0.2, at most 10)}. Each
 setting names one target and what to set on it:
@@ -416,6 +450,7 @@ setting names one target and what to set on it:
     {"ro": 1, "amp": true, "gain": 10}           DC In: powered up, gain (-6..26 dB)
     {"gen": 0, "att": [6, 8]}                    RF Out: both attenuators (and its supply on)
     {"gen": 0, "filter": {...}}
+    {"gen": 1, "dc": false}                      DC Out: powered down (true: powered up, rfb_set_gen_dc)
     {"bias": 3, "volts": 0.5}
 
 Several keys may share one item (`{"ro": 0, "adc_att": 20, "amp": true,
@@ -425,7 +460,26 @@ a card of the needed kind). The RF In attenuator can only be written together
 with switching the amplifier on (the library has no separate call). Refused
 for the `read` role (`forbidden`), while another client's job runs
 (`job_running`; the caller's own running job does not block it), during a
-load (`board_loading`). Logged with the label.
+load (`board_loading`). Logged with the label. DC Out: the library powers a
+channel up with `rfb_set_gen_dc`/`rfb_set_dac_dc` but has no `rfb_*` call to
+power it down, so the server calls `DacDcChain216.disable()` (PD = 1)
+directly; the state is read back from the card GPIO.
+
+**Limits.** An image's safe-state file may carry a `limits` table
+(`put_rf_safe` `limits`, or `import-image --rf-safe` with `limits`), checked
+on **every** `rf_set` from any client, before anything is applied, and on the
+safe-state settings themselves when they are stored:
+
+    "limits": {"bias":        {"3": [-1.0, 1.0]},  V per output; with this section an output
+                                                   not listed may only be set to 0 V
+               "adc_att_min": {"20": 10},          RF-ADC attenuator floor per ADC block, dB
+               "ro_att_min":  {"0": 3},            RF In card attenuator floor per readout, dB
+               "gen_att_min": {"0": 6},            RF Out attenuator floor per generator (dB, or [dB1, dB2])
+               "dc_gain_max": {"1": 12}}           DC In gain ceiling per readout, dB
+
+A setting outside it is refused with `rf_limit` {`output` (e.g. `bias 3`,
+`adc 20`, `ro 0`, `gen 0`), `limit`, `value`}; nothing is applied. Without a
+table only the hardware ranges are checked.
 
 The server applies the settings in this order, whatever order they were
 given in (each step's phase, op, target, value and readback are in the
@@ -440,8 +494,14 @@ reply's `order`):
    last;
 4. **bias** outputs;
 5. **flags**: every ADC's flags are cleared (the words read while clearing are
-   `flags_before_clear`), the server waits `settle_s`, reads them again and
-   clears them (`flags_idle`).
+   `flags_before_clear`: latched during the change), the server waits
+   `settle_s`, reads them again and clears them (`flags_idle`, and as a list
+   `flags_after_change`).
+
+Before step 1 (after the settings have been checked) the server reads and
+clears every ADC's flags: `flags_latched_before`. So a flag in
+`flags_latched_before` was there before this request; a flag only in
+`flags_after_change` came with it.
 
 So readout-side attenuation is always raised before gain is added, and
 output-reducing changes come before output-increasing ones. In the case the
@@ -450,14 +510,21 @@ is raised first; when the attenuator is already high (after this server's
 own safe state, 27 dB) lowering it to the working value is a gain increase and
 comes after the amplifier is on.
 
-Reply `rf_applied` {`order`, `flags_before_clear`, `flags_idle`, `settle_s`,
-`problems` [], `actions` [], `ok` true, `by`}. If any ADC is over range or
-over voltage at idle the reply is `error` `adc_flags` with the same
-`record`: on **over-voltage** the card amplifier of that ADC is switched off
+Reply `rf_applied` {`order`, `flags_latched_before`, `flags_before_clear`,
+`flags_idle`, `flags_after_change`, `flagged` (the entries of
+`flags_after_change` with a flag set or an error), `settle_s`, `problems` [],
+`actions` [], `ok` true, `by`}. If any ADC is over range or over voltage at
+idle the reply is `error` `adc_flags` (one code; the message has the text)
+with `flags` (= `flags_after_change`), `flagged`, `flags_latched_before` and
+the whole `record`: on **over-voltage** the card amplifier of that ADC is switched off
 again (listed in `actions` with its readback); on over-range it is left as
 set, for a person to look. A step that raises gives `rf_failed` with the
 record up to that step. With an interrupt still set, the next job fails at
 `prepare_round` with `adc_interrupt` (that is `RFQickSoc216V1`'s own check).
+
+`rf_clear_flags` {`settle_s`} reads and clears every ADC's flags
+(`flags_before`), waits `settle_s`, and reads them again without clearing
+(`flags_after`: a persisting condition is back). Same refusals as `rf_set`.
 
 #### Around `load_image`
 
@@ -485,19 +552,21 @@ cards are present (`--no-rf-safe-on-load` turns it off):
    read); the RF-ADC attenuators are read back from the converter and compared.
 
 The safe-state file is per image: `put_rf_safe` {`image`, `settings` (the
-`rf_set` list), `settle_s`} or `import-image --rf-safe FILE`; stored as
+`rf_set` list, may be empty), `limits`, `settle_s`} or `import-image --rf-safe
+FILE`; stored as
 `rf_safe.json` beside the image (`list_images` shows `has_rf_safe`). A file
 that does not check is ignored (built-in safe state used, `safe_file_problem`
 in the record, logged).
 
 `reset.rf` in the `image_loaded` reply: {`procedure` (`on`/`off`), `before`
-(null; {`done` [{`port`, `kind`, `amp_on`}], `flags`, `ok`}; or {`skipped`,
-`why`}), `constructor` (what the soc constructor does to the cards, below),
+(null; {`done` [{`port`, `kind`, `amp_on`}], `flags`, `flags_list`, `ok`};
+or {`skipped`, `why`}), `constructor` (what the soc constructor does to the
+cards, below, with `forced`: the same as data),
 `found_after_load` (the `rf_get` record read right after the load, before any
 RF call of the server), `after` (null, or {`source` (`built-in default` or
-`safe-state file`), `amplifiers_off`, `order`, `flags_before_clear`,
-`flags_idle`, `settle_s`, `adc_att` (read back), `problems`, `actions`,
-`ok`}), `state` (the `rf_get` record after the procedure, without flags)}.
+`safe-state file`), `amplifiers_off`, `order`, `flags_latched_before`,
+`flags_before_clear`, `flags_idle`, `flags_after_change`, `flagged`,
+`settle_s`, `adc_att` (read back), `problems`, `actions`, `ok`}), `state` (the `rf_get` record after the procedure, without flags)}.
 `after.ok` false is logged as an error but does not undo the load.
 
 What `RFQickSoc216V1`'s constructor does to the cards (read from
@@ -508,9 +577,21 @@ written off; RF In: attenuator 31.75 dB, amplifiers written off; DC In: gain
 reach pins 0/1** (`SwitchControl.add_MCP` puts output i's default on pin
 3-i while `set_bits` uses pin i), so the DC In amplifiers may be left powered
 up; DC Out: powered up; filters: only `ADI_SPI_CONFIG_A` written, the
-band/state registers keep what they held; bias: all 0 V, then enabled; the
-RF-ADC attenuator is not written (0 dB after a load, as measured by the
-engine side); all ADC tiles restarted and their interrupts cleared.
+band/state registers keep what they held; the RF-ADC attenuator is not
+written (0 dB after a load, as measured by the engine side); all ADC tiles
+restarted and their interrupts cleared.
+
+**Every load sets all eight bias outputs to 0 V.** `_rfb_config` constructs a
+`BiasDAC11001` per output, whose constructor writes `CONFIG1_REG` = 0x4e00
+and then `set_volt(0)`; after that `rfb_enable_bias()` switches the bias
+outputs on. So whatever a bias output held (a flux bias, say) is 0 V after any
+load of an RF image, and the outputs are enabled. `reset.rf.constructor.forced`
+lists what the constructor forces: `bias_volts` [0 x 8], `bias_enabled` true,
+`rf_out_att_db` [31.75, 31.75], `rf_in_att_db` 31.75, `rf_out_supply_on`
+false, `rf_in_amp_on` false, `dc_out_powered` true, `dc_in_gain_db` -6,
+`dc_in_powered` (intended false, possibly true: the pin bug above); filters
+and the RF-ADC attenuator are not forced. A safe-state file can set the bias
+back (`{"bias": n, "volts": v}`, within its limits) right after the load.
 
 
 ## Error codes
@@ -546,8 +627,9 @@ Every refusal is an `error` with a stable `code` and a human `message`.
 | `board_loading` | an image load (or, for `rf_set`/`load_image`, another RF change) is in progress | |
 | `no_rf_board` | `rf_get`/`rf_set` on an image without RF cards, or a setting for a channel not on a card of the needed kind | `field` |
 | `rf_safe_failed` | `load_image` refused before reprogramming: a readout amplifier could not be confirmed off; nothing loaded | `record`, `load_id`, `image` |
-| `adc_flags` | `rf_set` applied, but an ADC is over range / over voltage at idle | `record` |
+| `adc_flags` | `rf_set` applied, but an ADC is over range / over voltage at idle | `flags`, `flagged`, `flags_latched_before`, `record` |
 | `rf_failed` | an `rf_set` step raised; the later steps were not applied | `record` |
+| `rf_limit` | an `rf_set` (or safe-state) setting is outside the image's limits table; nothing applied | `output`, `limit`, `value` |
 | `internal` | unexpected server error | `traceback` |
 
 In `done.error.code` only: `job_exception` (any Python exception in the job;

@@ -122,6 +122,25 @@ the results in `slab/NOTEBOOK.md`.
 
 ## 6. QICK box with RF cards (ZCU216, `qick_tprocv2_216_rfbv2`)
 
+**Read first**, and write it in the notebook before anything else:
+
+- the PYNQ version (`pip show pynq`) and the Python version
+  (`python3 --version`; the server needs 3.8 or later with numpy);
+- whether the image's `.hwh` has the RF-board control block:
+  `grep -c rfb_control image.hwh` (non-zero: the server will construct
+  `RFQickSoc216V1`; zero: plain `QickSoc`, no RF requests).
+
+**Only one process may hold the board.** Stop the Pyro service (and any
+Jupyter kernel holding a `QickSoc`) before starting this server, and never run
+both: each would construct its own soc, reprogram the FPGA and drive the RF
+cards. For a systemd Pyro unit: `systemctl stop qick-pyro` and
+`systemctl disable qick-pyro` (or the unit's name on that box). The server's
+lock file only stops a second board server; the Pyro server does not check it.
+
+Every load of an RF image sets **all eight bias outputs to 0 V** (the library
+constructor does it). Anything biased from them must tolerate that, or the
+image's safe-state file must set the bias back (within its `limits`).
+
 The RF code (`qick_lib/qick/boardserver/rf.py`, `LibraryRfHw`) has **not been
 run on a board**. It follows the library (`rfboard.py`, `drivers/hardware.py`)
 and, for the RF-ADC attenuator and the ADC flags, the engine side's
@@ -154,7 +173,10 @@ analyser on the RF In inputs, and record the results in `slab/NOTEBOOK.md`.
    DC In `amp_on` is read from `PD` with the opposite sense. The RF-ADC
    attenuator read back equals what was set (0, 13, 27 dB). `filter`
    registers change when a filter is set and decode to the requested steps
-   (`FilterADMV8818.set_filter_raw`). `bias` setpoints read back.
+   (`FilterADMV8818.set_filter_raw`); `filter_setting` decodes them to the
+   requested type and steps (it uses a copy of the library's step table).
+   `bias` setpoints read back. DC Out `powered` follows `{"gen": g, "dc":
+   false/true}` (the power-down is `DacDcChain216.disable`, called directly).
 3. **The DC In power-down default.** `SwitchControl.add_MCP` writes output
    i's default on pin 3-i, while `set_bits` uses pin i: on a DC In card the
    constructor's "powered down" default lands on pins 2/3, not on PD0/PD1.

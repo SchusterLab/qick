@@ -68,6 +68,7 @@ ERROR_CODES = {
     'adc_flags': 'rf_set applied, but an ADC is over range or over voltage at idle ("record"; on over-voltage '
                  'the card amplifier was switched off)',
     'rf_failed': 'an rf_set step raised; later steps were not applied ("record")',
+    'rf_limit': 'an rf_set setting is outside the loaded image\'s limits table ("output", "limit", "value")',
     # only in done.error.code:
     'job_exception': 'a Python exception in the job (traceback in "traceback")',
     'tproc_queue_overflow': 'the tProc lost a push into a full dispatcher queue (see "queues")',

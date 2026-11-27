@@ -489,9 +489,16 @@ class BoardClient:
         r = self.request('rf_set', settings=settings, **kw)
         return {k: v for k, v in r.items() if k not in ('type', 'reply_to')}
 
-    def put_rf_safe(self, image, settings, settle_s=None):
+    def put_rf_safe(self, image, settings, settle_s=None, limits=None):
         kw = {} if settle_s is None else {'settle_s': settle_s}
+        if limits is not None:
+            kw['limits'] = limits
         return self.request('put_rf_safe', image=image, settings=settings, **kw)
+
+    def rf_clear_flags(self, settle_s=None):
+        kw = {} if settle_s is None else {'settle_s': settle_s}
+        r = self.request('rf_clear_flags', **kw)
+        return {k: v for k, v in r.items() if k not in ('type', 'reply_to')}
 
     # --- images ---
     def list_images(self):

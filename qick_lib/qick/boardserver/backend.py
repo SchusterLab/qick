@@ -227,6 +227,10 @@ class QickSocBackend:
         with self.hw_lock:
             return _plain(self.rf.apply(items, settle_s=settle_s, protect=True))
 
+    def rf_clear_flags(self, settle_s):
+        with self.hw_lock:
+            return _plain(self.rf.clear_flags(settle_s))
+
     # --- programs --------------------------------------------------------
 
     def make_program(self, progdict):
@@ -451,8 +455,8 @@ def fake_acc_values(ch, rnd, points):
     return np.stack([i, q], axis=-1).astype(np.int32)
 
 
-def fake_dec_values(ch, rnd, n):
-    k = np.arange(n, dtype=np.int64)
+def fake_dec_values(ch, rnd, n, start=0):
+    k = np.arange(start, start + n, dtype=np.int64)
     i = ((k * 3 + ch * 17 + rnd * 101) % 4001) - 2000
     q = ((k * 5 + ch * 23 + rnd * 103) % 3001) - 1500
     return np.stack([i, q], axis=-1).astype(np.int32)
@@ -595,7 +599,19 @@ class FakeSoc(QickConfig):
         # the newest point each slot holds: q = slot + maxlen*k, q < written
         k = (written - 1 - slots) // maxlen
         q = slots + maxlen * k
-        data = fake_acc_values(ch, self._round, q)
+        w = (self.weights or {}).get(ch)
+        if w is not None and self['readouts'][ch].get('has_weights'):
+            # weighted buffer: the accumulated value of window q is the sum of that
+            # window's weighted (decimated) samples, 32-bit (model.accumulate)
+            L = len(w)
+            data = np.zeros((length, 2), dtype=np.int32)
+            for i, qq in enumerate(q):
+                if qq >= 0:
+                    y = fake_weighted(fake_dec_values(ch, self._round, L, start=int(qq) * L), w)
+                    sm = y.astype(np.int64).sum(axis=0)
+                    data[i] = ((sm + 2**31) % 2**32) - 2**31
+        else:
+            data = fake_acc_values(ch, self._round, q)
         data[q < 0] = 0
         if delay:
             time.sleep(delay)
@@ -680,6 +696,7 @@ class FakeRfHardware:
         self.adc_att = {}      # adc port -> dB (write-only on the real part)
         self.gain = {}         # adc port -> dB (DC In)
         self.dac_att = {}      # dac port -> [a1, a2]
+        self.dac_dc = {}       # dac port -> powered (DC Out)
         self.filters = {}      # (side, port) -> {'WR0_SW', 'WR0_FILTER'}
         self.bias = [0.0] * 8
         self.dsa = {}          # ADC block name -> dB
@@ -701,8 +718,10 @@ class FakeRfHardware:
                             self.adc_att.setdefault(p, ATT_MAX_FAKE)
                         if card['kind'] == 'dc_in':
                             self.gain.setdefault(p, -6.0)
-                    else:
+                    elif card['kind'] == 'rf_out':
                         self.dac_att.setdefault(p, [ATT_MAX_FAKE, ATT_MAX_FAKE])
+                    elif card['kind'] == 'dc_out':
+                        self.dac_dc.setdefault(p, True)
                     self.filters.setdefault((side, p), {'WR0_SW': 0xC0, 'WR0_FILTER': 0})
         for b in blocks:
             self.dsa.setdefault(b, 0.0)
@@ -752,6 +771,8 @@ class FakeRfHardware:
         for p in self.gain:
             self.gain[p] = -6.0
         self.bias = [0.0] * 8
+        for p in self.dac_dc:
+            self.dac_dc[p] = True
         if amps_off:
             for p in self.amp:
                 self.amp[p] = False
@@ -842,23 +863,20 @@ class FakeRfHw:
         self.hw.dac_att[port] = [float(np.round(a1 / 0.25) * 0.25), float(np.round(a2 / 0.25) * 0.25)]
         return tuple(self.hw.dac_att[port])
 
+    def dac_dc(self, port, on):
+        self._need('dac', port, ('dc_out',))
+        self.hw.calls.append(('dac_dc', port, on))
+        self.hw.dac_dc[port] = bool(on)
+
+    def dac_dc_read(self, port):
+        return self.hw.dac_dc.get(port) if self.hw.kind('dac', port) == 'dc_out' else None
+
     def filter_set(self, side, port, f):
+        from .rf import filter_steps_for
         self._need(side, port, ('rf_in',) if side == 'adc' else ('rf_out',))
         self.hw.calls.append(('filter', side, port, dict(f)))
-        if 'hpf' in f:
-            hpf, lpf = f['hpf'], f['lpf']
-        else:
-            # not the ADMV8818 table: a fake monotonic mapping of GHz to steps
-            def step(fr):
-                return max(0, min(63, int(round((fr - 1.75) / (19.9 - 1.75) * 63))))
-            ft = f['ftype']
-            hpf = lpf = -1
-            if ft == 'lowpass':
-                lpf = step(f['fc'])
-            elif ft == 'highpass':
-                hpf = step(f['fc'])
-            elif ft == 'bandpass':
-                hpf, lpf = step(f['fc'] - f['bw'] / 2), step(f['fc'] + f['bw'] / 2)
+        # the steps the library's set_filter computes (its ADMV8818 table)
+        hpf, lpf = filter_steps_for(f)
         hb, hs = (0, 0) if hpf < 0 else (1 + hpf // 16, hpf % 16)
         lb, ls = (0, 0) if lpf < 0 else (1 + lpf // 16, lpf % 16)
         self.hw.filters[(side, port)] = {'WR0_SW': 0xC0 + (hb << 3) + lb, 'WR0_FILTER': (hs << 4) + ls}
@@ -934,7 +952,11 @@ class FakeBackend(QickSocBackend):
     def _constructor_note(self):
         return {'source': 'fake board: FakeRfHardware.constructor (attenuators 31.75 dB, DC In gain -6 dB, bias 0 V, '
                           'flags cleared; amplifier switches left as they were unless the image sets '
-                          'constructor_amps_off). The library constructor is described in rf.LIBRARY_CONSTRUCTOR.'}
+                          'constructor_amps_off). The library constructor is described in rf.LIBRARY_CONSTRUCTOR.',
+                'forced': {'bias_volts': [0.0] * 8, 'bias_enabled': True, 'rf_out_att_db': [31.75, 31.75],
+                           'rf_in_att_db': 31.75, 'dc_out_powered': True, 'dc_in_gain_db': -6,
+                           'rf_in_amp_on': 'not forced (the bad case: left as it was)',
+                           'filters': 'not forced', 'rf_adc_att_db': 'not forced (0 after the PL load)'}}
 
     def run(self, prog, run, stop_event, deadline=None):
         self.soc.fake_set_inject(run.get('fake'))
@@ -945,7 +967,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 FAKE_SOCCFG_PATH = os.path.join(_HERE, 'fake_soccfg.json')
 
 
-FAKE_VARIANTS = ('fake-a', 'fake-b', 'fake-rf', 'fake-w')
+FAKE_VARIANTS = ('fake-a', 'fake-b', 'fake-rf', 'fake-w', 'fake-w27')
 
 # the fake QICK box: RF Out on DAC slot 0, DC Out on slot 1, RF In on ADC slot 2
 # (ports 4, 5: ADC blocks 20, 21), DC In on slot 3 (ports 6, 7: blocks 22, 23)
@@ -964,7 +986,8 @@ def fake_image_files(variant):
     loading it re-programmed the clock chips;
     'fake-rf' is fake-a on a QICK box with RF cards (FAKE_RF_LAYOUT): readout 0 on
     ADC 20 (RF In), a second readout on ADC 22 (DC In), generator 0 on RF Out;
-    'fake-w' is fake-a with a weighted readout buffer (has_weights, wgt_maxlen 1024)."""
+    'fake-w' is fake-a with a weighted readout buffer as the lab firmware has it (tProc
+    revision 29, wgt_maxlen 8192); 'fake-w27' the same at revision 27 with 1024 weights."""
     with open(FAKE_SOCCFG_PATH) as f:
         cfg = json.load(f)
     cfg['tprocs'][0]['queue_flags'] = True
@@ -983,14 +1006,27 @@ def fake_image_files(variant):
         ro2['avgbuf_fullpath'] = 'readout_wrapper/axis_avg_buffer_1'
         ro2['ro_fullpath'] = 'readout_wrapper/axis_dyn_readout_v1_1'
         cfg['readouts'].append(ro2)
+        # every port of the cards has its converter block: ADC 23 for DC In port 7
+        cfg['rf']['adcs']['23'] = dict(cfg['rf']['adcs']['22'], index=[2, 3])
+        cfg['rf']['tiles']['adc']['2']['blocks'] = ['20', '21', '22', '23']
+        # a generator on the DC Out card (DAC 10 = port 4)
+        g2 = json.loads(json.dumps(cfg['gens'][0]))
+        g2['dac'] = '10'
+        g2['fullpath'] = g2.get('fullpath', 'gen') + '_dc'
+        cfg['gens'].append(g2)
         # a real rfbv2 .hwh names the RF-board control block; QickSocBackend's auto
         # class choice looks for it
         doc['fake_rf'] = {'layout': FAKE_RF_LAYOUT, 'constructor_amps_off': False, 'hwh_marker': 'rfb_control'}
-    elif variant == 'fake-w':
-        cfg['fw_timestamp'] = 'fake-w ' + cfg['fw_timestamp']
+    elif variant in ('fake-w', 'fake-w27'):
+        # fake-w: like the lab firmware (tProc revision 29 with queue flags, 8192 weights);
+        # fake-w27: like an upstream image (revision 27, no queue flags, 1024 weights)
+        lab = variant == 'fake-w'
+        cfg['fw_timestamp'] = variant + ' ' + cfg['fw_timestamp']
+        cfg['tprocs'][0]['revision'] = 29 if lab else 27
+        cfg['tprocs'][0]['queue_flags'] = lab
         ro = cfg['readouts'][0]
         ro['has_weights'] = True
-        ro['wgt_maxlen'] = 1024
+        ro['wgt_maxlen'] = 8192 if lab else 1024
         ro['avgbuf_type'] = 'axis_weighted_buffer'
         ro['avgbuf_version'] = '1.3'
     elif variant != 'fake-a':

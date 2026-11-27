@@ -145,7 +145,7 @@ def _import_image(argv):
     ap.add_argument('--replace', action='store_true')
     ap.add_argument('--rf-safe', default=None, metavar='JSON',
                     help='RF safe state applied right after each load of this image: {"settings": [...], '
-                         '"settle_s": s} (rf_set settings)')
+                         '"limits": {...}, "settle_s": s} (rf_set settings; limits as in the protocol note)')
     a = ap.parse_args(argv)
     from .images import ImageStore
     hwh = a.hwh or os.path.splitext(a.bit)[0] + '.hwh'
@@ -155,7 +155,8 @@ def _import_image(argv):
         from . import rf as RF
         with open(a.rf_safe) as f:
             doc = json.load(f)
-        safe = {'settings': RF.check_items(doc.get('settings')), 'stored_by': 'import-image'}
+        safe = {'settings': RF.check_items(doc.get('settings') or [], allow_empty=True),
+                'limits': RF.check_limits_table(doc.get('limits')), 'stored_by': 'import-image'}
         if doc.get('settle_s') is not None:
             safe['settle_s'] = RF.check_settle(doc['settle_s'])
     meta = store.add_files(a.name, a.bit, hwh, added_by='import-image', replace=a.replace, note=a.note)

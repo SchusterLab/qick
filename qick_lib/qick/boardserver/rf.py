@@ -65,13 +65,106 @@ LIBRARY_CONSTRUCTOR = {
     'bias': 'DAC11001 CONFIG1 = 0x4e00 and all eight outputs 0 V, then the bias switch enabled (bias_gpio = 1)',
     'rf_adc_dsa': 'not written by the constructor; after a PL load it reads 0 dB (engine-side measurement)',
     'adc_tiles': 'all ADC tiles restarted, then the ADC interrupts cleared without error',
+    # the same as data. Every load constructs a new soc, so every load forces these:
+    'forced': {
+        # BiasDAC11001.__init__: CONFIG1_REG = 0x4e00, set_volt(0); then rfb_enable_bias()
+        'bias_volts': [0.0] * 8,
+        'bias_enabled': True,
+        # AttenuatorPE43705.__init__: set_att(31.75), for every chain on a card
+        'rf_out_att_db': [31.75, 31.75],
+        'rf_in_att_db': 31.75,
+        # DaughterCard216 GPIO defaults (SwitchControl.add_MCP)
+        'rf_out_supply_on': False,
+        'rf_in_amp_on': False,
+        'dc_out_powered': True,
+        'dc_in_powered': 'intended False; pins 0/1 are written 0 (see dc_in), so possibly True',
+        # GainLMH6401.__init__: set_gain(-6)
+        'dc_in_gain_db': -6,
+        'filters': 'not forced (only the SPI configuration register is written)',
+        'rf_adc_att_db': 'not forced by the constructor (0 after the PL load; the server sets it afterwards)',
+    },
 }
 
 
 def decode_flags(word):
     w = int(word or 0)
-    return {'word': w, 'over_voltage': bool(w & OVR_VOLTAGE), 'over_range': bool(w & (OVR_RANGE | SUBADC_RANGE)),
+    return {'word': w, 'word_hex': '0x%08x' % w, 'over_voltage': bool(w & OVR_VOLTAGE),
+            'over_range': bool(w & (OVR_RANGE | SUBADC_RANGE)),
             'other': w & ~(OVR_VOLTAGE | OVR_RANGE | SUBADC_RANGE) & 0xFFFFFFFF}
+
+
+def flag_list(flags):
+    """The per-block flags dict as a list [{block, over_range, over_voltage, word,
+    word_hex, other}] (or {block, error}), sorted by block."""
+    out = []
+    for name in sorted(flags):
+        f = flags[name]
+        e = {'block': name}
+        e.update(f)
+        out.append(e)
+    return out
+
+
+# ADMV8818 band edges (state 0 and state 15 of each band, MHz), copied from
+# qick.drivers.hardware.FilterADMV8818.freq2steps (that module needs pynq).
+FILTER_BANDS = {'LPF': [[2050, 3850], [3350, 7250], [7000, 13000], [12550, 18850]],
+                'HPF': [[1750, 3550], [3400, 7250], [6600, 12600], [12500, 19900]]}
+
+
+def filter_step_freq(section, step):
+    """Cutoff (GHz) of a filter step 0..63, as the library's table gives it."""
+    f0, f15 = FILTER_BANDS[section][step // 16]
+    return (f0 + (f15 - f0) * (step % 16) / 15.0) / 1000.0
+
+
+def filter_step(section, f_ghz):
+    """The step whose cutoff is nearest f (GHz): FilterADMV8818._freq2step."""
+    best = min(range(64), key=lambda s: abs(filter_step_freq(section, s) - f_ghz))
+    return best
+
+
+def filter_steps_for(f):
+    """(hpf, lpf) steps the library's set_filter computes for a request."""
+    if 'hpf' in f:
+        return f['hpf'], f['lpf']
+    ft = f['ftype']
+    if ft == 'lowpass':
+        return -1, filter_step('LPF', f['fc'])
+    if ft == 'highpass':
+        return filter_step('HPF', f['fc']), -1
+    if ft == 'bandpass':
+        return filter_step('HPF', f['fc'] - f['bw'] / 2), filter_step('LPF', f['fc'] + f['bw'] / 2)
+    return -1, -1
+
+
+def decode_filter(regs):
+    """WR0_SW / WR0_FILTER -> {ftype, fc, bw (GHz), hpf, lpf, hpf_ghz, lpf_ghz} or None
+    if the registers do not hold a setting set_filter_raw can write."""
+    try:
+        sw, filt = int(regs['WR0_SW']), int(regs['WR0_FILTER'])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if sw & 0xC0 != 0xC0 or sw > 0xFF:
+        return None
+    hb, lb = (sw >> 3) & 7, sw & 7
+    hs, ls = (filt >> 4) & 15, filt & 15
+    if hb > 4 or lb > 4 or (hb == 0 and hs) or (lb == 0 and ls):
+        return None
+    hpf = -1 if hb == 0 else (hb - 1) * 16 + hs
+    lpf = -1 if lb == 0 else (lb - 1) * 16 + ls
+    out = {'hpf': hpf, 'lpf': lpf,
+           'hpf_ghz': None if hpf < 0 else filter_step_freq('HPF', hpf),
+           'lpf_ghz': None if lpf < 0 else filter_step_freq('LPF', lpf)}
+    if hpf < 0 and lpf < 0:
+        out.update(ftype='bypass', fc=None, bw=None)
+    elif hpf < 0:
+        out.update(ftype='lowpass', fc=out['lpf_ghz'], bw=None)
+    elif lpf < 0:
+        out.update(ftype='highpass', fc=out['hpf_ghz'], bw=None)
+    else:
+        out.update(ftype='bandpass', fc=(out['hpf_ghz'] + out['lpf_ghz']) / 2,
+                   bw=out['lpf_ghz'] - out['hpf_ghz'])
+    return out
 
 
 def adc_block_of_port(port):
@@ -144,13 +237,13 @@ def _filter(f, field):
     return out
 
 
-ITEM_KEYS = {'ro', 'gen', 'adc', 'bias', 'adc_att', 'filter', 'att', 'amp', 'gain', 'volts'}
+ITEM_KEYS = {'ro', 'gen', 'adc', 'bias', 'adc_att', 'filter', 'att', 'amp', 'gain', 'volts', 'dc'}
 
 
-def check_items(settings):
+def check_items(settings, allow_empty=False):
     """Syntax check of an rf_set settings list (no board needed). Returns a normalized
     copy. Raises RequestError('bad_request') naming the field."""
-    if not isinstance(settings, list) or not settings:
+    if not isinstance(settings, list) or (not settings and not allow_empty):
         raise _err('settings', 'a non-empty list of settings')
     out = []
     for i, it in enumerate(settings):
@@ -173,7 +266,7 @@ def check_items(settings):
             v = it[t]
             if isinstance(v, bool) or not isinstance(v, Integral) or v < 0 or (t == 'bias' and v > 7):
                 raise _err(w + '.' + t, '%r is not a channel number' % (v,))
-        allowed = {'ro': {'adc_att', 'filter', 'att', 'amp', 'gain'}, 'gen': {'filter', 'att'},
+        allowed = {'ro': {'adc_att', 'filter', 'att', 'amp', 'gain'}, 'gen': {'filter', 'att', 'dc'},
                    'adc': {'adc_att'}, 'bias': {'volts'}}[t]
         keys = set(it) - {t}
         if not keys:
@@ -190,6 +283,12 @@ def check_items(settings):
             if not isinstance(a, (list, tuple)) or len(a) != 2:
                 raise _err(w + '.att', 'a generator on an RF Out card takes two attenuations [A1, A2] (dB)')
             n['att'] = [_att(a[0], w + '.att[0]'), _att(a[1], w + '.att[1]')]
+        if t == 'gen' and 'dc' in it:
+            if not isinstance(it['dc'], bool):
+                raise _err(w + '.dc', 'true (DC Out powered up, rfb_set_gen_dc) or false (powered down)')
+            if 'att' in it or 'filter' in it:
+                raise _err(w + '.dc', 'dc is for a DC Out card; att and filter are for RF Out')
+            n['dc'] = it['dc']
         if t == 'ro':
             if 'amp' in it and not isinstance(it['amp'], bool):
                 raise _err(w + '.amp', 'true or false')
@@ -226,6 +325,94 @@ def check_settle(v):
     return float(v)
 
 
+LIMIT_KEYS = ('bias', 'adc_att_min', 'ro_att_min', 'gen_att_min', 'dc_gain_max')
+
+
+def check_limits_table(lim):
+    """Syntax check of a safe-state file's `limits`:
+        bias         {"<output 0-7>": [lo, hi]}  V; with this section, outputs not listed may only be 0 V
+        adc_att_min  {"<ADC block, e.g. 20>": dB}  floor of the RF-ADC attenuator
+        ro_att_min   {"<readout>": dB}             floor of the RF In card attenuator
+        gen_att_min  {"<generator>": dB or [dB1, dB2]}  floor of the RF Out attenuators
+        dc_gain_max  {"<readout>": dB}             ceiling of the DC In gain
+    Returns a normalized copy (keys as strings)."""
+    if lim is None:
+        return None
+    if not isinstance(lim, dict):
+        raise _err('limits', 'an object with %s' % ', '.join(LIMIT_KEYS))
+    bad = sorted(set(lim) - set(LIMIT_KEYS))
+    if bad:
+        raise _err('limits', 'unknown section %s (sections: %s)' % (', '.join(bad), ', '.join(LIMIT_KEYS)))
+    out = {}
+    for sec, table in lim.items():
+        f = 'limits.' + sec
+        if not isinstance(table, dict):
+            raise _err(f, 'an object keyed by channel')
+        o = {}
+        for k, v in table.items():
+            fk = '%s.%s' % (f, k)
+            if sec == 'bias':
+                if str(k) not in [str(i) for i in range(8)]:
+                    raise _err(fk, 'bias outputs are 0-7')
+                if not isinstance(v, (list, tuple)) or len(v) != 2:
+                    raise _err(fk, '[lo, hi] in V')
+                lo, hi = _num(v[0], fk + '[0]'), _num(v[1], fk + '[1]')
+                if not -BIAS_MAX <= lo <= hi <= BIAS_MAX:
+                    raise _err(fk, '[%g, %g] V must be increasing within -%g .. %g V' % (lo, hi, BIAS_MAX, BIAS_MAX))
+                o[str(k)] = [lo, hi]
+            elif sec == 'gen_att_min':
+                vv = list(v) if isinstance(v, (list, tuple)) else [v, v]
+                if len(vv) != 2:
+                    raise _err(fk, 'dB or [dB1, dB2]')
+                o[str(k)] = [_num(vv[0], fk), _num(vv[1], fk)]
+            else:
+                o[str(k)] = _num(v, fk)
+        out[sec] = o
+    return out
+
+
+def _limit(output, limit, value, msg):
+    return RequestError('rf_limit', '%s: %s' % (output, msg), output=output, limit=limit, value=value)
+
+
+def check_limits(items, limits, fe):
+    """Refuse (rf_limit) any item outside the image's limits table. fe: RfFrontEnd
+    (maps readouts to ADC blocks)."""
+    if not limits:
+        return
+    rm = fe.ro_map()
+    for it in items:
+        if 'adc_att' in it:
+            block = it['adc'] if 'adc' in it else rm.get(it['ro'], {}).get('adc')
+            lo = limits.get('adc_att_min', {}).get(str(block))
+            if lo is not None and it['adc_att'] < lo:
+                raise _limit('adc %s' % block, {'adc_att_min': lo}, it['adc_att'],
+                             'RF-ADC attenuator %g dB is below the floor %g dB' % (it['adc_att'], lo))
+        if 'ro' in it and 'att' in it:
+            lo = limits.get('ro_att_min', {}).get(str(it['ro']))
+            if lo is not None and it['att'] < lo:
+                raise _limit('ro %d' % it['ro'], {'ro_att_min': lo}, it['att'],
+                             'RF In attenuator %g dB is below the floor %g dB' % (it['att'], lo))
+        if 'ro' in it and 'gain' in it:
+            hi = limits.get('dc_gain_max', {}).get(str(it['ro']))
+            if hi is not None and it['gain'] > hi:
+                raise _limit('ro %d' % it['ro'], {'dc_gain_max': hi}, it['gain'],
+                             'DC In gain %g dB is above the ceiling %g dB' % (it['gain'], hi))
+        if 'gen' in it and 'att' in it:
+            lo = limits.get('gen_att_min', {}).get(str(it['gen']))
+            if lo is not None and (it['att'][0] < lo[0] or it['att'][1] < lo[1]):
+                raise _limit('gen %d' % it['gen'], {'gen_att_min': lo}, it['att'],
+                             'RF Out attenuators %s dB below the floor %s dB' % (it['att'], lo))
+        if 'bias' in it and 'bias' in limits:
+            lh = limits['bias'].get(str(it['bias']))
+            if lh is None and it['volts'] != 0:
+                raise _limit('bias %d' % it['bias'], {'bias': None}, it['volts'],
+                             '%g V: the limits table has no range for this output (only 0 V allowed)' % it['volts'])
+            if lh is not None and not lh[0] <= it['volts'] <= lh[1]:
+                raise _limit('bias %d' % it['bias'], {'bias': lh}, it['volts'],
+                             '%g V is outside [%g, %g] V' % (it['volts'], lh[0], lh[1]))
+
+
 class RfSafeFailed(Exception):
     def __init__(self, message, record):
         super().__init__(message)
@@ -245,6 +432,7 @@ class RfFrontEnd:
       hw.adc_amp_read(port) -> bool|None
       hw.adc_gain_read(port) -> dB|None
       hw.dac_rf(port, a1, a2) -> (a1, a2)
+      hw.dac_dc(port, on) / dac_dc_read(port) -> bool|None   DC Out power-down switch
       hw.filter_set(side, port, f)       side 'adc'|'dac'; f {ftype, fc, bw} or {hpf, lpf}
       hw.filter_read(side, port) -> {'WR0_SW', 'WR0_FILTER'}
       hw.bias_set(i, v) -> v / bias_get(i)
@@ -260,7 +448,7 @@ class RfFrontEnd:
         cw = hw.constructor_written()
         self.written = {'dac_att': {int(p): {'value': list(v), 'by': 'constructor'} for p, v in cw.get('dac', {}).items()},
                         'adc_att': {int(p): {'value': v, 'by': 'constructor'} for p, v in cw.get('adc', {}).items()},
-                        'dac_supply': {}}
+                        'dac_supply': {}, 'filters': {}}
 
     # --- mapping ----------------------------------------------------------
 
@@ -284,11 +472,16 @@ class RfFrontEnd:
 
     def ro_map(self):
         out = {}
+        adcs = (self.cfg.get('rf') or {}).get('adcs') or {}
         for i, r in enumerate(self.cfg.get('readouts', [])):
             name = str(r['adc'])
-            port = adc_port_of_block(name)
+            # the converter's own (tile, block) of this ADC, as RFQickSoc216V1 and the
+            # rf.adcs table give it; the name's digits only as a fallback
+            idx = (adcs.get(name) or {}).get('index')
+            t, b = (int(idx[0]), int(idx[1])) if idx else (int(name[0]), int(name[1]))
+            port = (t - 1) * 4 + b if t in (1, 2) else None
             card = self._card('adc', port) if port is not None else None
-            out[i] = {'adc': name, 'tile': int(name[0]), 'block': int(name[1]), 'port': port,
+            out[i] = {'adc': name, 'tile': t, 'block': b, 'port': port,
                       'slot': None if port is None else port // 2, 'kind': card['kind'] if card else None}
         return out
 
@@ -331,6 +524,7 @@ class RfFrontEnd:
             if kind == 'rf_in':
                 d['att'] = self.written['adc_att'].get(p)
                 d['filter'] = self._try(self.hw.filter_read, 'adc', p)
+                d['filter_setting'] = self._filter_setting('adc', p, d['filter'])
             if kind == 'dc_in':
                 d['gain'] = self._try(self.hw.adc_gain_read, p)
             adc[str(p)] = d
@@ -344,6 +538,9 @@ class RfFrontEnd:
                     d['att'] = self.written['dac_att'].get(p)
                     d['supply_on'] = self.written['dac_supply'].get(p)
                     d['filter'] = self._try(self.hw.filter_read, 'dac', p)
+                    d['filter_setting'] = self._filter_setting('dac', p, d['filter'])
+                if card['kind'] == 'dc_out':
+                    d['powered'] = self._try(self.hw.dac_dc_read, p)
                 dac[str(p)] = d
         rec = {
             'cards': lay,
@@ -355,14 +552,30 @@ class RfFrontEnd:
             'bias': {str(i): self._try(self.hw.bias_get, i) for i in range(8)},
             'readback': {'read_from_hardware': ['adc_att (RF-ADC step attenuator, from the converter)',
                                                 'flags (ADC interrupt status, not cleared by reading)',
-                                                'amp_on (card GPIO register)', 'gain (LMH6401)',
-                                                'filter (ADMV8818 WR0_SW / WR0_FILTER)', 'bias (DAC11001)'],
+                                                'amp_on, powered (card GPIO register)', 'gain (LMH6401)',
+                                                'filter (ADMV8818 WR0_SW / WR0_FILTER raw); filter_setting '
+                                                'decodes it with the library table, or gives the request '
+                                                'as written', 'bias (DAC11001)'],
                          'last_written': ['att (PE43705 attenuators are write-only: {value, by})',
                                           'supply_on (RF Out 5 V supply)']},
         }
         if flags:
             rec['flags'] = self.flags_all(clear=False)
+            rec['flags_list'] = flag_list(rec['flags'])
         return rec
+
+    def _filter_setting(self, side, port, regs):
+        dec = decode_filter(regs) if isinstance(regs, dict) and 'error' not in regs else None
+        last = self.written['filters'].get((side, port))
+        if dec is not None:
+            dec['source'] = 'decoded from the registers'
+            if last is not None:
+                dec['last_request'] = last
+            return dec
+        if last is not None:
+            return {'source': 'as written', 'request': last,
+                    'why': 'the registers do not decode to a set_filter_raw setting'}
+        return {'source': 'unknown', 'why': 'registers not decodable and nothing written since the load'}
 
     # --- applying -------------------------------------------------------------
 
@@ -402,9 +615,16 @@ class RfFrontEnd:
                 if g not in gens:
                     raise _err(w + '.gen', 'the firmware has no generator %d (it has %d)' % (g, len(gens)))
                 c = gens[g]
-                if c['kind'] != 'rf_out':
+                if c['kind'] != 'rf_out' and 'dc' not in it:
                     raise RequestError('no_rf_board', 'generator %d is on DAC %s (port %d): %s, not an RF Out card'
                                        % (g, c['dac'], c['port'], c['kind'] or 'no card'), field=w + '.gen')
+                if 'dc' in it:
+                    if c['kind'] != 'dc_out':
+                        raise RequestError('no_rf_board', 'generator %d is on DAC %s (port %d): %s, not a DC Out card'
+                                           % (g, c['dac'], c['port'], c['kind'] or 'no card'), field=w + '.gen')
+                    steps.append(('increase' if it['dc'] else 'reduce', 'dac_dc', c['port'], it['dc'],
+                                  'generator %d DC Out %s' % (g, 'powered up' if it['dc'] else 'powered down')))
+                    continue
                 if 'filter' in it:
                     steps.append(('filters', 'filter', ('dac', c['port']), it['filter'], 'generator %d filter' % g))
                 if 'att' in it:
@@ -440,8 +660,9 @@ class RfFrontEnd:
         # (attenuation removed, amplifiers on), bias. Within increases: card attenuators,
         # then amplifiers, then RF-ADC attenuator decreases last.
         phase_rank = {'reduce': 0, 'filters': 1, 'increase': 2, 'bias': 3}
-        op_rank = {'adc_att': 0, 'adc_off': 1, 'adc_dc_on': 2, 'dac_att': 3, 'adc_rf_on': 4, 'filter': 0, 'bias': 0}
-        inc_rank = {'dac_att': 0, 'adc_rf_on': 1, 'adc_dc_on': 2, 'adc_att': 3}
+        op_rank = {'adc_att': 0, 'adc_off': 1, 'adc_dc_on': 2, 'dac_dc': 3, 'dac_att': 3, 'adc_rf_on': 4,
+                   'filter': 0, 'bias': 0}
+        inc_rank = {'dac_att': 0, 'dac_dc': 0, 'adc_rf_on': 1, 'adc_dc_on': 2, 'adc_att': 3}
         keyed = []
         for n, s in enumerate(steps):
             rank = inc_rank.get(s[1], 9) if s[0] == 'increase' else op_rank.get(s[1], 9)
@@ -459,7 +680,13 @@ class RfFrontEnd:
         if op == 'filter':
             side, port = target
             hw.filter_set(side, port, value)
-            return {'read': self._try(hw.filter_read, side, port)}
+            self.written['filters'][(side, port)] = dict(value)
+            regs = self._try(hw.filter_read, side, port)
+            return {'read': regs, 'setting': self._filter_setting(side, port, regs),
+                    'steps_requested': list(filter_steps_for(value))}
+        if op == 'dac_dc':
+            hw.dac_dc(target, value)
+            return {'powered': self._try(hw.dac_dc_read, target)}
         if op == 'dac_att':
             got = hw.dac_rf(target, value[0], value[1])
             got = [float(got[0]), float(got[1])]
@@ -490,7 +717,9 @@ class RfFrontEnd:
         set at idle. With protect, an ADC in over-voltage at idle has its card amplifier
         switched off (record['actions'])."""
         steps = self.plan(items)
-        rec = {'order': [], 'actions': [], 'problems': []}
+        # what was already latched before this request changed anything (read and cleared)
+        rec = {'order': [], 'actions': [], 'problems': [],
+               'flags_latched_before': flag_list(self.flags_all(clear=True))}
         for s in steps:
             entry = {'phase': s[0], 'op': s[1], 'target': list(s[2]) if isinstance(s[2], tuple) else s[2],
                      'value': s[3], 'what': s[4]}
@@ -514,6 +743,9 @@ class RfFrontEnd:
             self.sleep(settle_s)
         idle = self.flags_all(clear=True)
         out['flags_idle'] = idle
+        out['flags_after_change'] = flag_list(idle)
+        out['flagged'] = [f for f in out['flags_after_change']
+                          if f.get('over_range') or f.get('over_voltage') or 'error' in f]
         out['settle_s'] = settle_s
         problems, actions = [], []
         rf_in = {adc_block_of_port(p): p for p, k in self.adc_ports() if k in ('rf_in', 'dc_in')}
@@ -537,6 +769,14 @@ class RfFrontEnd:
         out['ok'] = not problems
         return out
 
+    def clear_flags(self, settle_s=0.0):
+        """Read and clear every ADC's flags; after settle_s read them again (not cleared)."""
+        before = self.flags_all(clear=True)
+        if settle_s:
+            self.sleep(settle_s)
+        after = self.flags_all(clear=False)
+        return {'flags_before': flag_list(before), 'flags_after': flag_list(after), 'settle_s': settle_s}
+
     # --- around an image load ---------------------------------------------------
 
     def before_load(self):
@@ -556,6 +796,7 @@ class RfFrontEnd:
                 rec['ok'] = False
             rec['done'].append(e)
         rec['flags'] = self.flags_all(clear=False)
+        rec['flags_list'] = flag_list(rec['flags'])
         if not rec['ok']:
             bad = [e for e in rec['done'] if e.get('amp_on') is not False]
             raise RfSafeFailed('could not confirm the readout amplifiers off before the load: %s' % bad, rec)
@@ -611,6 +852,23 @@ class RfFrontEnd:
                 rec['ok'] = False
                 rec.setdefault('problems', []).append('RF-ADC %s attenuator reads %s after setting %g dB' % (name, got, v))
         return rec
+
+
+class MapOnly:
+    """Adapter with no hardware: lets RfFrontEnd map readouts to ADC blocks from a
+    soccfg alone (limits checks when storing a safe-state file)."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+    def layout(self):
+        return {'adc': [None] * 4, 'dac': [None] * 4}
+
+    def constructor_written(self):
+        return {}
+
+    def adc_blocks(self):
+        return [(n, int(c['index'][0]), int(c['index'][1])) for n, c in sorted(self.cfg['rf']['adcs'].items())]
 
 
 class LibraryRfHw:
@@ -705,6 +963,25 @@ class LibraryRfHw:
 
     def dac_rf(self, port, a1, a2):
         return self.soc.rfb_set_dac_rf(port, a1, a2)
+
+    def dac_dc(self, port, on):
+        # rfb_set_dac_dc -> DacDcChain216.enable_dc (PD = 0); the library has no rfb_* call
+        # for powering down, so DacDcChain216.disable (PD = 1) is called directly
+        if on:
+            self.soc.rfb_set_dac_dc(port)
+        else:
+            self.soc.dac_chains[port].disable()
+
+    def dac_dc_read(self, port):
+        ch = self.soc.dac_chains[port]
+        net = getattr(ch, 'powerdown', None)
+        if net is None:
+            return None
+        sc = ch.card.switch_control
+        dev, bit = sc.net2port[net]
+        with self.soc.board_sel.enable_context(ch.card_num):
+            reg = sc.devs[dev].read_reg('GPIO_REG')
+        return not bool((reg >> bit) & 1)
 
     def filter_set(self, side, port, f):
         if 'hpf' in f:
