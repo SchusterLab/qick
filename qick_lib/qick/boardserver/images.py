@@ -6,6 +6,7 @@ Layout of the image directory:
     <root>/<name>/image.hwh
     <root>/<name>/meta.json      name, hashes, sizes, when and by whom it was added
     <root>/<name>/soccfg.json    the configuration the image produced at its last load
+    <root>/<name>/rf_safe.json   optional: the RF safe state applied right after loading it
     <root>/.uploads/<id>/        uploads in progress (removed on commit or abort)
 
 An image is identified by `hash` = SHA-256 of (bit SHA-256 hex + hwh SHA-256 hex).
@@ -89,6 +90,7 @@ class ImageStore:
                 cfg = self.cached_soccfg(name)
                 meta = dict(meta)
                 meta['has_soccfg'] = cfg is not None
+                meta['has_rf_safe'] = os.path.exists(os.path.join(self._dir(name), 'rf_safe.json'))
                 if cfg is not None:
                     meta['fw_timestamp'] = cfg.get('fw_timestamp')
                     meta['board'] = cfg.get('board')
@@ -122,6 +124,26 @@ class ImageStore:
         with self.lock:
             if os.path.isdir(self._dir(name)):
                 _write_json(os.path.join(self._dir(name), 'soccfg.json'), cfg)
+
+    def rf_safe(self, name):
+        """The image's RF safe-state document {'settings': [...], 'settle_s'?, ...} or None."""
+        try:
+            with open(os.path.join(self._dir(name), 'rf_safe.json')) as f:
+                return json.load(f)
+        except OSError:
+            return None
+
+    def set_rf_safe(self, name, doc):
+        """Store (doc) or remove (None) the image's RF safe-state document."""
+        with self.lock:
+            if not os.path.isdir(self._dir(name)):
+                raise RequestError('unknown_image', 'no image named %r' % name, image=name)
+            path = os.path.join(self._dir(name), 'rf_safe.json')
+            if doc is None:
+                if os.path.exists(path):
+                    os.remove(path)
+            else:
+                _write_json(path, doc)
 
     # --- adding ----------------------------------------------------------
 

@@ -62,9 +62,18 @@ ERROR_CODES = {
     'image_load_failed': 'constructing QickSoc from the image raised',
     'board_loading': 'an image load is in progress',
     'internal': 'unexpected server error (traceback in "traceback")',
+    'no_rf_board': 'the loaded image (or the channel named) has no QICK box RF card of the kind needed',
+    'rf_safe_failed': 'load_image refused before reprogramming: the readout amplifiers could not be confirmed off '
+                      '("record"); nothing was loaded (skip_rf_safe overrides)',
+    'adc_flags': 'rf_set applied, but an ADC is over range or over voltage at idle ("record"; on over-voltage '
+                 'the card amplifier was switched off)',
+    'rf_failed': 'an rf_set step raised; later steps were not applied ("record")',
     # only in done.error.code:
     'job_exception': 'a Python exception in the job (traceback in "traceback")',
     'tproc_queue_overflow': 'the tProc lost a push into a full dispatcher queue (see "queues")',
+    'image_changed': 'the image changed after the job was submitted and the job names no image (run.image)',
+    'adc_interrupt': 'an ADC interrupt (over range / over voltage) was raised when the round was prepared '
+                     '(RFQickSoc216V1.prepare_round)',
 }
 
 AUTH_CONTEXT = b'qick-boardserver-auth/1'

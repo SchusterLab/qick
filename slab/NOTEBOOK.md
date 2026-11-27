@@ -3,6 +3,60 @@
 Running log for the lab fork. Newest entry first. Record dead ends as well as
 results, and say where each number came from.
 
+## 2026-11-26: board server, second round: RF cards, idle_after, image changes (branch `lab/board-server`)
+
+Requested by the engine side, which wrote its own stdlib client, so every
+change only adds fields or requests. **Nothing has run on a board; the RF
+code on the real path (`rf.LibraryRfHw` over `RFQickSoc216V1`) is unverified.**
+68 tests in `slab/tests/test_boardserver.py` (123 in `slab/tests/`) pass on
+the lab PC, Python 3.12.
+
+- Loads carry a `load_id` (also in the log lines and `current_image`) and the
+  `previous` image; `image_mismatch` names the loaded image; `jobs_queued`
+  lists job, submitter, ref.
+- `run.idle_after: false` leaves the outputs as the program left them at a
+  normal end; errors, cancels, time limits and queue-bound stops still idle.
+- The note said queued jobs are rebuilt after a load; the code never did.
+  Fixed the other way round: a job that names no image and reaches the head of
+  the queue after an image change is not run (`image_changed`), and a
+  `run.image` load cancels such queued jobs and lists them. Clients should
+  always send `run.image`.
+- Checked the client's decimated result against the library: the test runs
+  `acquire_decimated` itself on a FakeSoc and compares arrays for the three
+  documented shapes. It matched without code changes.
+- RF cards. Read from the library: the PE43705 attenuators are write-only (the
+  server reports what it last wrote and who wrote it); amplifier switches, DC
+  In gain, filter registers and bias setpoints read back. The RF-ADC step
+  attenuator and the ADC over-range/over-voltage flags are not in the `rfb_*`
+  methods; I added them as the engine side asked (they measured on a ZCU216
+  with RF cards that the RF-ADC attenuator is 0 dB after a load and the ADC is
+  over range with the RF In amplifier on and nothing playing). Their approach
+  (`qubit-measurement` `board_side/qick_rf.py`) is credited in `rf.py`.
+- `rf_set` orders the settings itself: attenuation raised and amplifiers off
+  first, then filters, then attenuation lowered and amplifiers on, the RF-ADC
+  attenuator lowered last, then bias, then the idle flag check. This differs
+  from the engine side's fixed order (RF-ADC attenuator first) only when the
+  attenuator is lowered; after this server's safe state it starts at 27 dB, so
+  lowering it to the working value is a gain increase and now comes last.
+- Around every load (on by default, `--no-rf-safe-on-load` turns it off): all
+  readout amplifiers off and read back before reprogramming (refused with
+  `rf_safe_failed` otherwise), and after the load every RF-ADC attenuator to 27
+  dB or the image's safe-state file value, amplifiers off unless the file says
+  otherwise, flags cleared and read. Everything read back is in
+  `reset.rf`. On the fake (amplifier state survives a load, RF-ADC attenuator
+  back to 0) the over-range flag is set after a load without the procedure and
+  never with it.
+- Found while reading `rfboard.py`/`hardware.py` (not measured):
+  `SwitchControl.add_MCP` writes output i's default on pin 3-i while `set_bits`
+  uses pin i. For the DC In card the "powered down" default therefore does not
+  reach PD0/PD1. Within the window inside `RFQickSoc216V1.__init__` between the
+  bitstream download and `_rfb_config`, an amplifier left on by the previous
+  image is on while the RF-ADC attenuator is at 0 dB. Both are in the install
+  note's measurement list.
+- Weights: a fake image with a weighted buffer; a `weights=` array survives
+  dump_prog -> server -> `load_weights` bit for bit, and the fake's decimated
+  data equals `model.weighted()` of the trace.
+
 ## 2026-11-26: board server version 1, against a fake board only (branch `lab/board-server`)
 
 Implemented the server sketched in `slab/notes/board-server-protocol.md`

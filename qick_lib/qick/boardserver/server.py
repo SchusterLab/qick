@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import platform
+import secrets
 import socket
 import sys
 import threading
@@ -31,10 +32,12 @@ from . import protocol as P
 from .protocol import RequestError, ProtocolError
 from .jobs import JobManager
 from .backend import ProgramError, LimitError
+from . import rf as RF
 
 log = logging.getLogger('qick.boardserver')
 
-READ_TYPES = {'get_config', 'get_state', 'status', 'subscribe', 'unsubscribe', 'list_images', 'current_image', 'bye'}
+READ_TYPES = {'get_config', 'get_state', 'status', 'subscribe', 'unsubscribe', 'list_images', 'current_image', 'bye',
+              'rf_get'}
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -109,6 +112,10 @@ DEFAULTS = {
     'send_stall_timeout_s': 600.0,
     'program_cache_size': 64,
     'max_connections': 32,
+    # RF cards (images whose soc has QICK box daughter cards): readout amplifiers off
+    # before a load, safe state after it (rf.py). Off only by a deliberate setting.
+    'rf_safe_on_load': True,
+    'rf_settle_s': 0.2,
 }
 
 
@@ -292,6 +299,8 @@ class BoardServer:
         backend.image_hash = None
         self.current_image = None
         self.load_history = deque(maxlen=50)
+        self._nload = 0
+        self.rf_lock = threading.Lock()     # rf_set and image loads exclude each other
         self.loading_info = None
         self.prog_cache = OrderedDict()
         self.prog_lock = threading.Lock()
@@ -388,7 +397,7 @@ class BoardServer:
         ci = self.current_image
         if ci is None:
             return None
-        return {k: ci.get(k) for k in ('state', 'name', 'hash', 'bit_sha256', 'hwh_sha256', 'detail')}
+        return {k: ci.get(k) for k in ('state', 'name', 'hash', 'bit_sha256', 'hwh_sha256', 'detail', 'load_id')}
 
     def _need_image(self):
         if self.backend.soccfg is None:
@@ -478,7 +487,10 @@ class BoardServer:
                                  'image_store': self.images is not None,
                                  'allow_job_image_load': bool(self.cfg['allow_job_image_load']),
                                  'time_sync_period': tp.get('time_sync_period', 0),
-                                 'queue_flags': bool(tp.get('queue_flags', False))},
+                                 'queue_flags': bool(tp.get('queue_flags', False)),
+                                 'rf': getattr(self.backend, 'rf', None) is not None,
+                                 'rf_safe_on_load': bool(self.cfg['rf_safe_on_load']),
+                                 'idle_after': True},
                    limits={'max_header': P.MAX_HEADER, 'max_body': P.MAX_BODY,
                            'max_queue_bytes': self.cfg['max_queue_bytes'],
                            'max_retention_s': self.cfg['max_retention_s']},
@@ -565,6 +577,10 @@ class BoardServer:
                                field='run.reduce')
         out['reduce'] = None
         out['image'] = run.get('image')
+        ia = run.get('idle_after', True)
+        if not isinstance(ia, bool):
+            raise RequestError('bad_request', 'run.idle_after must be true or false', field='run.idle_after')
+        out['idle_after'] = ia
         if 'fake' in run:
             if not getattr(self.backend, 'is_fake', False):
                 raise RequestError('bad_request', 'run.fake is only accepted by the fake backend', field='run.fake')
@@ -606,10 +622,11 @@ class BoardServer:
         if meta['hash'] == loaded:
             return None
         if not self.cfg['allow_job_image_load']:
-            raise RequestError('image_mismatch', 'job wants image %s (%s) but %s is loaded, and this server does not '
-                               'load images for jobs (allow_job_image_load is off)'
-                               % (meta['name'], meta['hash'][:12], (loaded or 'none')[:12]),
-                               wanted=meta['hash'], wanted_name=meta['name'], loaded=loaded)
+            loaded_name = (self.current_image or {}).get('name') if loaded else None
+            raise RequestError('image_mismatch', 'job wants image %s (%s) but %s (%s) is loaded, and this server does '
+                               'not load images for jobs (allow_job_image_load is off)'
+                               % (meta['name'], meta['hash'][:12], loaded_name, (loaded or 'none')[:12]),
+                               wanted=meta['hash'], wanted_name=meta['name'], loaded=loaded, loaded_name=loaded_name)
         return meta
 
     def h_submit(self, conn, req, body):
@@ -710,6 +727,64 @@ class BoardServer:
         log.info('job %s cancelled by %s (was %s)', jid, conn.label, was)
         conn.reply(req, 'cancelling', job=jid, was=was)
 
+    # --- RF cards ---
+
+    def _need_rf(self):
+        if getattr(self.backend, 'rf', None) is None:
+            img = self._image_summary()
+            raise RequestError('no_rf_board', 'the loaded image (%s) has no QICK box RF cards'
+                               % ((img or {}).get('name') or 'none'))
+
+    def h_rf_get(self, conn, req, body):
+        self._need_image()
+        self._need_rf()
+        conn.reply(req, 'rf', rf=self.backend.rf_get(), image=self._image_summary())
+
+    def h_rf_set(self, conn, req, body):
+        self._need_image()
+        self._need_rf()
+        items = RF.check_items(req.get('settings'))
+        settle = RF.check_settle(req.get('settle_s', self.cfg['rf_settle_s']))
+        if not self.rf_lock.acquire(blocking=False):
+            raise RequestError('board_loading', 'an image load or another RF change is in progress')
+        try:
+            with self.jobs.lock:
+                if self.jobs.loading:
+                    raise RequestError('board_loading', 'an image load is in progress')
+                j = self.jobs.running
+                if j is not None and j.owner_label != conn.label:
+                    raise RequestError('job_running', 'job %s (%s, ref %r) of another client is running'
+                                       % (j.id, j.owner_label, j.ref), job=j.id, submitter=j.owner_label, ref=j.ref)
+            log.info('rf_set by %s: %s', conn.label, json.dumps(items, sort_keys=True))
+            rec = self.backend.rf_set(items, settle)
+        finally:
+            self.rf_lock.release()
+        log.info('rf_set by %s: order %s; ok %s; problems %s; actions %s', conn.label,
+                 [e['what'] for e in rec['order']], rec.get('ok'), rec.get('problems'), rec.get('actions'))
+        rec['by'] = conn.label
+        if not rec.get('ok'):
+            raise RequestError('adc_flags' if 'flags_idle' in rec else 'rf_failed',
+                               'rf_set by %s: %s' % (conn.label, '; '.join(rec.get('problems') or ['failed'])),
+                               record=rec)
+        conn.reply(req, 'rf_applied', **rec)
+
+    def h_put_rf_safe(self, conn, req, body):
+        """Store (or with settings null, remove) the RF safe state of a store image."""
+        self._need_store()
+        meta = self.images.resolve(req.get('image'))
+        if req.get('settings') is None:
+            self.images.set_rf_safe(meta['name'], None)
+            log.info('rf safe state of %s removed by %s', meta['name'], conn.label)
+            conn.reply(req, 'rf_safe_stored', image=meta['name'], settings=None)
+            return
+        items = RF.check_items(req.get('settings'))
+        doc = {'settings': items, 'stored_by': conn.label, 'wall_time': time.time()}
+        if req.get('settle_s') is not None:
+            doc['settle_s'] = RF.check_settle(req.get('settle_s'))
+        self.images.set_rf_safe(meta['name'], doc)
+        log.info('rf safe state of %s stored by %s: %s', meta['name'], conn.label, json.dumps(items, sort_keys=True))
+        conn.reply(req, 'rf_safe_stored', image=meta['name'], settings=items, settle_s=doc.get('settle_s'))
+
     # --- images ---
 
     def _need_store(self):
@@ -752,27 +827,66 @@ class BoardServer:
         self._need_store()
         meta = self.images.resolve(req.get('image'))
         force = bool(req.get('force'))
-        cancelled = self.jobs.begin_exclusive(force)
+        skip_rf = req.get('skip_rf_safe', False)
+        if not isinstance(skip_rf, bool):
+            raise RequestError('bad_request', 'skip_rf_safe must be true or false', field='skip_rf_safe')
+        if not self.rf_lock.acquire(blocking=False):
+            raise RequestError('board_loading', 'an RF change or image load is in progress')
         try:
-            for c in cancelled:
-                log.info('load_image by %s: cancelled queued job %s (%s, ref %r)', conn.label, c['job'],
-                         c['submitter'], c['ref'])
-            rec = self._do_load(meta, conn.label, 'load_image')
+            cancelled = self.jobs.begin_exclusive(force)
+            try:
+                for c in cancelled:
+                    log.info('load_image by %s: cancelled queued job %s (%s, ref %r)', conn.label, c['job'],
+                             c['submitter'], c['ref'])
+                if skip_rf:
+                    log.warning('load_image by %s: skip_rf_safe given: readout amplifiers are NOT switched off '
+                                'before the load', conn.label)
+                rec = self._do_load(meta, conn.label, 'load_image', skip_rf_safe=skip_rf)
+            finally:
+                self.jobs.end_exclusive()
         finally:
-            self.jobs.end_exclusive()
+            self.rf_lock.release()
         rec = dict(rec)
         rec['cancelled_jobs'] = cancelled
         conn.reply(req, 'image_loaded', **rec)
 
-    def _do_load(self, meta, label, reason):
+    def _rf_policy(self, meta, skip_rf_safe=False):
+        safe = self.images.rf_safe(meta['name']) if self.images is not None else None
+        items, settle, problem = None, self.cfg['rf_settle_s'], None
+        if safe is not None:
+            try:
+                items = RF.check_items(safe.get('settings') or [])
+                if safe.get('settle_s') is not None:
+                    settle = RF.check_settle(safe.get('settle_s'))
+            except RequestError as e:
+                items, problem = None, 'rf_safe.json of %s ignored (built-in safe state used): %s' % (meta['name'], e)
+                log.error(problem)
+        return {'enabled': bool(self.cfg['rf_safe_on_load']), 'skip_before': bool(skip_rf_safe),
+                'safe_items': items, 'settle_s': settle}, problem
+
+    def _do_load(self, meta, label, reason, skip_rf_safe=False):
         """Load an image; the caller holds the board exclusively (no job running)."""
         bit, hwh = self.images.paths(meta)
         t_req = self.clock()
-        self.loading_info = {'image': meta['name'], 'hash': meta['hash'], 'requested_by': label, 'since': t_req}
-        log.info('loading image %s (%s) for %s (%s)', meta['name'], meta['hash'][:12], label, reason)
+        self._nload += 1
+        load_id = 'L%d-%s' % (self._nload, secrets.token_hex(4))
+        prev = self.current_image
+        previous = None if prev is None else {k: prev.get(k) for k in ('state', 'name', 'hash', 'bit_sha256',
+                                                                      'hwh_sha256', 'load_id', 'assumed')}
+        self.loading_info = {'image': meta['name'], 'hash': meta['hash'], 'requested_by': label, 'since': t_req,
+                             'load_id': load_id}
+        log.info('load %s: loading image %s (%s) for %s (%s)', load_id, meta['name'], meta['hash'][:12], label,
+                 reason)
+        policy, safe_problem = self._rf_policy(meta, skip_rf_safe)
         try:
             try:
-                res = self.backend.load_image(bit, hwh)
+                res = self.backend.load_image(bit, hwh, rf_policy=policy)
+            except RF.RfSafeFailed as e:
+                # nothing was loaded: the previous image is still there
+                log.error('load %s refused: %s', load_id, e)
+                raise RequestError('rf_safe_failed', 'load %s of %s refused, nothing loaded: %s (pass skip_rf_safe to '
+                                   'load anyway)' % (load_id, meta['name'], e), record=e.record, load_id=load_id,
+                                   image=meta['hash'])
             except Exception as e:
                 tb = traceback.format_exc()
                 self.backend.image_hash = None
@@ -780,11 +894,12 @@ class BoardServer:
                 with self.prog_lock:
                     self.prog_cache.clear()
                 self.current_image = {'state': 'failed', 'name': meta['name'], 'hash': meta['hash'],
-                                      'requested_by': label, 't': t_req, 'error': '%s: %s' % (type(e).__name__, e)}
+                                      'requested_by': label, 't': t_req, 'error': '%s: %s' % (type(e).__name__, e),
+                                      'load_id': load_id, 'previous': previous}
                 self.load_history.append(self.current_image)
-                log.error('loading image %s failed: %s', meta['name'], e)
+                log.error('load %s: loading image %s failed: %s', load_id, meta['name'], e)
                 raise RequestError('image_load_failed', 'loading %s failed: %s: %s' % (meta['name'], type(e).__name__, e),
-                                   traceback=tb, image=meta['hash'])
+                                   traceback=tb, image=meta['hash'], load_id=load_id, previous=previous)
         finally:
             self.loading_info = None
         self.backend.generation += 1
@@ -792,13 +907,24 @@ class BoardServer:
         with self.prog_lock:
             self.prog_cache.clear()
         self.images.save_soccfg(meta['name'], res['soccfg'])
+        reset = res['reset']
+        if reset.get('rf') is not None and safe_problem:
+            reset['rf']['safe_file_problem'] = safe_problem
         rec = {'state': 'loaded', 'name': meta['name'], 'hash': meta['hash'], 'bit_sha256': meta['bit_sha256'],
                'hwh_sha256': meta['hwh_sha256'], 'soccfg': res['soccfg'], 'duration_s': res['duration_s'],
-               'requested_by': label, 'reason': reason, 't': t_req, 'wall_time': time.time(), 'reset': res['reset']}
+               'requested_by': label, 'reason': reason, 't': t_req, 'wall_time': time.time(), 'reset': reset,
+               'load_id': load_id, 'previous': previous}
         self.current_image = rec
         self.load_history.append({k: v for k, v in rec.items() if k != 'soccfg'})
-        log.info('image %s loaded in %.2f s for %s (clocks reprogrammed: %s)', meta['name'], res['duration_s'], label,
-                 res['reset'].get('clocks_reprogrammed'))
+        rfr = reset.get('rf')
+        log.info('load %s: image %s loaded in %.2f s for %s (previous %s; clocks reprogrammed: %s; RF: %s)',
+                 load_id, meta['name'], res['duration_s'], label, (previous or {}).get('name'),
+                 reset.get('clocks_reprogrammed'),
+                 'none' if rfr is None else 'procedure %s, safe state ok %s'
+                 % (rfr.get('procedure'), (rfr.get('after') or {}).get('ok')))
+        if rfr is not None and rfr.get('after') is not None and not rfr['after'].get('ok'):
+            log.error('load %s: RF safe state not confirmed: %s', load_id,
+                      rfr['after'].get('problems') or rfr['after'].get('error'))
         return rec
 
     def _prepare_job_image(self, job):
@@ -812,6 +938,12 @@ class BoardServer:
         if meta is None:
             return None
         rec = self._do_load(meta, job.owner_label, 'job %s' % job.id)
+        # queued jobs that do not name an image were built for the previous one
+        rec = dict(rec)
+        rec['cancelled_jobs'] = self.jobs.cancel_unpinned(self.backend.generation)
+        for c in rec['cancelled_jobs']:
+            log.info('load %s for job %s: cancelled queued job %s (%s, ref %r): it names no image',
+                     rec['load_id'], job.id, c['job'], c['submitter'], c['ref'])
         return rec
 
     # --- startup helpers (used by __main__) ---

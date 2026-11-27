@@ -219,8 +219,11 @@ class JobManager:
                 raise RequestError('job_running', 'job %s (%s, ref %r) is running; cancel it first' %
                                    (j.id, j.owner_label, j.ref), job=j.id, submitter=j.owner_label, ref=j.ref)
             if self.queue and not force:
-                raise RequestError('jobs_queued', '%d job(s) queued; pass force to cancel them' % len(self.queue),
-                                   jobs=[j.summary() for j in self.queue])
+                listed = [{'job': j.id, 'submitter': j.owner_label, 'ref': j.ref, 'state': j.state,
+                           'image': j.run.get('image')} for j in self.queue]
+                raise RequestError('jobs_queued', '%d job(s) queued (%s); pass force to cancel them' % (
+                    len(self.queue), ', '.join('%s by %s, ref %r' % (x['job'], x['submitter'], x['ref'])
+                                               for x in listed)), jobs=listed)
             cancelled = []
             while self.queue:
                 j = self.queue.popleft()
@@ -231,6 +234,20 @@ class JobManager:
         # the runner releases exec_lock between jobs; it cannot start one while loading
         self.exec_lock.acquire()
         return cancelled
+
+    def cancel_unpinned(self, generation, reason='image_changed'):
+        """After a load started by a job (run.image): cancel the queued jobs that do not
+        name an image and were submitted against an earlier image. Returns them."""
+        out = []
+        with self.lock:
+            for j in list(self.queue):
+                if not j.run.get('image') and j.prog_gen != generation:
+                    self.queue.remove(j)
+                    self._finish(j, 'cancelled', reason)
+                    out.append({'job': j.id, 'submitter': j.owner_label, 'ref': j.ref})
+        if out:
+            self._notify()
+        return out
 
     def end_exclusive(self):
         self.exec_lock.release()
@@ -355,6 +372,12 @@ class JobManager:
                 rec = self.prepare_image(job)
                 if rec is not None:
                     self._event(job, 'image_loaded', image=rec)
+            if not job.run.get('image') and job.prog_gen != getattr(be, 'generation', 0):
+                # submitted against another image and does not name one: do not run it on this one
+                raise RequestError('image_changed', 'the image changed after job %s was submitted and the job does '
+                                   'not name an image (run.image); it is not run on %s'
+                                   % (job.id, getattr(be, 'image_hash', None)),
+                                   loaded=getattr(be, 'image_hash', None))
             if job.prog is None or job.prog_gen != getattr(be, 'generation', 0):
                 job.prog = be.make_program(job.progdict)
                 job.prog_gen = getattr(be, 'generation', 0)
@@ -401,17 +424,34 @@ class JobManager:
             outcome, reason = 'failed', 'limit_exceeded'
             error = {'code': 'limit_exceeded', 'limit': e.limit, 'message': str(e), 'traceback': None}
         except Exception as e:
-            outcome, reason = 'failed', 'job_exception'
-            error = {'code': 'job_exception', 'exc_type': type(e).__name__, 'message': str(e),
+            # RFQickSoc216V1.prepare_round raises ADCInterruptError when an ADC is over range
+            code = 'adc_interrupt' if type(e).__name__ == 'ADCInterruptError' else 'job_exception'
+            outcome, reason = 'failed', code
+            error = {'code': code, 'exc_type': type(e).__name__, 'message': str(e),
                      'traceback': traceback.format_exc()}
         if error is not None:
             self.last_error = {'job': job.id, 'code': error['code'], 'message': error['message'], 't': self.clock()}
             self._event(job, 'error', **error)
-        # outputs idle, whatever happened
-        try:
-            idle = be.idle()
-        except Exception as e:
-            idle = {'done': False, 'error': '%s: %s' % (type(e).__name__, e), 'traceback': traceback.format_exc()}
+        # outputs idle, unless the program ended normally and the job asked to keep them
+        normal_end = error is None and (outcome == 'complete' or reason in ('overrun', 'dropped',
+                                                                             'overrun_and_dropped'))
+        if normal_end and job.run.get('idle_after', True) is False:
+            idle = {'done': False, 'skipped': True,
+                    'reason': 'run.idle_after is false and the program ran to its end: outputs left as the '
+                              'program left them'}
+        else:
+            if error is not None:
+                why = 'error (%s)' % error['code']
+            elif normal_end:
+                why = 'normal end of the job'
+            else:
+                why = '%s (%s)' % (outcome, reason)
+            try:
+                idle = be.idle()
+                idle['reason'] = why
+            except Exception as e:
+                idle = {'done': False, 'reason': why, 'error': '%s: %s' % (type(e).__name__, e),
+                        'traceback': traceback.format_exc()}
         idle['t'] = self.clock()
         with self.lock:
             job.idle = idle
@@ -452,6 +492,7 @@ class JobManager:
                        'overruns': job.overruns, 'events': len(job.events),
                        'events_truncated': job.events_truncated, 'bound_stop': job.bound_stop},
             'outputs_idle': bool(job.idle and job.idle.get('done')), 'idle': job.idle,
+            'outputs_idle_reason': (job.idle or {}).get('reason', 'the job never ran'),
             'times': job.times, 'events_total': len(job.events),
         }
         self.cond.notify_all()

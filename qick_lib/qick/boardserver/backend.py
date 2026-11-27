@@ -71,21 +71,38 @@ class QickSocBackend:
     """
     is_fake = False
 
-    def __init__(self, soc_factory=None, soc_kwargs=None, poll_interval=0.0005):
+    def __init__(self, soc_factory=None, soc_kwargs=None, poll_interval=0.0005, soc_class='auto'):
         self._factory = soc_factory or self._qicksoc_factory
         self.soc_kwargs = dict(soc_kwargs or {})
         self.poll_interval = poll_interval
+        if soc_class not in ('auto', 'QickSoc', 'RFQickSoc216V1'):
+            raise ValueError('soc_class must be auto, QickSoc or RFQickSoc216V1')
+        self.soc_class = soc_class
         self.soc = None
+        self.rf = None          # RfFrontEnd of the loaded image, None without RF cards
         # serialises every hardware access: the drain holds it around each counter
         # read and transfer, get_state around its register reads
         self.hw_lock = threading.RLock()
 
     # --- image -----------------------------------------------------------
 
+    @staticmethod
+    def hwh_has_rf_board(hwh_path):
+        """Whether the firmware has the QICK box RF-board control block (the IPs
+        RFQickSoc216V1._rfb_config uses live under 'rfb_control')."""
+        with open(hwh_path, 'rb') as f:
+            return b'rfb_control' in f.read()
+
     def _qicksoc_factory(self, bitfile, download):
         from .. import QickSoc  # needs pynq: only importable on the board
+        base = QickSoc
+        cls = self.soc_class
+        if cls == 'auto':
+            cls = 'RFQickSoc216V1' if self.hwh_has_rf_board(os.path.splitext(bitfile)[0] + '.hwh') else 'QickSoc'
+        if cls == 'RFQickSoc216V1':
+            from ..rfboard import RFQickSoc216V1 as base
 
-        class _TracedQickSoc(QickSoc):
+        class _TracedQickSoc(base):
             # QickSoc.config_clocks calls set_all_clks when it (re)programs the clock chips
             _bs_clocks_reprogrammed = False
 
@@ -95,27 +112,71 @@ class QickSocBackend:
 
         return _TracedQickSoc(bitfile=bitfile, download=download, **self.soc_kwargs)
 
+    def _make_rf(self, soc):
+        from .rf import RfFrontEnd, LibraryRfHw
+        if LibraryRfHw.present(soc):
+            return RfFrontEnd(LibraryRfHw(soc), soc.get_cfg())
+        return None
+
     @property
     def soccfg(self):
         return None if self.soc is None else self.soc.get_cfg()
 
-    def load_image(self, bit_path, hwh_path):
+    def load_image(self, bit_path, hwh_path, rf_policy=None):
         """Program the FPGA with this bit/hwh pair and construct a new QickSoc.
-        The .hwh must sit beside the .bit with the same stem (PYNQ finds it that way)."""
+        The .hwh must sit beside the .bit with the same stem (PYNQ finds it that way).
+
+        rf_policy {'enabled', 'skip_before', 'safe_items', 'settle_s'}: the RF procedure
+        around the load (rf.py). With enabled and RF cards on the current image, every
+        readout amplifier is switched off and read back first (RfSafeFailed if that
+        fails, and nothing is loaded, unless skip_before); with RF cards on the new
+        image the safe state is applied and read back before returning."""
+        from .rf import RfSafeFailed
         if os.path.splitext(bit_path)[0] != os.path.splitext(hwh_path)[0]:
             raise ValueError('the .hwh must be beside the .bit with the same name')
+        pol = {'enabled': False, 'skip_before': False, 'safe_items': None, 'settle_s': 0.2}
+        pol.update(rf_policy or {})
+        rf_rec = {'procedure': 'on' if pol['enabled'] else 'off', 'before': None, 'found_after_load': None,
+                  'constructor': None, 'after': None}
         with self.hw_lock:
             if self.soc is not None:
                 try:
                     self.idle()
                 except Exception:
                     pass
+            old_rf = self.rf
+            if old_rf is not None and pol['enabled']:
+                if pol['skip_before']:
+                    rf_rec['before'] = {'skipped': True, 'why': 'skip_rf_safe in the request'}
+                else:
+                    rf_rec['before'] = old_rf.before_load()     # raises RfSafeFailed: nothing loaded
+            elif old_rf is not None:
+                rf_rec['before'] = {'skipped': True, 'why': 'RF procedure off (--no-rf-safe-on-load)'}
             # drop the old object first: after the download its IP handles are stale
             self.soc = None
+            self.rf = None
             t0 = time.monotonic()
             soc = self._factory(bit_path, True)
             duration = time.monotonic() - t0
             self.soc = soc
+            self.rf = self._make_rf(soc)
+            if self.rf is not None:
+                rf_rec['constructor'] = self._constructor_note()
+                # what the cards hold before any RF call of ours (flags not cleared)
+                try:
+                    rf_rec['found_after_load'] = self.rf.read()
+                except Exception as e:
+                    rf_rec['found_after_load'] = {'error': '%s: %s' % (type(e).__name__, e),
+                                                  'traceback': traceback.format_exc()}
+                if pol['enabled']:
+                    try:
+                        rf_rec['after'] = self.rf.after_load(pol['safe_items'], pol['settle_s'])
+                    except Exception as e:
+                        rf_rec['after'] = {'ok': False, 'error': '%s: %s' % (type(e).__name__, e),
+                                           'traceback': traceback.format_exc()}
+                    rf_rec['state'] = self.rf.read(flags=False)
+            if old_rf is None and self.rf is None:
+                rf_rec = None
         clocks = bool(getattr(soc, '_bs_clocks_reprogrammed', False))
         return {
             'soccfg': _plain(soc.get_cfg()),
@@ -128,23 +189,43 @@ class QickSocBackend:
                 'tproc_memories_cleared': True,
                 'envelopes_cleared': True,
                 'program_cache_cleared': True,
+                'rf': _plain(rf_rec),
             },
         }
+
+    def _constructor_note(self):
+        from .rf import LIBRARY_CONSTRUCTOR
+        return dict(LIBRARY_CONSTRUCTOR)
 
     def attach(self, bit_path, hwh_path):
         """Construct QickSoc for a bitstream assumed to be on the FPGA already (no download).
         Whether it really is that bitstream cannot be checked here."""
         with self.hw_lock:
             self.soc = None
+            self.rf = None
             t0 = time.monotonic()
             soc = self._factory(bit_path, False)
             duration = time.monotonic() - t0
             self.soc = soc
+            self.rf = self._make_rf(soc)
+            rf = None if self.rf is None else {'procedure': 'none at attach', 'found_after_load': self.rf.read()}
         return {'soccfg': _plain(soc.get_cfg()), 'duration_s': duration,
                 'reset': {'pl_reconfigured': False,
                           'clocks_reprogrammed': bool(getattr(soc, '_bs_clocks_reprogrammed', False)),
                           'converters_restarted': False, 'tproc_memories_cleared': False,
-                          'envelopes_cleared': False, 'program_cache_cleared': True}}
+                          'envelopes_cleared': False, 'program_cache_cleared': True, 'rf': _plain(rf)}}
+
+    # --- RF front end ------------------------------------------------------
+
+    def rf_get(self):
+        if self.rf is None:
+            return None
+        with self.hw_lock:
+            return _plain(self.rf.read())
+
+    def rf_set(self, items, settle_s):
+        with self.hw_lock:
+            return _plain(self.rf.apply(items, settle_s=settle_s, protect=True))
 
     # --- programs --------------------------------------------------------
 
@@ -343,9 +424,17 @@ class QickSocBackend:
                 st['clocks_locked'] = bool(soc.clocks_locked())
             except Exception as e:
                 st['clocks_locked'] = None
+            if self.rf is not None:
+                try:
+                    st['rf'] = self.rf.read()
+                except Exception as e:
+                    st['rf'] = {'error': '%s: %s' % (type(e).__name__, e)}
+            else:
+                st['rf'] = None
         st['tproc'] = tp
-        st['not_implemented'] = ['adc_attenuators', 'dac_settings', 'mixer_nco', 'reference_lock_detail',
-                                 'temperatures']
+        st['not_implemented'] = ['dac_settings', 'mixer_nco', 'reference_lock_detail', 'temperatures']
+        if self.rf is None:
+            st['not_implemented'].insert(0, 'adc_attenuators (only read on images with RF cards, in rf)')
         return _plain(st)
 
 
@@ -516,11 +605,280 @@ class FakeSoc(QickConfig):
         maxlen = self['readouts'][ch]['buf_maxlen']
         if length >= maxlen:
             raise RuntimeError("requested length=%d longer or equal to decimated buffer size=%d" % (length, maxlen))
-        return fake_dec_values(ch, self._round, length)
+        x = fake_dec_values(ch, self._round, length)
+        w = (self.weights or {}).get(ch)
+        if w is not None and self['readouts'][ch].get('has_weights'):
+            # weighted buffer: sample n of each window times weight n (window = readout length)
+            n = len(w)
+            x = fake_weighted(x, w[np.arange(length) % n]).astype(np.int32)
+        return x
+
+    # --- weights ---
+    weights = None
+
+    def load_weights(self, ch, data, addr=0):
+        self.calls.append('load_weights')
+        if self.weights is None:
+            self.weights = {}
+        self.weights[ch] = np.array(data, dtype=np.int16)
+
+    # --- RF front end (only for images with 'fake_rf') ---
+    fake_rf = None
+
+    def prepare_round(self):
+        self.calls.append('prepare_round')
+        if self.fake_rf is not None:
+            # like RFQickSoc216V1.prepare_round: clear_interrupts(error_on_interrupt=True)
+            raised = {}
+            for name, cfg in self['rf']['adcs'].items():
+                w = self.fake_rf.flags(name, clear=True)
+                if w:
+                    raised[name] = hex(w)
+            if raised:
+                raise FakeADCInterruptError('fake board: ADC interrupts raised: %s' % raised)
 
 
-def fake_soc_factory_from_hwh(inject=None):
-    """Factory for FakeBackend: a fake image's .hwh file is the soccfg as JSON."""
+class FakeADCInterruptError(Exception):
+    """Stands for qick.helpers.ADCInterruptError (same name for the job error code)."""
+
+
+FakeADCInterruptError.__name__ = 'ADCInterruptError'
+
+
+def fake_weighted(x, w):
+    """The weighted buffer's product, copied from slab/sim/weighted_buffer/model.py
+    weighted() (the bit-exact model of axis_weighted_buffer v1.3):
+        y_I = (I*wQ + Q*wI) >> 16,  y_Q = (Q*wQ - I*wI) >> 16  (32-bit wrap, floor)."""
+    x = np.asarray(x, dtype=np.int64)
+    w = np.asarray(w, dtype=np.int64)
+    I, Q = x[..., 0], x[..., 1]
+    wI, wQ = w[..., 0], w[..., 1]
+
+    def wrap32(v):
+        return ((v + 2**31) % 2**32) - 2**31
+    yI = wrap32(Q * wI + I * wQ) >> 16
+    yQ = wrap32(Q * wQ - I * wI) >> 16
+    return np.stack([yI, yQ], axis=-1).astype(np.int16)
+
+
+class FakeRfHardware:
+    """The RF daughter cards of a fake QICK box, as physical state that survives
+    image loads (owned by the FakeBackend, not by a FakeSoc).
+
+    It models the bad case the engine side asked to design for: across a PL load
+    the card GPIO keeps the amplifier state while every RF-ADC step attenuator
+    returns to 0 dB. An RF In amplifier that is on while its ADC's attenuator is
+    below `threshold_db` latches the over-range flag; with the attenuator at 0 dB
+    and the card attenuator at 0 dB also over-voltage. Each new latch is appended to
+    `events` (what, when), so a test can tell whether the ADC was ever overdriven.
+    """
+
+    def __init__(self, threshold_db=10.0):
+        self.threshold_db = float(threshold_db)
+        self.layout = {'adc': [None] * 4, 'dac': [None] * 4}
+        self.amp = {}          # adc port -> bool (RF In: amplifier supply; DC In: powered up)
+        self.adc_att = {}      # adc port -> dB (write-only on the real part)
+        self.gain = {}         # adc port -> dB (DC In)
+        self.dac_att = {}      # dac port -> [a1, a2]
+        self.filters = {}      # (side, port) -> {'WR0_SW', 'WR0_FILTER'}
+        self.bias = [0.0] * 8
+        self.dsa = {}          # ADC block name -> dB
+        self.latched = {}      # ADC block name -> interrupt word
+        self.events = []
+        self.pl_loads = 0
+        self.calls = []
+
+    def configure(self, layout, blocks):
+        self.layout = layout
+        for side in ('adc', 'dac'):
+            for card in layout[side]:
+                if not card:
+                    continue
+                for p in card['ports']:
+                    if side == 'adc':
+                        self.amp.setdefault(p, False)
+                        if card['kind'] == 'rf_in':
+                            self.adc_att.setdefault(p, ATT_MAX_FAKE)
+                        if card['kind'] == 'dc_in':
+                            self.gain.setdefault(p, -6.0)
+                    else:
+                        self.dac_att.setdefault(p, [ATT_MAX_FAKE, ATT_MAX_FAKE])
+                    self.filters.setdefault((side, p), {'WR0_SW': 0xC0, 'WR0_FILTER': 0})
+        for b in blocks:
+            self.dsa.setdefault(b, 0.0)
+            self.latched.setdefault(b, 0)
+
+    def kind(self, side, port):
+        n = 2 if side == 'adc' else 4
+        card = self.layout[side][port // n] if port // n < len(self.layout[side]) else None
+        return card['kind'] if card else None
+
+    def condition(self, block):
+        from .rf import adc_port_of_block, OVR_RANGE, OVR_VOLTAGE
+        p = adc_port_of_block(block)
+        if p is None or not self.amp.get(p) or self.kind('adc', p) != 'rf_in':
+            return 0
+        w = 0
+        if self.dsa.get(block, 0.0) < self.threshold_db:
+            w |= OVR_RANGE
+            if self.dsa.get(block, 0.0) == 0 and self.adc_att.get(p, 0) == 0:
+                w |= OVR_VOLTAGE
+        return w
+
+    def update(self, why):
+        for b in self.dsa:
+            w = self.condition(b)
+            if w & ~self.latched[b]:
+                self.events.append({'block': b, 'word': w, 'why': why, 't': time.monotonic()})
+            self.latched[b] |= w
+
+    def pl_load(self):
+        """A bitstream download: the converter restarts with every step attenuator at
+        0 dB; the cards are not touched (amplifier state persists)."""
+        self.pl_loads += 1
+        for b in self.dsa:
+            self.dsa[b] = 0.0
+        self.update('PL load %d' % self.pl_loads)
+
+    def constructor(self, amps_off=False):
+        """What the fake soc constructor does: like RFQickSoc216V1 it writes the
+        attenuators 31.75 dB, DC In gain -6 dB and the bias outputs 0 V and clears the
+        flags; unlike the library it leaves the amplifier switches alone unless
+        amps_off (the bad case)."""
+        for p in self.adc_att:
+            self.adc_att[p] = ATT_MAX_FAKE
+        for p in self.dac_att:
+            self.dac_att[p] = [ATT_MAX_FAKE, ATT_MAX_FAKE]
+        for p in self.gain:
+            self.gain[p] = -6.0
+        self.bias = [0.0] * 8
+        if amps_off:
+            for p in self.amp:
+                self.amp[p] = False
+        for b in self.latched:
+            self.latched[b] = 0
+        self.update('constructor')
+
+    def flags(self, block, clear):
+        self.update('flags read')
+        w = self.latched.get(block, 0)
+        if clear:
+            self.latched[block] = 0
+        return w
+
+
+ATT_MAX_FAKE = 31.75
+
+
+class FakeRfHw:
+    """rf.RfFrontEnd adapter over FakeRfHardware (the counterpart of rf.LibraryRfHw)."""
+
+    def __init__(self, hw, soc):
+        self.hw = hw
+        self.soc = soc
+
+    def layout(self):
+        return json.loads(json.dumps(self.hw.layout))
+
+    def adc_blocks(self):
+        return [(n, int(c['index'][0]), int(c['index'][1])) for n, c in sorted(self.soc['rf']['adcs'].items())]
+
+    def constructor_written(self):
+        return {'dac': {p: [ATT_MAX_FAKE, ATT_MAX_FAKE] for p in self.hw.dac_att},
+                'adc': {p: ATT_MAX_FAKE for p in self.hw.adc_att}}
+
+    def _need(self, side, port, kinds):
+        k = self.hw.kind(side, port)
+        if k not in kinds:
+            raise RuntimeError('%s port %d does not have a %s signal chain' % (side.upper(), port, '/'.join(kinds)))
+
+    def dsa_set(self, name, att):
+        self.hw.calls.append(('dsa_set', name, att))
+        self.hw.dsa[name] = float(np.round(att))
+        self.hw.update('dsa_set')
+        return self.hw.dsa[name]
+
+    def dsa_get(self, name):
+        return self.hw.dsa[name]
+
+    def flags(self, tile, block, clear):
+        return self.hw.flags('%d%d' % (tile, block), clear)
+
+    def adc_rf_on(self, port, att):
+        self._need('adc', port, ('rf_in',))
+        self.hw.calls.append(('adc_rf_on', port, att))
+        self.hw.amp[port] = True
+        self.hw.adc_att[port] = float(np.round(att / 0.25) * 0.25)
+        self.hw.update('adc_rf_on')
+        return self.hw.adc_att[port]
+
+    def adc_dc_on(self, port, gain):
+        self._need('adc', port, ('dc_in',))
+        self.hw.calls.append(('adc_dc_on', port, gain))
+        self.hw.amp[port] = True
+        self.hw.gain[port] = float(round(gain))
+        self.hw.update('adc_dc_on')
+        return self.hw.gain[port]
+
+    def adc_off(self, port):
+        self._need('adc', port, ('rf_in', 'dc_in'))
+        self.hw.calls.append(('adc_off', port))
+        self.hw.amp[port] = False
+        if self.hw.kind('adc', port) == 'rf_in':
+            self.hw.adc_att[port] = ATT_MAX_FAKE
+        self.hw.update('adc_off')
+
+    def adc_amp_read(self, port):
+        if self.hw.kind('adc', port) not in ('rf_in', 'dc_in'):
+            return None
+        return bool(self.hw.amp.get(port))
+
+    def adc_gain_read(self, port):
+        return self.hw.gain.get(port)
+
+    def dac_rf(self, port, a1, a2):
+        self._need('dac', port, ('rf_out',))
+        self.hw.calls.append(('dac_rf', port, a1, a2))
+        self.hw.dac_att[port] = [float(np.round(a1 / 0.25) * 0.25), float(np.round(a2 / 0.25) * 0.25)]
+        return tuple(self.hw.dac_att[port])
+
+    def filter_set(self, side, port, f):
+        self._need(side, port, ('rf_in',) if side == 'adc' else ('rf_out',))
+        self.hw.calls.append(('filter', side, port, dict(f)))
+        if 'hpf' in f:
+            hpf, lpf = f['hpf'], f['lpf']
+        else:
+            # not the ADMV8818 table: a fake monotonic mapping of GHz to steps
+            def step(fr):
+                return max(0, min(63, int(round((fr - 1.75) / (19.9 - 1.75) * 63))))
+            ft = f['ftype']
+            hpf = lpf = -1
+            if ft == 'lowpass':
+                lpf = step(f['fc'])
+            elif ft == 'highpass':
+                hpf = step(f['fc'])
+            elif ft == 'bandpass':
+                hpf, lpf = step(f['fc'] - f['bw'] / 2), step(f['fc'] + f['bw'] / 2)
+        hb, hs = (0, 0) if hpf < 0 else (1 + hpf // 16, hpf % 16)
+        lb, ls = (0, 0) if lpf < 0 else (1 + lpf // 16, lpf % 16)
+        self.hw.filters[(side, port)] = {'WR0_SW': 0xC0 + (hb << 3) + lb, 'WR0_FILTER': (hs << 4) + ls}
+
+    def filter_read(self, side, port):
+        return dict(self.hw.filters[(side, port)])
+
+    def bias_set(self, i, v):
+        self.hw.calls.append(('bias', i, v))
+        self.hw.bias[i] = float(v)
+        return float(v)
+
+    def bias_get(self, i):
+        return self.hw.bias[i]
+
+
+def fake_soc_factory_from_hwh(inject=None, rf_hardware=None):
+    """Factory for FakeBackend: a fake image's .hwh file is the soccfg as JSON.
+    An image with 'fake_rf' {'layout', 'constructor_amps_off'} has RF cards, which
+    live in rf_hardware (shared across loads)."""
     def factory(bitfile, download):
         hwh = os.path.splitext(bitfile)[0] + '.hwh'
         with open(hwh) as f:
@@ -528,20 +886,55 @@ def fake_soc_factory_from_hwh(inject=None):
         soc = FakeSoc(doc['fake_soccfg'], **(inject or {}))
         soc._bs_clocks_reprogrammed = bool(doc.get('fake_clocks_reprogrammed', False))
         delay = float(doc.get('fake_load_delay_s', 0.05))
+        frf = doc.get('fake_rf')
+        if rf_hardware is not None:
+            blocks = sorted(soc['rf']['adcs'])
+            if frf:
+                rf_hardware.configure(frf['layout'], blocks)
+            if download:
+                # the converter restarts whatever the image (the cards are on the box, not in the PL)
+                for b in blocks:
+                    rf_hardware.dsa.setdefault(b, 0.0)
+                    rf_hardware.latched.setdefault(b, 0)
+                rf_hardware.pl_load()
         if delay:
             time.sleep(delay)
+        if frf and rf_hardware is not None:
+            rf_hardware.constructor(amps_off=bool(frf.get('constructor_amps_off', False)))
+            soc.fake_rf = rf_hardware
+            soc['extra_description'].append("\nQICK box daughter cards detected:")
+            for side, label in (('adc', 'ADC'), ('dac', 'DAC')):
+                for slot, card in enumerate(frf['layout'][side]):
+                    if card is None:
+                        soc['extra_description'].append("\t%s slot %d: No card detected" % (label, slot))
+                    else:
+                        soc['extra_description'].append("\t%s slot %d: %s card has ports %s"
+                                                        % (label, slot, card['name'], card['ports']))
         return soc
     return factory
 
 
 class FakeBackend(QickSocBackend):
     """QickSocBackend over FakeSoc. Fake images: the .hwh is JSON with 'fake_soccfg'
-    (and optionally 'fake_clocks_reprogrammed', 'fake_load_delay_s'); the .bit is any
-    bytes. Per-job injections come from run['fake']."""
+    (and optionally 'fake_clocks_reprogrammed', 'fake_load_delay_s', 'fake_rf'); the
+    .bit is any bytes. Per-job injections come from run['fake']. The fake RF cards
+    (FakeRfHardware) are self.rf_hardware and keep their state across loads."""
     is_fake = True
 
-    def __init__(self, inject=None, poll_interval=0.0002):
-        super().__init__(soc_factory=fake_soc_factory_from_hwh(inject), poll_interval=poll_interval)
+    def __init__(self, inject=None, poll_interval=0.0002, rf_threshold_db=10.0):
+        self.rf_hardware = FakeRfHardware(threshold_db=rf_threshold_db)
+        super().__init__(soc_factory=fake_soc_factory_from_hwh(inject, self.rf_hardware), poll_interval=poll_interval)
+
+    def _make_rf(self, soc):
+        from .rf import RfFrontEnd
+        if soc.fake_rf is None:
+            return None
+        return RfFrontEnd(FakeRfHw(soc.fake_rf, soc), soc.get_cfg())
+
+    def _constructor_note(self):
+        return {'source': 'fake board: FakeRfHardware.constructor (attenuators 31.75 dB, DC In gain -6 dB, bias 0 V, '
+                          'flags cleared; amplifier switches left as they were unless the image sets '
+                          'constructor_amps_off). The library constructor is described in rf.LIBRARY_CONSTRUCTOR.'}
 
     def run(self, prog, run, stop_event, deadline=None):
         self.soc.fake_set_inject(run.get('fake'))
@@ -552,11 +945,26 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 FAKE_SOCCFG_PATH = os.path.join(_HERE, 'fake_soccfg.json')
 
 
+FAKE_VARIANTS = ('fake-a', 'fake-b', 'fake-rf', 'fake-w')
+
+# the fake QICK box: RF Out on DAC slot 0, DC Out on slot 1, RF In on ADC slot 2
+# (ports 4, 5: ADC blocks 20, 21), DC In on slot 3 (ports 6, 7: blocks 22, 23)
+FAKE_RF_LAYOUT = {
+    'dac': [{'kind': 'rf_out', 'name': 'RF Out', 'ports': [0, 1, 2, 3]},
+            {'kind': 'dc_out', 'name': 'DC Out', 'ports': [4, 5, 6, 7]}, None, None],
+    'adc': [None, None, {'kind': 'rf_in', 'name': 'RF In', 'ports': [4, 5]},
+            {'kind': 'dc_in', 'name': 'DC In', 'ports': [6, 7]}],
+}
+
+
 def fake_image_files(variant):
     """(bit bytes, hwh bytes) of a built-in fake image. Variants differ in soccfg:
     'fake-a' is the QICK testbench configuration (one dynamic readout, avg ring 8192);
     'fake-b' has fw_timestamp changed, avg ring 1024 and buf 2048, and reports that
-    loading it re-programmed the clock chips."""
+    loading it re-programmed the clock chips;
+    'fake-rf' is fake-a on a QICK box with RF cards (FAKE_RF_LAYOUT): readout 0 on
+    ADC 20 (RF In), a second readout on ADC 22 (DC In), generator 0 on RF Out;
+    'fake-w' is fake-a with a weighted readout buffer (has_weights, wgt_maxlen 1024)."""
     with open(FAKE_SOCCFG_PATH) as f:
         cfg = json.load(f)
     cfg['tprocs'][0]['queue_flags'] = True
@@ -567,6 +975,24 @@ def fake_image_files(variant):
             ro['avg_maxlen'] = 1024
             ro['buf_maxlen'] = 2048
         doc['fake_clocks_reprogrammed'] = True
+    elif variant == 'fake-rf':
+        cfg['fw_timestamp'] = 'fake-rf ' + cfg['fw_timestamp']
+        ro2 = json.loads(json.dumps(cfg['readouts'][0]))
+        ro2['adc'] = '22'
+        ro2['trigger_bit'] = 1
+        ro2['avgbuf_fullpath'] = 'readout_wrapper/axis_avg_buffer_1'
+        ro2['ro_fullpath'] = 'readout_wrapper/axis_dyn_readout_v1_1'
+        cfg['readouts'].append(ro2)
+        # a real rfbv2 .hwh names the RF-board control block; QickSocBackend's auto
+        # class choice looks for it
+        doc['fake_rf'] = {'layout': FAKE_RF_LAYOUT, 'constructor_amps_off': False, 'hwh_marker': 'rfb_control'}
+    elif variant == 'fake-w':
+        cfg['fw_timestamp'] = 'fake-w ' + cfg['fw_timestamp']
+        ro = cfg['readouts'][0]
+        ro['has_weights'] = True
+        ro['wgt_maxlen'] = 1024
+        ro['avgbuf_type'] = 'axis_weighted_buffer'
+        ro['avgbuf_version'] = '1.3'
     elif variant != 'fake-a':
         raise ValueError('unknown fake image %r' % variant)
     bit = ('FAKE BITSTREAM %s\n' % variant).encode('ascii')

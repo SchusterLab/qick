@@ -58,6 +58,9 @@ More images can be imported the same way or uploaded by a client with
 - `--soc-kwargs '{"external_clk": true}'` passes options to `QickSoc`.
 - `--allow-job-image-load` lets a job that names another image load it
   (default: refused with `image_mismatch`).
+- `--soc-class auto|QickSoc|RFQickSoc216V1` (default `auto`: the RF class when
+  the `.hwh` has the `rfb_control` block). `--no-rf-safe-on-load` turns off
+  the RF procedure around image loads (section 6); it is on by default.
 - `--max-queue-mb` bounds the memory held for unsent and unacknowledged chunks
   (default 256 MiB; the ZCU216 has 4 GiB of PS RAM, part of it used by PYNQ).
 - A JSON file given with `--config` may hold the same settings
@@ -113,3 +116,72 @@ the results in `slab/NOTEBOOK.md`.
    that stays alive).
 10. **Network loss.** Pull the cable during a long run: the job continues,
     `fetch` after reconnect resumes with no gap.
+11. **`idle_after: false`.** With a scope on a DAC output, a job that ends
+    with a tone still playing and `idle_after: false` leaves it playing; the
+    next job (or an error, cancel or time limit) makes it idle.
+
+## 6. QICK box with RF cards (ZCU216, `qick_tprocv2_216_rfbv2`)
+
+The RF code (`qick_lib/qick/boardserver/rf.py`, `LibraryRfHw`) has **not been
+run on a board**. It follows the library (`rfboard.py`, `drivers/hardware.py`)
+and, for the RF-ADC attenuator and the ADC flags, the engine side's
+`board_side/qick_rf.py`, which they ran on such a box. Start the server with
+the default `--soc-class auto` (it picks `RFQickSoc216V1` when the `.hwh` has
+`rfb_control`); check in the log and in `welcome.capabilities.rf` that it did.
+Do the following with no sample connected and a 50 ohm load or a spectrum
+analyser on the RF In inputs, and record the results in `slab/NOTEBOOK.md`.
+
+1. **The measurement that settles the load behaviour.** With an RF In
+   amplifier switched on (`rf_set [{"ro": 0, "adc_att": 20}, {"ro": 0,
+   "amp": true, "att": 10}]`), load an image with the procedure off
+   (`--no-rf-safe-on-load`, or `skip_rf_safe: true`) and read
+   `reset.rf.found_after_load` in the reply: it is read right after the load,
+   before any RF call of the server, flags not cleared. It answers: is the
+   amplifier still on (`adc_ports.<port>.amp_on`), is the RF-ADC attenuator
+   0 dB (`adc_att`), are over-range / over-voltage flags set (`flags`)? Repeat
+   with the procedure on: `before.done` must show every readout amplifier
+   off, `found_after_load` must show no flag, `after.adc_att` 27 dB (or the
+   safe-state file's values) and `after.flags_idle` clean. Note that
+   `RFQickSoc216V1`'s constructor itself writes the amplifier switches off,
+   so with a library soc `found_after_load` can show the amplifier off even
+   if the window before `_rfb_config` over-drove the ADC; the flags
+   (interrupts are latched until cleared, and the constructor clears them at
+   its end) may not show it either. To see the window, read the flags with
+   `xrfdc` from a second process during the load, or put a power meter on the
+   RF In input; say which in the notebook.
+2. **Readback matches.** For each RF In and DC In port: `amp_on` from the
+   GPIO register is what was set (on, off), including after `adc_off`; the
+   DC In `amp_on` is read from `PD` with the opposite sense. The RF-ADC
+   attenuator read back equals what was set (0, 13, 27 dB). `filter`
+   registers change when a filter is set and decode to the requested steps
+   (`FilterADMV8818.set_filter_raw`). `bias` setpoints read back.
+3. **The DC In power-down default.** `SwitchControl.add_MCP` writes output
+   i's default on pin 3-i, while `set_bits` uses pin i: on a DC In card the
+   constructor's "powered down" default lands on pins 2/3, not on PD0/PD1.
+   Read `adc_ports.<6|7>.amp_on` right after a load: true would confirm the
+   DC In amplifiers are left on by the constructor. (Code reading; if
+   confirmed this is an upstream bug report, to be raised by a person.)
+4. **The ordering is safe.** With the amplifier on and the RF-ADC attenuator
+   at 0 dB the engine side saw over-range at idle. Check on the box that the
+   server's order never shows a flag: from a load (procedure on), send the
+   working settings in the worst order (`amp` first, `adc_att` last) and
+   check `flags_before_clear` and `flags_idle` of the reply and a power meter
+   on the input; also lower `adc_att` with the amplifier on (applied last).
+   Check that `rf_set` with an over-range setting gives `adc_flags`, and that
+   over-voltage switches the amplifier off (`actions`).
+5. **The settle time.** Whether 0.2 s after clearing is enough for a flag to
+   reappear when the input is over range (`settle_s`), and how long a flag
+   read takes.
+6. **`adc_interrupt`.** A job on an ADC with a latched flag fails at
+   `prepare_round` (`RFQickSoc216V1` raises `ADCInterruptError`); check that
+   the job error says so and that clearing (`rf_set` with the working
+   settings) lets the next job run.
+7. **RF Out.** `{"gen": g, "att": [a1, a2]}` switches the card's 5 V supply on
+   (both channels of a supply pair) and sets the attenuators; with a tone
+   playing, check that the order (attenuation raised before lowered) gives
+   no transient above the final level.
+
+An optional per-image safe state (`put_rf_safe`, or `import-image --rf-safe
+FILE` with `{"settings": [...], "settle_s": 0.2}`) is applied right after
+each load of that image; without one the server sets every RF-ADC attenuator
+to 27 dB and leaves the amplifiers off.

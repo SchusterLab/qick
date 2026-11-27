@@ -411,12 +411,14 @@ class BoardClient:
         return r['hash']
 
     def submit(self, prog, rounds=1, mode='acc', start_src='internal', stride=None, time_limit_s=None,
-               image=None, ref=None, limits=None, fake=None, use_cache=True, on_chunk=None):
+               image=None, ref=None, limits=None, fake=None, use_cache=True, on_chunk=None, idle_after=True):
         """Queue a compiled program. mode 'acc' = acquire(), 'dec' = acquire_decimated().
         Returns a Job; chunks start arriving as soon as it runs."""
         tree, arrays, h = self.pack_program(prog)
         run = {'rounds': rounds, 'mode': mode, 'start_src': start_src, 'stride': stride,
                'time_limit_s': time_limit_s, 'image': image}
+        if idle_after is not True:
+            run['idle_after'] = idle_after
         if fake is not None:
             run['fake'] = fake
         holder = {}
@@ -476,6 +478,21 @@ class BoardClient:
     def cancel(self, job):
         return self.request('cancel', job=job.id if isinstance(job, Job) else job)['was']
 
+    # --- RF cards ---
+    def rf_get(self):
+        return self.request('rf_get')['rf']
+
+    def rf_set(self, settings, settle_s=None):
+        """Apply RF settings in the server's safe order. Raises BoardError with code
+        adc_flags (header['record']) when an ADC is over range at idle afterwards."""
+        kw = {} if settle_s is None else {'settle_s': settle_s}
+        r = self.request('rf_set', settings=settings, **kw)
+        return {k: v for k, v in r.items() if k not in ('type', 'reply_to')}
+
+    def put_rf_safe(self, image, settings, settle_s=None):
+        kw = {} if settle_s is None else {'settle_s': settle_s}
+        return self.request('put_rf_safe', image=image, settings=settings, **kw)
+
     # --- images ---
     def list_images(self):
         return self.request('list_images')
@@ -483,8 +500,9 @@ class BoardClient:
     def current_image(self):
         return self.request('current_image')['image']
 
-    def load_image(self, image, force=False, timeout=900.0):
-        r = self.request('load_image', image=image, force=force, timeout=timeout)
+    def load_image(self, image, force=False, timeout=900.0, skip_rf_safe=False):
+        kw = {'skip_rf_safe': True} if skip_rf_safe else {}
+        r = self.request('load_image', image=image, force=force, timeout=timeout, **kw)
         self._soccfg = None
         self._known_progs.clear()
         return {k: v for k, v in r.items() if k not in ('type', 'reply_to')}

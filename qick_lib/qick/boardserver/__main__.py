@@ -38,6 +38,11 @@ def _serve(argv):
     ap.add_argument('--attach', metavar='IMAGE',
                     help='use what the FPGA already runs, assuming it is this store image (no download)')
     ap.add_argument('--soc-kwargs', default=None, help='JSON object of extra QickSoc arguments (real backend)')
+    ap.add_argument('--soc-class', default=None, choices=['auto', 'QickSoc', 'RFQickSoc216V1'],
+                    help='soc class for the real backend (default auto: RFQickSoc216V1 when the .hwh has the '
+                         'rfb_control block)')
+    ap.add_argument('--no-rf-safe-on-load', action='store_true',
+                    help='do NOT switch readout amplifiers off before a load and apply the RF safe state after it')
     ap.add_argument('--fake', action='store_true', help='fake board (no hardware); creates fake images if needed')
     ap.add_argument('--insecure-fake', action='store_true', help='with --fake only: accept any client, no token')
     ap.add_argument('--log-file', default=None)
@@ -51,10 +56,12 @@ def _serve(argv):
     if 'token' in cfg:
         sys.exit('refusing to start: the config file contains "token"; put tokens in a token file (token_file)')
     for key in ('host', 'port', 'token_file', 'image_dir', 'lock_file', 'allow_job_image_load', 'soc_kwargs',
-                'log_file'):
+                'log_file', 'soc_class'):
         v = getattr(a, key)
         if v is not None:
             cfg[key] = v
+    if a.no_rf_safe_on_load:
+        cfg['rf_safe_on_load'] = False
     if a.max_queue_mb is not None:
         cfg['max_queue_bytes'] = int(a.max_queue_mb * (1 << 20))
 
@@ -86,10 +93,10 @@ def _serve(argv):
     images = ImageStore(os.path.expanduser(cfg['image_dir']))
 
     if a.fake:
-        from .backend import FakeBackend, fake_image_files
+        from .backend import FakeBackend, fake_image_files, FAKE_VARIANTS
         backend = FakeBackend()
         names = [m['name'] for m in images.list()]
-        for variant in ('fake-a', 'fake-b'):
+        for variant in FAKE_VARIANTS:
             if variant not in names:
                 bit, hwh = fake_image_files(variant)
                 images.add_bytes(variant, bit, hwh, added_by='--fake', note='built-in fake image')
@@ -100,9 +107,11 @@ def _serve(argv):
         kw = cfg.get('soc_kwargs')
         if isinstance(kw, str):
             kw = json.loads(kw)
-        backend = QickSocBackend(soc_kwargs=kw)
+        backend = QickSocBackend(soc_kwargs=kw, soc_class=cfg.get('soc_class') or 'auto')
+    if cfg.get('rf_safe_on_load') is False:
+        log.warning('RF safe procedure around image loads is OFF (--no-rf-safe-on-load)')
 
-    server_cfg = {k: v for k, v in cfg.items() if k not in ('token_file', 'image_dir', 'soc_kwargs')}
+    server_cfg = {k: v for k, v in cfg.items() if k not in ('token_file', 'image_dir', 'soc_kwargs', 'soc_class')}
     srv = BoardServer(backend, images, server_cfg, tokens=tokens)
     srv.start()
     try:
@@ -134,11 +143,25 @@ def _import_image(argv):
     ap.add_argument('--hwh', default=None, help='default: the .bit path with .hwh')
     ap.add_argument('--note', default=None)
     ap.add_argument('--replace', action='store_true')
+    ap.add_argument('--rf-safe', default=None, metavar='JSON',
+                    help='RF safe state applied right after each load of this image: {"settings": [...], '
+                         '"settle_s": s} (rf_set settings)')
     a = ap.parse_args(argv)
     from .images import ImageStore
     hwh = a.hwh or os.path.splitext(a.bit)[0] + '.hwh'
-    meta = ImageStore(a.image_dir).add_files(a.name, a.bit, hwh, added_by='import-image', replace=a.replace,
-                                             note=a.note)
+    store = ImageStore(a.image_dir)
+    safe = None
+    if a.rf_safe:
+        from . import rf as RF
+        with open(a.rf_safe) as f:
+            doc = json.load(f)
+        safe = {'settings': RF.check_items(doc.get('settings')), 'stored_by': 'import-image'}
+        if doc.get('settle_s') is not None:
+            safe['settle_s'] = RF.check_settle(doc['settle_s'])
+    meta = store.add_files(a.name, a.bit, hwh, added_by='import-image', replace=a.replace, note=a.note)
+    if safe is not None:
+        store.set_rf_safe(a.name, safe)
+        meta['rf_safe'] = safe
     print(json.dumps(meta, indent=1))
 
 

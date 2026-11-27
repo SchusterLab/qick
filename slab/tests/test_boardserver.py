@@ -24,7 +24,7 @@ from qick import QickConfig
 from qick.asm_v2 import AveragerProgramV2
 from qick.boardserver import protocol as P
 from qick.boardserver.backend import (FakeBackend, FakeSoc, QickSocBackend, fake_acc_values, fake_dec_values,
-                                      fake_image_files)
+                                      fake_image_files, FAKE_VARIANTS)
 from qick.boardserver.client import BoardClient, BoardError, IncompleteResult
 from qick.boardserver.images import ImageStore
 from qick.boardserver.server import BoardServer, acquire_lock_file, board_lock_holder
@@ -63,7 +63,7 @@ class Board:
     def __init__(self, tmp_path, cfg=None, load='fake-a', inject=None):
         self.dir = str(tmp_path)
         self.images = ImageStore(os.path.join(self.dir, 'images'))
-        for v in ('fake-a', 'fake-b'):
+        for v in FAKE_VARIANTS:
             self.images.add_bytes(v, *fake_image_files(v), added_by='test')
         self.backend = FakeBackend(inject=inject)
         c = {'host': '127.0.0.1', 'port': 0, 'lock_file': os.path.join(self.dir, 'board.lock'),
@@ -643,19 +643,24 @@ def test_image_put_list_load(board, tmp_path):
     meta = c.put_image('up1', bp, hp, chunk_bytes=1000)      # several chunks
     assert meta['name'] == 'up1' and len(meta['hash']) == 64
     names = [m['name'] for m in c.list_images()['images']]
-    assert names == ['fake-a', 'fake-b', 'up1']
+    assert names == ['fake-a', 'fake-b', 'fake-rf', 'fake-w', 'up1']
     rec = c.load_image(meta['hash'][:12])
     assert rec['name'] == 'up1' and rec['hash'] == meta['hash']
     assert rec['bit_sha256'] == meta['bit_sha256'] and rec['hwh_sha256'] == meta['hwh_sha256']
     assert rec['requested_by'] == 'loader' and rec['duration_s'] > 0 and rec['t'] > 0
     assert rec['reset'] == {'pl_reconfigured': True, 'clocks_reprogrammed': False, 'converters_restarted': True,
                             'tproc_memories_cleared': True, 'envelopes_cleared': True,
-                            'program_cache_cleared': True}
+                            'program_cache_cleared': True, 'rf': None}
     assert rec['cancelled_jobs'] == []
     assert rec['soccfg']['readouts'][0]['avg_maxlen'] == 4096
     assert c.get_config()['fw_timestamp'] == 'uploaded'
+    # A1: the image loaded before, and a unique load id also in current_image and the welcome
+    assert rec['previous']['name'] == 'fake-a' and rec['previous']['hash'] == board.images.resolve('fake-a')['hash']
+    assert rec['previous']['load_id'] and rec['load_id'] and rec['load_id'] != rec['previous']['load_id']
     cur = c.current_image()
     assert cur['hash'] == meta['hash'] and cur['requested_by'] == 'loader'
+    assert cur['load_id'] == rec['load_id'] and cur['previous'] == rec['previous']
+    assert board.client('w').welcome['firmware']['image']['load_id'] == rec['load_id']
     # the soccfg is cached beside the image
     assert [m for m in c.list_images()['images'] if m['name'] == 'up1'][0]['has_soccfg']
     rec_b = c.load_image('fake-b')
@@ -713,7 +718,9 @@ def test_load_refused_while_job_queued_or_running(board):
     q2 = c.submit(prog, ref='queued-2')
     with pytest.raises(BoardError) as e:
         other.load_image('fake-b')
-    assert e.value.code == 'jobs_queued' and len(e.value.header['jobs']) == 2
+    assert e.value.code == 'jobs_queued'
+    assert [(x['job'], x['submitter'], x['ref']) for x in e.value.header['jobs']] == \
+        [(q1.id, 'runner', 'queued-1'), (q2.id, 'runner', 'queued-2')]
     rec = other.load_image('fake-b', force=True)
     assert [(x['job'], x['submitter'], x['ref']) for x in rec['cancelled_jobs']] == \
         [(q1.id, 'runner', 'queued-1'), (q2.id, 'runner', 'queued-2')]
@@ -733,6 +740,7 @@ def test_job_image_guard_off(board):
         c.submit(prog, image=hb)
     assert e.value.code == 'image_mismatch'
     assert e.value.header['wanted'] == hb and e.value.header['loaded'] == ha
+    assert e.value.header['wanted_name'] == 'fake-b' and e.value.header['loaded_name'] == 'fake-a'
     assert c.current_image()['name'] == 'fake-a'
 
 
@@ -873,6 +881,7 @@ BOARD_SIDE = ['qick_lib/qick/boardserver/protocol.py', 'qick_lib/qick/boardserve
               'qick_lib/qick/boardserver/jobs.py', 'qick_lib/qick/boardserver/images.py',
               'qick_lib/qick/boardserver/backend.py', 'qick_lib/qick/boardserver/__main__.py',
               'qick_lib/qick/boardserver/__init__.py', 'qick_lib/qick/boardserver/client.py',
+              'qick_lib/qick/boardserver/rf.py',
               'qick_lib/qick/streamer.py', 'qick_lib/qick/drivers/tproc.py', 'qick_lib/qick/helpers.py']
 
 
@@ -909,8 +918,9 @@ def test_board_side_imports_only_stdlib_and_numpy():
             for n in names:
                 if n in allowed_third_party or n in sys.stdlib_module_names or n == 'qick':
                     continue
-                # pynq is imported by tproc.py through qick.ip; that is the board's own library
-                assert n in ('pynq',), '%s imports %s' % (path, n)
+                # pynq (tproc.py through qick.ip) and xrfdc (rf.py, the ADC flags) come with the
+                # board's PYNQ image; QickSoc itself needs both
+                assert n in ('pynq', 'xrfdc'), '%s imports %s' % (path, n)
 
 
 # --- command line -------------------------------------------------------------
@@ -943,7 +953,7 @@ def test_cli_fake_server(tmp_path):
         c = BoardClient('127.0.0.1', port, token_file=tf, label='cli-test')
         assert c.welcome['fake'] is True
         imgs = c.list_images()
-        assert [m['name'] for m in imgs['images']] == ['fake-a', 'fake-b']
+        assert [m['name'] for m in imgs['images']] == ['fake-a', 'fake-b', 'fake-rf', 'fake-w']
         assert c.current_image()['name'] == 'fake-a'
         job = c.submit(make_prog(c.get_config(), reps=10, loop=2))
         assert job.wait(10)['outcome'] == 'complete'
@@ -964,3 +974,372 @@ def test_cli_import_image(tmp_path):
     meta = json.loads(r.stdout)
     assert meta['name'] == 'rollback'
     assert ImageStore(str(tmp_path / 'img')).resolve('rollback')['hash'] == meta['hash']
+
+
+# --- round 2: idle_after, image changes, decimated shapes -------------------
+
+def test_idle_after(board):
+    c = board.client()
+    calls = board.backend.soc.calls
+    prog = make_prog(c.get_config(), reps=20, loop=2)
+    n0 = calls.count('reset_gens')
+    done = c.submit(prog, idle_after=False).wait(10)
+    assert done['outcome'] == 'complete' and done['outputs_idle'] is False
+    assert done['idle']['skipped'] and 'idle_after' in done['outputs_idle_reason']
+    assert calls.count('reset_gens') == n0
+    assert c.get_state()['last_idle']['skipped']
+    # still made idle on error, cancel and time limit
+    done = c.submit(prog, rounds=2, idle_after=False, fake={'queue_error': {'round': 0, 'queues': ['data']}}).wait(10)
+    assert done['outcome'] == 'failed' and done['outputs_idle'] is True
+    assert done['outputs_idle_reason'] == 'error (tproc_queue_overflow)'
+    long = make_prog(c.get_config(), reps=1000, loop=10)
+    done = c.submit(long, idle_after=False, time_limit_s=0.1, fake={'shot_rate': 2000}).wait(10)
+    assert done['outcome'] == 'timed_out' and done['outputs_idle'] is True
+    j = c.submit(long, stride=100, idle_after=False, fake={'shot_rate': 2000})
+    wait_for(lambda: len(j.chunks) >= 1)
+    c.cancel(j)
+    assert j.wait(10)['outputs_idle'] is True
+    done = c.submit(prog).wait(10)
+    assert done['outputs_idle'] is True and done['outputs_idle_reason'] == 'normal end of the job'
+    with pytest.raises(BoardError) as e:
+        c.request('submit', kind='qick_prog', prog_ref=c.put_prog(prog), run={'idle_after': 'no'})
+    assert e.value.code == 'bad_request' and e.value.header['field'] == 'run.idle_after'
+
+
+def test_queued_job_without_image_not_run_on_another(board_factory):
+    b = board_factory(cfg={'allow_job_image_load': True})
+    c = b.client('eng')
+    prog = make_prog(c.get_config(), reps=10, loop=2)
+    b.srv.jobs.hold(True)
+    first = c.submit(prog, ref='first')                    # no image: runs on fake-a
+    switch = c.submit(prog, image='fake-b', ref='switch')  # loads fake-b
+    stale = c.submit(prog, ref='stale')                    # no image, built for fake-a
+    pinned = c.submit(prog, image='fake-b', ref='pinned')
+    b.srv.jobs.hold(False)
+    assert first.wait(10)['outcome'] == 'complete'
+    assert switch.wait(10)['outcome'] == 'complete'
+    ev = switch.events_of('image_loaded')[0]['image']
+    assert ev['cancelled_jobs'] == [{'job': stale.id, 'submitter': 'eng', 'ref': 'stale'}]
+    assert ev['previous']['name'] == 'fake-a'
+    d = stale.wait(10)
+    assert d['outcome'] == 'cancelled' and d['reason'] == 'image_changed'
+    assert pinned.wait(10)['outcome'] == 'complete'
+
+
+class _LibSoc(FakeSoc):
+    """FakeSoc driven by the library's own acquire_decimated (which does not call
+    fake_round_info): rounds counted at prepare_round."""
+    def __init__(self, cfg, total, reads):
+        super().__init__(cfg)
+        self._lib = (total, reads)
+        self._n = -1
+
+    def prepare_round(self):
+        self._n += 1
+        self.fake_round_info(self._n, self._lib[0], [0], [self._lib[1]])
+
+
+@pytest.mark.parametrize('reps,loop,two_reads,shape', [
+    (1, 0, False, 'L2'),          # single shot, single read: (length, 2)
+    (1, 3, False, 'NL2'),         # multi-rep: (n_reps*n_reads, length, 2)
+    (1, 0, True, 'NL2'),          # multi-read, one rep: (n_reps*n_reads, length, 2)
+    (2, 3, True, 'NRL2'),         # multi-rep and multi-read: (n_reps, n_reads, length, 2)
+])
+def test_decimated_matches_library_acquire_decimated(board, reps, loop, two_reads, shape):
+    c = board.client()
+    cfg = c.get_config()
+    prog = make_prog(cfg, reps=reps, loop=loop, two_reads=two_reads)
+    res = c.submit(prog, rounds=3, mode='dec').result(prog)
+    ref_prog = make_prog(cfg, reps=reps, loop=loop, two_reads=two_reads)
+    total = int(np.prod(ref_prog.loop_dims))
+    nreads = 2 if two_reads else 1
+    soc = _LibSoc(cfg.get_cfg(), total, nreads)
+    ref = ref_prog.acquire_decimated(soc, rounds=3, progress=False)
+    assert soc._n == 2                                     # three rounds, averaged
+    assert len(res) == len(ref) == 1
+    assert res[0].shape == ref[0].shape and res[0].dtype == ref[0].dtype
+    assert np.array_equal(res[0], ref[0])
+    L = prog.ro_chs[0]['length']
+    want = {'L2': (L, 2), 'NL2': (total * nreads, L, 2), 'NRL2': (total, nreads, L, 2)}[shape]
+    assert res[0].shape == want
+
+
+# --- D: weights over the wire -------------------------------------------------
+
+class WProg(AveragerProgramV2):
+    def _initialize(self, cfg):
+        self.declare_gen(ch=0, nqz=1)
+        self.declare_readout(ch=0, length=0.5, weights=cfg['weights'])
+        self.add_readoutconfig(ch=0, name='ro', freq=100, gen_ch=0)
+        self.add_pulse(ch=0, name='p', style='const', freq=100, phase=0, gain=0.5, length=0.1)
+        self.add_loop('x', 2)
+
+    def _body(self, cfg):
+        self.send_readoutconfig(ch=0, name='ro', t=0)
+        self.pulse(ch=0, name='p', t=0)
+        self.trigger(ros=[0], t=0.2)
+
+
+def _weight_model():
+    import importlib.util
+    path = os.path.join(REPO, 'slab', 'sim', 'weighted_buffer', 'model.py')
+    spec = importlib.util.spec_from_file_location('wb_model', path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_weights_round_trip(board):
+    c = board.client()
+    c.load_image('fake-w')
+    cfg = c.get_config(refresh=True)
+    assert cfg['readouts'][0]['has_weights'] and cfg['readouts'][0]['wgt_maxlen'] == 1024
+    L = WProg(cfg, reps=1, final_delay=1.0, cfg={'weights': None}).ro_chs[0]['length']
+    rng = np.random.default_rng(7)
+    w = rng.integers(-30000, 30000, size=(L, 2)).astype(np.int16)
+    prog = WProg(cfg, reps=1, final_delay=1.0, cfg={'weights': w})
+    tree, arrays, h = BoardClient.pack_program(prog)
+    assert any(a.dtype == np.int16 and a.shape == (L, 2) and np.array_equal(a, w) for _, a in arrays)
+    job = c.submit(prog, mode='dec')
+    assert job.wait(10)['outcome'] == 'complete'
+    got = board.backend.soc.weights[0]
+    assert got.dtype == np.int16 and np.array_equal(got, w)
+    # the fake applies the firmware formula of slab/sim/weighted_buffer/model.py
+    model = _weight_model()
+    x = fake_dec_values(0, 0, 2 * L)
+    want = model.weighted(x, w[np.arange(2 * L) % L]).astype(np.int32)
+    assert np.array_equal(job.raw_rounds()[0]['dec'][0], want)
+    # the library refuses weights on a readout without a weighted buffer (fake-a)
+    with pytest.raises(RuntimeError):
+        WProg(QickConfig(json.loads(fake_image_files('fake-a')[1])['fake_soccfg']), reps=1, final_delay=1.0, cfg={'weights': w})
+
+
+# --- C: RF cards ----------------------------------------------------------------
+
+def rf_board(board_factory, **cfg):
+    return board_factory(cfg=cfg, load='fake-rf')
+
+
+def test_rf_get_state_and_load_record(board_factory):
+    b = rf_board(board_factory)
+    c = b.client('eng')
+    rf = c.rf_get()
+    assert rf['cards']['adc'][2]['kind'] == 'rf_in' and rf['cards']['adc'][3]['kind'] == 'dc_in'
+    assert rf['ros']['0']['kind'] == 'rf_in' and rf['ros']['1']['kind'] == 'dc_in'
+    assert rf['gens']['0']['kind'] == 'rf_out'
+    assert rf['adc_att'] == {'20': 27.0, '21': 27.0, '22': 27.0}          # read from the converter
+    assert rf['adc_ports']['4']['amp_on'] is False and rf['adc_ports']['6']['amp_on'] is False
+    assert rf['adc_ports']['4']['att'] == {'value': 31.75, 'by': 'amplifier off'}
+    assert not any(f['over_range'] or f['over_voltage'] for f in rf['flags'].values())
+    assert c.get_state()['rf']['adc_att'] == rf['adc_att']
+    reset = c.current_image()['reset']['rf']
+    assert reset['procedure'] == 'on' and reset['after']['ok'] and reset['after']['source'] == 'built-in default'
+    assert reset['found_after_load']['adc_att']['20'] == 0.0              # the converter's state after a load
+    assert c.welcome['capabilities']['rf'] is True
+    # no RF on a plain image
+    c.load_image('fake-a')
+    with pytest.raises(BoardError) as e:
+        c.rf_get()
+    assert e.value.code == 'no_rf_board'
+
+
+def test_rf_set_safe_order_and_readback(board_factory):
+    b = rf_board(board_factory)
+    c = b.client('eng')
+    hw = b.backend.rf_hardware
+    n_ev = len(hw.events)
+    # given in an unsafe order; RF-ADC attenuator raised from 0 (as after a load without the procedure)
+    hw.dsa['20'] = 0.0
+    rec = c.rf_set([{'ro': 0, 'amp': True, 'att': 10},
+                    {'gen': 0, 'att': [6, 8]},
+                    {'ro': 0, 'filter': {'ftype': 'bandpass', 'fc': 6.0, 'bw': 1.0}},
+                    {'gen': 0, 'filter': {'ftype': 'lowpass', 'fc': 8.0}},
+                    {'ro': 0, 'adc_att': 20},
+                    {'bias': 3, 'volts': 0.5}], settle_s=0.01)
+    ops = [(e['phase'], e['op']) for e in rec['order']]
+    assert ops == [('reduce', 'adc_att'), ('filters', 'filter'), ('filters', 'filter'), ('increase', 'dac_att'),
+                   ('increase', 'adc_rf_on'), ('bias', 'bias')]
+    assert rec['order'][1]['target'] == ['adc', 4]                         # readout filter before generator filter
+    assert rec['order'][0]['result'] == {'set': 20.0, 'read': 20.0}
+    assert rec['order'][4]['result']['amp_on'] is True
+    assert rec['ok'] and rec['by'] == 'eng'
+    assert not rec['flags_idle']['20']['over_range']
+    assert len(hw.events) == n_ev                                          # never over range on the way
+    rf = c.rf_get()
+    assert rf['adc_att']['20'] == 20.0 and rf['adc_ports']['4']['amp_on'] is True
+    assert rf['adc_ports']['4']['att'] == {'value': 10.0, 'by': 'rf_set'}
+    assert rf['dac_ports']['0']['att'] == {'value': [6.0, 8.0], 'by': 'rf_set'}
+    assert rf['adc_ports']['4']['filter'] != {'WR0_SW': 0xC0, 'WR0_FILTER': 0}
+    assert rf['bias']['3'] == 0.5
+    # lowering the RF-ADC attenuator with the amplifier on comes after everything else
+    rec = c.rf_set([{'ro': 0, 'adc_att': 15}, {'gen': 0, 'att': [10, 10]}, {'ro': 0, 'amp': True, 'att': 12}],
+                   settle_s=0)
+    assert [(e['phase'], e['op']) for e in rec['order']] == [('reduce', 'dac_att'), ('reduce', 'adc_rf_on'),
+                                                            ('increase', 'adc_att')]
+    # DC In readout: gain, read back
+    rec = c.rf_set([{'ro': 1, 'amp': True, 'gain': 10}], settle_s=0)
+    assert rec['order'][0]['result']['gain'] == 10.0 and rec['order'][0]['result']['amp_on'] is True
+
+
+def test_rf_set_flags_at_idle(board_factory):
+    b = rf_board(board_factory)
+    c = b.client('eng')
+    with pytest.raises(BoardError) as e:
+        c.rf_set([{'ro': 0, 'adc_att': 5}, {'ro': 0, 'amp': True, 'att': 10}], settle_s=0.01)
+    assert e.value.code == 'adc_flags'
+    rec = e.value.header['record']
+    assert rec['flags_idle']['20']['over_range'] and not rec['flags_idle']['20']['over_voltage']
+    assert rec['actions'] == [] and c.rf_get()['adc_ports']['4']['amp_on'] is True     # left on, reported
+    # a job on an ADC in interrupt state is refused by prepare_round, as RFQickSoc216V1 does
+    d = c.submit(make_prog(c.get_config(), reps=5, loop=2)).wait(10)
+    assert d['outcome'] == 'failed' and d['error']['code'] == 'adc_interrupt'
+    # over-voltage: the amplifier is switched off again
+    with pytest.raises(BoardError) as e:
+        c.rf_set([{'ro': 0, 'adc_att': 0}, {'ro': 0, 'amp': True, 'att': 0}], settle_s=0)
+    rec = e.value.header['record']
+    assert rec['flags_idle']['20']['over_voltage']
+    assert rec['actions'][0]['op'] == 'adc_off' and rec['actions'][0]['amp_on'] is False
+    assert c.rf_get()['adc_ports']['4']['amp_on'] is False
+
+
+def test_rf_set_refusals(board_factory):
+    b = rf_board(board_factory)
+    c = b.client('eng')
+    hw = b.backend.rf_hardware
+    before = list(hw.calls)
+    bad = [([{'ro': 0, 'att': 10}], 'bad_request'),                  # att without amp
+           ([{'ro': 0, 'amp': True, 'att': 10.1}], 'bad_request'),     # not a 0.25 dB step
+           ([{'ro': 0, 'adc_att': 28}], 'bad_request'),
+           ([{'gen': 0, 'att': 5}], 'bad_request'),
+           ([{'ro': 7, 'adc_att': 10}], 'bad_request'),
+           ([{'ro': 1, 'amp': True, 'att': 10}], 'no_rf_board'),       # readout 1 is on a DC In card
+           ([{'ro': 0, 'adc_att': 20}, {'ro': 0, 'amp': True, 'gain': 3}], 'no_rf_board'),
+           ([{'bias': 9, 'volts': 1}], 'bad_request'),
+           ([], 'bad_request')]
+    for settings, code in bad:
+        with pytest.raises(BoardError) as e:
+            c.rf_set(settings)
+        assert e.value.code == code, settings
+    assert hw.calls == before                                         # nothing applied
+    r = b.client('viewer', token=READ_TOKEN, role='read')
+    assert r.rf_get()['adc_att']
+    with pytest.raises(BoardError) as e:
+        r.rf_set([{'ro': 0, 'adc_att': 20}])
+    assert e.value.code == 'forbidden'
+    # another client's running job
+    long = make_prog(c.get_config(), reps=1000, loop=10)
+    j = c.submit(long, stride=100, fake={'shot_rate': 2000})
+    wait_for(lambda: b.srv.jobs.get(j.id).state == 'running')
+    other = b.client('other')
+    with pytest.raises(BoardError) as e:
+        other.rf_set([{'ro': 0, 'adc_att': 20}])
+    assert e.value.code == 'job_running' and e.value.header['job'] == j.id
+    assert c.rf_set([{'ro': 0, 'adc_att': 26}], settle_s=0)['ok']      # the job's own client may
+    c.cancel(j)
+    j.wait(10)
+    c.load_image('fake-a')
+    with pytest.raises(BoardError) as e:
+        c.rf_set([{'ro': 0, 'adc_att': 20}])
+    assert e.value.code == 'no_rf_board'
+
+
+def _amp_on(c):
+    rec = c.rf_set([{'ro': 0, 'adc_att': 20}, {'ro': 0, 'amp': True, 'att': 10}], settle_s=0)
+    assert rec['ok']
+
+
+def test_rf_load_bad_case_without_procedure(board_factory):
+    b = rf_board(board_factory, rf_safe_on_load=False)
+    c = b.client('eng')
+    assert c.current_image()['reset']['rf']['procedure'] == 'off'
+    _amp_on(c)
+    hw = b.backend.rf_hardware
+    n_ev = len(hw.events)
+    rec = c.load_image('fake-rf')
+    rf = rec['reset']['rf']
+    assert rf['before'] == {'skipped': True, 'why': 'RF procedure off (--no-rf-safe-on-load)'} and rf['after'] is None
+    found = rf['found_after_load']
+    assert found['adc_att']['20'] == 0.0 and found['adc_ports']['4']['amp_on'] is True
+    assert found['flags']['20']['over_range']
+    assert any(ev['why'].startswith('PL load') for ev in hw.events[n_ev:])
+    d = c.submit(make_prog(c.get_config(), reps=5, loop=2)).wait(10)
+    assert d['outcome'] == 'failed' and d['error']['code'] == 'adc_interrupt'
+
+
+def test_rf_load_with_procedure(board_factory):
+    b = rf_board(board_factory)
+    c = b.client('eng')
+    _amp_on(c)
+    hw = b.backend.rf_hardware
+    n_ev = len(hw.events)
+    rec = c.load_image('fake-rf')
+    rf = rec['reset']['rf']
+    assert rf['procedure'] == 'on'
+    assert {(e['port'], e['amp_on']) for e in rf['before']['done']} == {(4, False), (5, False), (6, False), (7, False)}
+    found = rf['found_after_load']
+    assert found['adc_att']['20'] == 0.0 and found['adc_ports']['4']['amp_on'] is False
+    assert not found['flags']['20']['over_range']
+    after = rf['after']
+    assert after['ok'] and after['adc_att'] == {'20': 27.0, '21': 27.0, '22': 27.0}
+    assert all(e['amp_on'] is False for e in after['amplifiers_off'])
+    assert not any(f['over_range'] for f in after['flags_idle'].values())
+    assert rf['state']['adc_att']['20'] == 27.0
+    assert hw.events[n_ev:] == []                                      # never overdriven
+    assert c.submit(make_prog(c.get_config(), reps=5, loop=2)).wait(10)['outcome'] == 'complete'
+    # leaving the RF image: the before-half still runs
+    _amp_on(c)
+    rf = c.load_image('fake-a')['reset']['rf']
+    assert rf['before']['ok'] and rf['after'] is None and rf['found_after_load'] is None
+    assert hw.amp[4] is False
+
+
+def test_rf_safe_failed_refuses_load(board_factory):
+    b = rf_board(board_factory)
+    c = b.client('eng')
+    _amp_on(c)
+    hw = b.backend.rf_hardware
+    loads = hw.pl_loads
+    stuck = b.backend.rf.hw
+    real_off = stuck.adc_off
+    stuck.adc_off = lambda port: None if port == 4 else real_off(port)    # the switch does not respond
+    with pytest.raises(BoardError) as e:
+        c.load_image('fake-b')
+    assert e.value.code == 'rf_safe_failed'
+    assert [d for d in e.value.header['record']['done'] if d['port'] == 4][0]['amp_on'] is True
+    assert hw.pl_loads == loads and c.current_image()['name'] == 'fake-rf'   # nothing loaded
+    rec = c.load_image('fake-b', skip_rf_safe=True)
+    assert rec['reset']['rf']['before'] == {'skipped': True, 'why': 'skip_rf_safe in the request'}
+    assert c.current_image()['name'] == 'fake-b'
+
+
+def test_rf_safe_state_file(board_factory):
+    b = rf_board(board_factory)
+    c = b.client('eng')
+    with pytest.raises(BoardError) as e:
+        c.put_rf_safe('fake-rf', [{'ro': 0, 'adc_att': 99}])
+    assert e.value.code == 'bad_request'
+    c.put_rf_safe('fake-rf', [{'ro': 0, 'adc_att': 20}, {'ro': 0, 'filter': {'ftype': 'bandpass', 'fc': 6.0, 'bw': 1.0}},
+                              {'gen': 0, 'att': [10, 12]}], settle_s=0.01)
+    assert [m for m in c.list_images()['images'] if m['name'] == 'fake-rf'][0]['has_rf_safe']
+    after = c.load_image('fake-rf')['reset']['rf']['after']
+    assert after['ok'] and after['source'] == 'safe-state file' and after['settle_s'] == 0.01
+    assert after['adc_att'] == {'20': 20.0, '21': 27.0, '22': 27.0}
+    rf = c.rf_get()
+    assert rf['adc_ports']['4']['amp_on'] is False                     # not turned on by the file
+    assert rf['dac_ports']['0']['att'] == {'value': [10.0, 12.0], 'by': 'rf_set'}
+    # a file that turns the amplifier on: after its attenuator, then flags
+    c.put_rf_safe('fake-rf', [{'ro': 0, 'adc_att': 20}, {'ro': 0, 'amp': True, 'att': 15}])
+    after = c.load_image('fake-rf')['reset']['rf']['after']
+    assert after['ok'] and [o['op'] for o in after['order']][-1] == 'adc_rf_on'
+    assert c.rf_get()['adc_ports']['4']['amp_on'] is True
+    c.put_rf_safe('fake-rf', None)
+    assert c.load_image('fake-rf')['reset']['rf']['after']['source'] == 'built-in default'
+
+
+def test_real_backend_picks_rf_class(tmp_path):
+    bit, hwh = fake_image_files('fake-rf')
+    p = tmp_path / 'x.hwh'
+    p.write_bytes(hwh)
+    assert QickSocBackend.hwh_has_rf_board(str(p))
+    p.write_bytes(fake_image_files('fake-a')[1])
+    assert not QickSocBackend.hwh_has_rf_board(str(p))
