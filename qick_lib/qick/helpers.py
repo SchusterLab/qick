@@ -178,7 +178,11 @@ class NpEncoder(json.JSONEncoder):
 def decode_array(json_array):
     """
     Convert a base64-encoded array back into numpy.
+    An array that is already a numpy array (a program dictionary that came through
+    the board server, which carries arrays as raw bytes) is returned as it is.
     """
+    if isinstance(json_array, np.ndarray):
+        return json_array
     data, shape, dtype = json_array
     return np.frombuffer(base64.b64decode(data), dtype=np.dtype(dtype)).reshape(shape)
 

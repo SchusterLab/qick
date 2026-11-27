@@ -3,6 +3,39 @@
 Running log for the lab fork. Newest entry first. Record dead ends as well as
 results, and say where each number came from.
 
+## 2026-11-26: board server version 1, against a fake board only (branch `lab/board-server`)
+
+Implemented the server sketched in `slab/notes/board-server-protocol.md`
+(now rewritten to match what was built), plus the image store and
+`load_image` that the sketch had reserved. **Nothing has run on a board.**
+51 tests in `slab/tests/test_boardserver.py` (106 in `slab/tests/` with the
+older ones) pass with Python 3.12 on the lab PC; the board-side modules are
+only syntax-checked for 3.8 (`ast` `feature_version`), no 3.8 interpreter was
+run.
+
+- The fake replaces only the QickSoc/pynq layer (`FakeSoc`): the server, the
+  drain, the job store and the real backend's run sequence are the code under
+  test. Its ring buffers really get overwritten when the drain lags, so the
+  overrun tests check delivered data, not just flags.
+- Bug found by that fake in my first drain: when the program finished during a
+  transfer, the after-transfer check was skipped and one overwritten shot was
+  delivered as data. Fixed (the check now always runs, with the counter capped
+  at the last shot); the test that found it checks every shot is delivered
+  correctly or reported lost, exactly once.
+- `DataStreamer` now uses the same drain loop. Behaviour change for
+  `acquire()` users: it also raises when the ring was lapped during a transfer
+  (before, that data was returned silently), and it uses each readout's own
+  ring length. Checked only on the fake.
+- Choices that differ from the sketch: threads rather than asyncio; `ack` has
+  no reply; any `run` client may cancel any job (logged); a `read` token only
+  authenticates for role `read`; `fetch` takes `from_event` as well as
+  `from_seq`; events carry `eseq`; `dropped` entries say whether the chunk had
+  already been sent; `run.reduce` is still reserved; tokens are not stored
+  hashed (an HMAC challenge needs the key).
+- Not measured (list in `slab/notes/board-server-install.md`): the real
+  backend at all, DAC outputs during `load_image`, load duration, drain rate
+  against shot rate, idle outputs, memory over a long run.
+
 ## 2026-11-26: weighted readout buffer simulated against a numpy model (branch `lab/weighted-buffer-sim`)
 
 Question from the measurement side: what exactly does `axis_weighted_buffer`
