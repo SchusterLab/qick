@@ -13,10 +13,17 @@ in `make_bd.py`):
   `N_BUF` 14 and `N_WGT` 14; buffers 2-9 `N_WGT` 13. Meets timing (setup
   +0.009 ns, hold +0.010 ns), block RAM 93.75 %. Bitstream sha256 `9f3cec75...`.
 - Plain buffers (`axis_avg_buffer` 1.2, `N_BUF` 15 on readouts 0 and 1,
-  `PMEM_AW` 14): routed 0.062 ns short on setup (134 endpoints). Not loaded.
-  Polish pass started on the routed checkpoint; result to be added.
-- `N_WGT` 14 on all ten readouts: placement check only, estimated >99 % block
-  RAM; still failing mid-route when this was written.
+  `PMEM_AW` 14, no weights): routed 0.062 ns short on setup (134 endpoints).
+  Three polish passes on the routed checkpoint (`place_design
+  -post_place_opt`, `phys_opt_design`, `route_design`, `phys_opt_design`)
+  went -0.015, then -0.193 and -0.010, then +0.003 ns: meets timing (setup
+  +0.003 ns, hold +0.008 ns), block RAM 88.1 %, finished 11-27 02:08.
+  Bitstream sha256 `a004d9c4...`. Not run on a board. Placement-preserving
+  steps (fanout optimisation, retiming, re-route) did not move the last
+  0.010 ns; only another re-placement round did, so each round is a new draw.
+- `N_WGT` 14 on all ten readouts (program memory 4096): fits in 94.8 % block
+  RAM (my earlier estimate of over 99 % was wrong) and routed 0.028 ns short
+  on setup (56 endpoints). Not polished.
 
 Board runs, done by the measurement side on a ZCU216 that normally runs a
 2024 custom image (tProc rev 21, qick 0.2.420, Pyro server from a Jupyter
