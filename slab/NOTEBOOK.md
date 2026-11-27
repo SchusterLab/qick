@@ -3,6 +3,54 @@
 Running log for the lab fork. Newest entry first. Record dead ends as well as
 results, and say where each number came from.
 
+## 2026-11-26: first runs of the lab images on a board; larger-memory weighted build
+
+Builds (Vivado 2024.1, same recipe as 11-25, source `main` at the tag
+`slab-0.2.450-1`; the size changes were made in the build copy and are not yet
+in `make_bd.py`):
+
+- Weighted, larger memories: tProc `PMEM_AW` 14; weighted buffers 0 and 1 with
+  `N_BUF` 14 and `N_WGT` 14; buffers 2-9 `N_WGT` 13. Meets timing (setup
+  +0.009 ns, hold +0.010 ns), block RAM 93.75 %. Bitstream sha256 `9f3cec75...`.
+- Plain buffers (`axis_avg_buffer` 1.2, `N_BUF` 15 on readouts 0 and 1,
+  `PMEM_AW` 14): routed 0.062 ns short on setup (134 endpoints). Not loaded.
+  Polish pass started on the routed checkpoint; result to be added.
+- `N_WGT` 14 on all ten readouts: placement check only, estimated >99 % block
+  RAM; still failing mid-route when this was written.
+
+Board runs, done by the measurement side on a ZCU216 that normally runs a
+2024 custom image (tProc rev 21, qick 0.2.420, Pyro server from a Jupyter
+cell). I did not have access to the board; these are their reported results.
+
+1. Library tag `slab-0.2.450-1` on the board (Python 3.8.2) and client with
+   the unchanged 2024 image: their reference measurements matched, and the
+   board description differed only by new keys. Before this I compared the
+   2024 hardware description statically against the tagged drivers (block
+   versions, required parameters) and found nothing missing.
+2. The 11-25 weighted image (`e20611d4...`): loaded first time by restarting
+   the server with the new bitfile, 33-36 s. Default weights measured at
+   -88.6 degrees from unit weights (fit +-3 degrees) with per-sample noise
+   0.50 of stock, as the simulation predicts (-90 degrees, half scale). A
+   single non-zero weight gave a decimated trace non-zero at that sample only.
+   A program with 300 readouts per repetition and no hold lost nothing (the
+   2024 image lost 14.7 % on the same program).
+3. The larger-memory weighted image: sizes read back as built; 16384-sample
+   traces and streams of 750 and 2000 readouts per repetition with no stale
+   data.
+4. Back to the 2024 image: description identical to before (0 differences).
+
+Not checked on the board: window sum against the accumulated value on one
+shot, minimum trigger spacing, the lost-push flags read directly
+(`soc.check_tproc_queues()`), and the DAC outputs during a load.
+
+Start-up differences of the newer library that were checked on the board
+first and were harmless there: `libi2c.so` and `libsensors.so` load at import;
+the library reads the DAC_AVTT rail and would switch it if the image's output
+current mode asked for it (both images 20 mA mode, rail 2.475 V, no switch);
+the reference-clock equality check. `BOARD=ZCU216` comes from the Jupyter
+service's environment and is empty in a plain root shell: a service that
+starts QickSoc must set it.
+
 ## 2026-11-26: weighted readout buffer simulated against a numpy model (branch `lab/weighted-buffer-sim`)
 
 Question from the measurement side: what exactly does `axis_weighted_buffer`
