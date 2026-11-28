@@ -19,6 +19,107 @@ script does this), so `.0` always means unreleased. Not yet done: the firmware
 itself does not carry the version (a constant register or the bitstream's
 USR_ACCESS word would let the library read it from the loaded image).
 
+## 2026-11-27: rfbox 0.3, deterministic filter settings (branch `lab/rf-driver`)
+
+Asked for directly: filter settings must be deterministic. Against the fake
+box only. 68 tests in `slab/tests/test_rfbox.py`, 203 in `slab/tests/` pass;
+both files parse with the 3.8 grammar.
+
+- Explicit form `{hpf: step|null, lpf: step|null}` is canonical, accepted
+  everywhere and reported everywhere. Frequency requests are resolved by one
+  rfbox rule ("never narrower": high-pass highest corner at or below the
+  lower edge, low-pass lowest corner at or above the upper edge, lower band
+  preferred in overlaps as far as the result stays monotone). This replaces
+  the nearest-step rule of 0.1/0.2. Checked on a 2.5 MHz grid from 0.5 to
+  20 GHz: monotone, never narrower, round trip for every step the rule picks.
+  Ten overlap steps are reachable only in the explicit form.
+- The users' high-pass fc 5.9 (step 26, 5.97 GHz under 0.2) resolves to step
+  25 (5.71 GHz) under the new rule. To keep the state, store
+  `{hpf: 26, lpf: null}`.
+- `spec_hash` is now `h2:` on the canonical form, and the old hash is
+  `spec_hash_v1`. `apply` returns the canonical description.
+- The missing `filter_read` in one instrument reply: in `get()`, all the
+  fields of a port were read inside one `try`, so a failing GPIO expander
+  read (amplifier or rail pin) dropped the filter and every later field of
+  that port. This was reproduced on the fake with an injected GPIO read fault
+  and is fixed: each field is read on its own. No code path skips a filter
+  step when the state is unchanged or a section maps to bypass, and a test now
+  covers both. A filter that reads back registers that do not decode gives
+  `value: null` (the client's `filter_read: None`); that is the chip not
+  answering, not a missing block.
+- qick 0.2.432-0.2.447 write bypass for every frequency-form filter request
+  (`_freq2step` matches the table's `bypass` entry first). The measurement side
+  saw the registers stay at bypass on a box running 0.2.436; I then checked the
+  released PyPI packages one by one (0.2.431 fine, 0.2.432 first faulty, 0.2.447
+  last faulty, 0.2.449 fine). The 0.2.436 version commit is in this fork's
+  history (87045790).
+
+## 2026-11-27: rfbox 0.2, from the measurement side's integration against `slab-rfbox-0.1` (branch `lab/rf-driver`)
+
+Against the fake box only. 59 tests in `slab/tests/test_rfbox.py`, 194 in
+`slab/tests/` pass; both files parse with the Python 3.8 grammar. The tag
+`slab-rfbox-0.1` is left where it was.
+
+- The identity and `get()` carry `rfbox_version` ("0.2") and `rfbox_sha256`
+  (of the file as loaded). The mixin has `rfbox_version()`.
+- `labdev_*` and every `rfbox_*` call except `set` / `apply` / `apply_safe`
+  now raise on failure. In 0.1, `labdev_ro_off` returned the refusal dict,
+  which is truthy. The note has the full table of which calls return data and
+  which raise.
+- `adc_dsa` accepts any value in 0-27 dB and rounds it as qick_rf did;
+  `record=True` gives requested, applied and read. `clear_flags` takes a list
+  of blocks.
+- Filters: on the users' box the filters did not act and may not answer, and
+  the strict readback refused at the filter step. Strict stays the default;
+  `filter_verify: false` per channel lets the write stand with a warning and
+  marks it written-not-verified in `get()`. `filter_probe` gives raw register
+  reads with the selects used. Every filter step records the band, state and
+  nominal corners written, because older libraries (0.2.360, 0.2.436) choose
+  states with different code than rfbox's table.
+- `soc_class` (and the board server's RF soc class) wraps every `rfb_*`
+  method in the rfbox lock and invalidates what rfbox remembers writing.
+- Field numbers from the users (old driver, their setup) recorded in the note
+  under "Measured on hardware by the users".
+
+## 2026-11-27: rfbox, a front-end driver for the QICK box (branch `lab/rf-driver`)
+
+Against the fake box only; nothing here has run on a board. 43 tests in
+`slab/tests/test_rfbox.py`, 178 in `slab/tests/` pass. Note:
+`slab/notes/rfbox-driver.md` (API, readback per chip, upstream hazards with
+file:line, loopback checklist, migration table from the measurement side's
+`qick_rf.py`).
+
+- `qick/rfbox.py` replaces both the board server's RF code and the
+  measurement side's `board_side/qick_rf.py` (same description format and
+  hash; every qick_rf function has an rfbox equivalent). It works from
+  `adc_cards` / `dac_cards`, chains and chip objects, which 0.2.360 and 0.2.450
+  both have; the `rfb_*` port methods, `adc_chains` and the raw filter setter
+  are 0.2.4xx only.
+- Read from the library, not measured: the card constructor's nested
+  `init_filter` selection means only chain 0 of each card gets its 31.75 dB
+  attenuator write while selected; `add_MCP` writes the GPIO defaults
+  mirrored (DC In power-downs written 0); the RF Out rails are shared by
+  ports 0/2 and 1/3 and `enable_rf` switches the rail before the
+  attenuators; filter and RF-ADC attenuator `rfb_*` calls clear every ADC's
+  interrupts. Full list in the note.
+- Corrections to the round-3 board server RF code: the RF Out rail pin is
+  readable (same expander as the RF In rails); the constructor does not leave
+  every attenuator at 31.75 dB; RF In `att` does not need `amp: true` (that was
+  the `rfb_*` call's limitation); a DSA whose current value is unknown is now
+  raised first, not last; readout ports follow the ADC name as the library
+  does (round 3 used `rf.adcs[name].index`; equal on a ZCU216).
+  `test_ro_map_uses_converter_index` became `test_ro_map_port_follows_the_name`,
+  `att` alone left the refusal list, the stuck-switch test uses the fake's
+  `stuck` set, and bias readbacks compare within the DAC11001 LSB.
+- Fake (`qick/rfbox_fake.py`): what it takes from measurement (DSA 0 dB
+  after a load, amplifier left on through start-up, DSA reads back integer
+  dB) and what is a model (the over-range threshold) is listed in its
+  docstring.
+- Open for the hardware people: whether the GPIO defaults write lands; whether
+  attenuator writes with the card deselected land anywhere; which RF Out
+  channels really share a rail; ID of an empty slot (0 or 15); DSA readback
+  during over-voltage; whether the AXI bias switch can be read.
+
 ## 2026-11-26: first runs of the lab images on a board; larger-memory weighted build
 
 Builds (Vivado 2024.1, same recipe as 11-25, source `main` at the tag
@@ -73,6 +174,119 @@ current mode asked for it (both images 20 mA mode, rail 2.475 V, no switch);
 the reference-clock equality check. `BOARD=ZCU216` comes from the Jupyter
 service's environment and is empty in a plain root shell: a service that
 starts QickSoc must set it.
+## 2026-11-26: board server, third round: from the engine side's client run (branch `lab/board-server`)
+
+All against the fake board; additive on the wire. 78 tests in
+`slab/tests/test_boardserver.py` (133 in `slab/tests/`) pass.
+
+- Fake fixed to match the firmware: on a weighted readout the accumulated
+  value is now the 32-bit sum of its window's weighted samples (it was
+  unweighted); `fake-w` is now tProc revision 29 with 8192 weights, `fake-w27`
+  keeps revision 27 / 1024 weights; `fake-rf` gained ADC block 23 (its DC In
+  port 7 had no converter block) and a generator on the DC Out card.
+- Readouts are mapped to ports through `rf.adcs[name].index`, as
+  `RFQickSoc216V1` does, not through the name's digits.
+- `capabilities` were only in `welcome`, so a client kept the ones of the image
+  loaded when it connected. They are now also in `image_loaded`, `config`
+  and `state`.
+- ADC flags as per-block lists, with `flags_latched_before` (read before the
+  request changes anything) and `flags_after_change`; `rf_clear_flags`.
+- Filters decoded with the library's ADMV8818 table (copied: that module needs
+  pynq); the request "as written" when the registers do not decode.
+- Per-image limits table (bias ranges, attenuation floors, DC In gain
+  ceiling) enforced on every `rf_set` (`rf_limit`).
+- DC Out: the library can power a channel up (`rfb_set_gen_dc`) but has no
+  `rfb_*` call to power it down; the server calls `DacDcChain216.disable()`.
+- Confirmed from the library: every load of an RF image writes all eight bias
+  outputs to 0 V and enables them (`BiasDAC11001.__init__`, then
+  `rfb_enable_bias`). Now stated in the reset record as data.
+
+## 2026-11-26: board server, second round: RF cards, idle_after, image changes (branch `lab/board-server`)
+
+Requested by the engine side, which wrote its own stdlib client, so every
+change only adds fields or requests. **Nothing has run on a board; the RF
+code on the real path (`rf.LibraryRfHw` over `RFQickSoc216V1`) is unverified.**
+68 tests in `slab/tests/test_boardserver.py` (123 in `slab/tests/`) pass on
+the lab PC, Python 3.12.
+
+- Loads carry a `load_id` (also in the log lines and `current_image`) and the
+  `previous` image; `image_mismatch` names the loaded image; `jobs_queued`
+  lists job, submitter, ref.
+- `run.idle_after: false` leaves the outputs as the program left them at a
+  normal end; errors, cancels, time limits and queue-bound stops still idle.
+- The note said queued jobs are rebuilt after a load; the code never did.
+  Fixed the other way round: a job that names no image and reaches the head of
+  the queue after an image change is not run (`image_changed`), and a
+  `run.image` load cancels such queued jobs and lists them. Clients should
+  always send `run.image`.
+- Checked the client's decimated result against the library: the test runs
+  `acquire_decimated` itself on a FakeSoc and compares arrays for the three
+  documented shapes. It matched without code changes.
+- RF cards. Read from the library: the PE43705 attenuators are write-only (the
+  server reports what it last wrote and who wrote it); amplifier switches, DC
+  In gain, filter registers and bias setpoints read back. The RF-ADC step
+  attenuator and the ADC over-range/over-voltage flags are not in the `rfb_*`
+  methods; I added them as the engine side asked (they measured on a ZCU216
+  with RF cards that the RF-ADC attenuator is 0 dB after a load and the ADC is
+  over range with the RF In amplifier on and nothing playing). Their approach
+  (`qubit-measurement` `board_side/qick_rf.py`) is credited in `rf.py`.
+- `rf_set` orders the settings itself: attenuation raised and amplifiers off
+  first, then filters, then attenuation lowered and amplifiers on, the RF-ADC
+  attenuator lowered last, then bias, then the idle flag check. This differs
+  from the engine side's fixed order (RF-ADC attenuator first) only when the
+  attenuator is lowered; after this server's safe state it starts at 27 dB, so
+  lowering it to the working value is a gain increase and now comes last.
+- Around every load (on by default, `--no-rf-safe-on-load` turns it off): all
+  readout amplifiers off and read back before reprogramming (refused with
+  `rf_safe_failed` otherwise), and after the load every RF-ADC attenuator to 27
+  dB or the image's safe-state file value, amplifiers off unless the file says
+  otherwise, flags cleared and read. Everything read back is in
+  `reset.rf`. On the fake (amplifier state survives a load, RF-ADC attenuator
+  back to 0) the over-range flag is set after a load without the procedure and
+  never with it.
+- Found while reading `rfboard.py`/`hardware.py` (not measured):
+  `SwitchControl.add_MCP` writes output i's default on pin 3-i while `set_bits`
+  uses pin i. For the DC In card the "powered down" default therefore does not
+  reach PD0/PD1. Within the window inside `RFQickSoc216V1.__init__` between the
+  bitstream download and `_rfb_config`, an amplifier left on by the previous
+  image is on while the RF-ADC attenuator is at 0 dB. Both are in the install
+  note's measurement list.
+- Weights: a fake image with a weighted buffer; a `weights=` array survives
+  dump_prog -> server -> `load_weights` bit for bit, and the fake's decimated
+  data equals `model.weighted()` of the trace.
+
+## 2026-11-26: board server version 1, against a fake board only (branch `lab/board-server`)
+
+Implemented the server sketched in `slab/notes/board-server-protocol.md`
+(now rewritten to match what was built), plus the image store and
+`load_image` that the sketch had reserved. **Nothing has run on a board.**
+51 tests in `slab/tests/test_boardserver.py` (106 in `slab/tests/` with the
+older ones) pass with Python 3.12 on the lab PC; the board-side modules are
+only syntax-checked for 3.8 (`ast` `feature_version`), no 3.8 interpreter was
+run.
+
+- The fake replaces only the QickSoc/pynq layer (`FakeSoc`): the server, the
+  drain, the job store and the real backend's run sequence are the code under
+  test. Its ring buffers really get overwritten when the drain lags, so the
+  overrun tests check delivered data, not just flags.
+- Bug found by that fake in my first drain: when the program finished during a
+  transfer, the after-transfer check was skipped and one overwritten shot was
+  delivered as data. Fixed (the check now always runs, with the counter capped
+  at the last shot); the test that found it checks every shot is delivered
+  correctly or reported lost, exactly once.
+- `DataStreamer` now uses the same drain loop. Behaviour change for
+  `acquire()` users: it also raises when the ring was lapped during a transfer
+  (before, that data was returned silently), and it uses each readout's own
+  ring length. Checked only on the fake.
+- Choices that differ from the sketch: threads rather than asyncio; `ack` has
+  no reply; any `run` client may cancel any job (logged); a `read` token only
+  authenticates for role `read`; `fetch` takes `from_event` as well as
+  `from_seq`; events carry `eseq`; `dropped` entries say whether the chunk had
+  already been sent; `run.reduce` is still reserved; tokens are not stored
+  hashed (an HMAC challenge needs the key).
+- Not measured (list in `slab/notes/board-server-install.md`): the real
+  backend at all, DAC outputs during `load_image`, load duration, drain rate
+  against shot rate, idle outputs, memory over a long run.
 
 ## 2026-11-26: weighted readout buffer simulated against a numpy model (branch `lab/weighted-buffer-sim`)
 

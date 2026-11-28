@@ -790,6 +790,92 @@ class Axis_QICK_Proc(SocIP):
         self.load_mem('pmem', self.binprog['pmem'])
         if load_mem: self.reload_mem()
 
+    # --- the register dumps below as data (lab fork; used by the board server) ---
+
+    def get_axi_regs(self):
+        """AXI register values as a dict {name: int} (what print_axi_regs shows).
+        Reading is side-effect free except that read_sel is whatever it was."""
+        return {xreg: int(getattr(self, xreg)) for xreg in self.REGISTERS}
+
+    def get_status(self):
+        """TPROC_STATUS decoded as in print_status, as a dict (bits as '0'/'1' strings
+        and the core/time state names), plus the raw register value."""
+        core_st = ['C_RST_STOP', 'C_RST_STOP_WAIT', 'C_RST_RUN', 'C_RST_RUN_WAIT', 'C_STOP', 'C_RUN', 'C_STEP', 'C_END_STEP']
+        time_st = ['T_RST_STOP', 'T_RST_RUN', 'T_UPDT', 'T_INIT', 'T_RUN', 'T_STOP', 'T_STEP']
+        num = int(self.tproc_status)
+        b = '{:032b}'.format(num)
+        c_st = int(b[29:32], 2)
+        t_st = int(b[25:28], 2)
+        return {
+            'raw': num,
+            'core_state': core_st[c_st],
+            'core_en': b[28],
+            'time_state': time_st[t_st] if t_st < len(time_st) else 'unknown(%d)' % t_st,
+            'time_en': b[24],
+            'core_src_dt': b[22:24],
+            'core_src_flag': b[19:22],
+            'c0_flag': b[12],
+            'internal_flag': b[18],
+            'axi_flag': b[17],
+            'external_flag': b[16],
+            'qnet_flag': b[15],
+            'qcom_flag': b[14],
+            'qp1_flag': b[13],
+            'port_dt_new': b[11],
+            'div_dt_new': b[10],
+            'qnet_dt_new': b[9],
+            'qcom_dt_new': b[8],
+            'qp1_dt_new': b[7],
+            'qp2_dt_new': b[6],
+            'div_rdy': b[5],
+            'arith_rdy': b[4],
+            'qnet_rdy': b[3],
+            'qcom_rdy': b[2],
+            'qp1_rdy': b[1],
+            'qp2_rdy': b[0],
+        }
+
+    def get_debug(self):
+        """The values print_debug shows, as a dict. Like print_debug this writes
+        read_sel (and leaves it at 3), so do not call it while another thread reads
+        the shot counter (get_tproc_counter sets read_sel=1 before each read)."""
+        out = {}
+        for sel, name in [(3, 'div'), (4, 'arith'), (5, 'qnet'), (6, 'qcom'),
+                          (7, 'qpa'), (8, 'qpb'), (9, 'in_port'), (10, 'rand')]:
+            self.read_sel = sel
+            out[name] = [int(self.axi_r_dt1), int(self.axi_r_dt2)]
+        self.read_sel = 0
+        num = int(self.tproc_debug)
+        b = '{:032b}'.format(num)
+        out['fifo'] = {
+            'raw': num,
+            'all_tfifo_empty': b[31], 'all_dfifo_empty': b[30], 'all_wfifo_empty': b[29],
+            'all_fifo_empty': b[28], 'all_tfifo_full': b[27], 'all_dfifo_full': b[26],
+            'all_wfifo_full': b[25], 'all_fifo_full': b[24], 'some_tfifo_full': b[23],
+            'some_dfifo_full': b[22], 'some_wfifo_full': b[21], 'some_fifo_full': b[20],
+            'dfifo0_time': int(b[4:20], 2), 'dfifo0_dt': int(b[0:4], 2),
+        }
+        self.read_sel = 1
+        num = int(self.tproc_debug)
+        b = '{:032b}'.format(num)
+        # same bit slices as print_debug
+        out['memory'] = {
+            'raw': num,
+            'ext_mem_w_dt_o': int(b[24:31], 2), 'ext_mem_addr': int(b[16:24], 2),
+            'aw_exec': b[15], 'ar_exec': b[14], 'mem_sel': b[12:14], 'mem_source': b[11],
+            'core_sel': b[9:11], 'mem_op': b[8],
+        }
+        self.read_sel = 2
+        out['time'] = {'time_reft': int(self.tproc_debug), 'time_usr': int(self.time_usr)}
+        self.read_sel = 3
+        num = int(self.tproc_debug)
+        b = '{:032b}'.format(num)
+        out['port'] = {
+            'raw': num, 'in_port_dt_r0': int(b[8:32], 2), 'port_dt_new': b[5:8],
+            'tport0': b[4], 'dport0': b[0:4],
+        }
+        return out
+
     def print_axi_regs(self):
         print('---------------------------------------------')
         print('--- AXI Registers')
