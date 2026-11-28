@@ -881,7 +881,7 @@ BOARD_SIDE = ['qick_lib/qick/boardserver/protocol.py', 'qick_lib/qick/boardserve
               'qick_lib/qick/boardserver/jobs.py', 'qick_lib/qick/boardserver/images.py',
               'qick_lib/qick/boardserver/backend.py', 'qick_lib/qick/boardserver/__main__.py',
               'qick_lib/qick/boardserver/__init__.py', 'qick_lib/qick/boardserver/client.py',
-              'qick_lib/qick/boardserver/rf.py',
+              'qick_lib/qick/boardserver/rf.py', 'qick_lib/qick/rfbox.py', 'qick_lib/qick/rfbox_fake.py',
               'qick_lib/qick/streamer.py', 'qick_lib/qick/drivers/tproc.py', 'qick_lib/qick/helpers.py']
 
 
@@ -916,7 +916,8 @@ def test_board_side_imports_only_stdlib_and_numpy():
             else:
                 continue
             for n in names:
-                if n in allowed_third_party or n in sys.stdlib_module_names or n == 'qick':
+                # rfbox_fake falls back to a plain `import rfbox` when copied next to rfbox.py
+                if n in allowed_third_party or n in sys.stdlib_module_names or n in ('qick', 'rfbox'):
                     continue
                 # pynq (tproc.py through qick.ip) and xrfdc (rf.py, the ADC flags) come with the
                 # board's PYNQ image; QickSoc itself needs both
@@ -1171,7 +1172,7 @@ def test_rf_set_safe_order_and_readback(board_factory):
     assert rf['adc_ports']['4']['att'] == {'value': 10.0, 'by': 'rf_set'}
     assert rf['dac_ports']['0']['att'] == {'value': [6.0, 8.0], 'by': 'rf_set'}
     assert rf['adc_ports']['4']['filter'] != {'WR0_SW': 0xC0, 'WR0_FILTER': 0}
-    assert rf['bias']['3'] == 0.5
+    assert rf['bias']['3'] == pytest.approx(0.5, abs=2e-5)       # DAC11001 LSB 19 uV
     # lowering the RF-ADC attenuator with the amplifier on comes after everything else
     rec = c.rf_set([{'ro': 0, 'adc_att': 15}, {'gen': 0, 'att': [10, 10]}, {'ro': 0, 'amp': True, 'att': 12}],
                    settle_s=0)
@@ -1208,7 +1209,7 @@ def test_rf_set_refusals(board_factory):
     c = b.client('eng')
     hw = b.backend.rf_hardware
     before = list(hw.calls)
-    bad = [([{'ro': 0, 'att': 10}], 'bad_request'),                  # att without amp
+    bad = [([{'ro': 0, 'att': 10, 'gain': 3}], 'bad_request'),       # RF In att and DC In gain together
            ([{'ro': 0, 'amp': True, 'att': 10.1}], 'bad_request'),     # not a 0.25 dB step
            ([{'ro': 0, 'adc_att': 28}], 'bad_request'),
            ([{'gen': 0, 'att': 5}], 'bad_request'),
@@ -1300,9 +1301,7 @@ def test_rf_safe_failed_refuses_load(board_factory):
     _amp_on(c)
     hw = b.backend.rf_hardware
     loads = hw.pl_loads
-    stuck = b.backend.rf.hw
-    real_off = stuck.adc_off
-    stuck.adc_off = lambda port: None if port == 4 else real_off(port)    # the switch does not respond
+    hw.stuck.add(('adc', 2))                  # the RF In card's GPIO expander does not respond
     with pytest.raises(BoardError) as e:
         c.load_image('fake-b')
     assert e.value.code == 'rf_safe_failed'
@@ -1375,12 +1374,15 @@ def test_weighted_accumulated_is_sum_of_window(board, image, revision, nwgt):
     assert np.array_equal(acc, want)
 
 
-def test_ro_map_uses_converter_index():
+def test_ro_map_port_follows_the_name():
+    # the port follows the ADC's name, as RFQickSoc216V1 links readouts to cards (rfboard.py
+    # _rfb_config, from readout['adc']); the converter index is kept for the xrfdc calls.
+    # (Round 3 had the index win; on a ZCU216 they are equal, see slab/notes/rfbox-driver.md.)
     from qick.boardserver import rf as RF
     cfg = json.loads(fake_image_files('fake-rf')[1])['fake_soccfg']
-    cfg['rf']['adcs']['20']['index'] = [2, 1]          # name and index disagree: the index wins
+    cfg['rf']['adcs']['20']['index'] = [2, 1]
     m = RF.RfFrontEnd(RF.MapOnly(cfg), cfg).ro_map()
-    assert (m[0]['tile'], m[0]['block'], m[0]['port']) == (2, 1, 5)
+    assert (m[0]['tile'], m[0]['block'], m[0]['port'], m[0]['index']) == (2, 0, 4, [2, 1])
 
 
 def test_capabilities_follow_the_image(board):
@@ -1485,7 +1487,7 @@ def test_rf_load_forces_bias_zero(board_factory):
     b = rf_board(board_factory)
     c = b.client('eng')
     c.rf_set([{'bias': 3, 'volts': 0.5}], settle_s=0)
-    assert c.rf_get()['bias']['3'] == 0.5
+    assert c.rf_get()['bias']['3'] == pytest.approx(0.5, abs=2e-5)
     rf = c.load_image('fake-rf')['reset']['rf']
     assert rf['constructor']['forced']['bias_volts'] == [0.0] * 8
     assert rf['found_after_load']['bias']['3'] == 0.0

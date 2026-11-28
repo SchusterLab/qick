@@ -113,9 +113,12 @@ class QickSocBackend:
         return _TracedQickSoc(bitfile=bitfile, download=download, **self.soc_kwargs)
 
     def _make_rf(self, soc):
-        from .rf import RfFrontEnd, LibraryRfHw
-        if LibraryRfHw.present(soc):
-            return RfFrontEnd(LibraryRfHw(soc), soc.get_cfg())
+        # the RF cards through qick.rfbox, the same driver the stock Pyro server can use (one per soc object:
+        # a new soc after a load is a new driver identity)
+        from .rf import RfFrontEnd
+        from .. import rfbox
+        if isinstance(getattr(soc, '__dict__', {}).get('adc_cards'), list):
+            return RfFrontEnd(rfbox.attach(soc))
         return None
 
     @property
@@ -194,7 +197,7 @@ class QickSocBackend:
         }
 
     def _constructor_note(self):
-        from .rf import LIBRARY_CONSTRUCTOR
+        from ..rfbox import LIBRARY_CONSTRUCTOR
         return dict(LIBRARY_CONSTRUCTOR)
 
     def attach(self, bit_path, hwh_path):
@@ -677,226 +680,10 @@ def fake_weighted(x, w):
     return np.stack([yI, yQ], axis=-1).astype(np.int16)
 
 
-class FakeRfHardware:
-    """The RF daughter cards of a fake QICK box, as physical state that survives
-    image loads (owned by the FakeBackend, not by a FakeSoc).
-
-    It models the bad case the engine side asked to design for: across a PL load
-    the card GPIO keeps the amplifier state while every RF-ADC step attenuator
-    returns to 0 dB. An RF In amplifier that is on while its ADC's attenuator is
-    below `threshold_db` latches the over-range flag; with the attenuator at 0 dB
-    and the card attenuator at 0 dB also over-voltage. Each new latch is appended to
-    `events` (what, when), so a test can tell whether the ADC was ever overdriven.
-    """
-
-    def __init__(self, threshold_db=10.0):
-        self.threshold_db = float(threshold_db)
-        self.layout = {'adc': [None] * 4, 'dac': [None] * 4}
-        self.amp = {}          # adc port -> bool (RF In: amplifier supply; DC In: powered up)
-        self.adc_att = {}      # adc port -> dB (write-only on the real part)
-        self.gain = {}         # adc port -> dB (DC In)
-        self.dac_att = {}      # dac port -> [a1, a2]
-        self.dac_dc = {}       # dac port -> powered (DC Out)
-        self.filters = {}      # (side, port) -> {'WR0_SW', 'WR0_FILTER'}
-        self.bias = [0.0] * 8
-        self.dsa = {}          # ADC block name -> dB
-        self.latched = {}      # ADC block name -> interrupt word
-        self.events = []
-        self.pl_loads = 0
-        self.calls = []
-
-    def configure(self, layout, blocks):
-        self.layout = layout
-        for side in ('adc', 'dac'):
-            for card in layout[side]:
-                if not card:
-                    continue
-                for p in card['ports']:
-                    if side == 'adc':
-                        self.amp.setdefault(p, False)
-                        if card['kind'] == 'rf_in':
-                            self.adc_att.setdefault(p, ATT_MAX_FAKE)
-                        if card['kind'] == 'dc_in':
-                            self.gain.setdefault(p, -6.0)
-                    elif card['kind'] == 'rf_out':
-                        self.dac_att.setdefault(p, [ATT_MAX_FAKE, ATT_MAX_FAKE])
-                    elif card['kind'] == 'dc_out':
-                        self.dac_dc.setdefault(p, True)
-                    self.filters.setdefault((side, p), {'WR0_SW': 0xC0, 'WR0_FILTER': 0})
-        for b in blocks:
-            self.dsa.setdefault(b, 0.0)
-            self.latched.setdefault(b, 0)
-
-    def kind(self, side, port):
-        n = 2 if side == 'adc' else 4
-        card = self.layout[side][port // n] if port // n < len(self.layout[side]) else None
-        return card['kind'] if card else None
-
-    def condition(self, block):
-        from .rf import adc_port_of_block, OVR_RANGE, OVR_VOLTAGE
-        p = adc_port_of_block(block)
-        if p is None or not self.amp.get(p) or self.kind('adc', p) != 'rf_in':
-            return 0
-        w = 0
-        if self.dsa.get(block, 0.0) < self.threshold_db:
-            w |= OVR_RANGE
-            if self.dsa.get(block, 0.0) == 0 and self.adc_att.get(p, 0) == 0:
-                w |= OVR_VOLTAGE
-        return w
-
-    def update(self, why):
-        for b in self.dsa:
-            w = self.condition(b)
-            if w & ~self.latched[b]:
-                self.events.append({'block': b, 'word': w, 'why': why, 't': time.monotonic()})
-            self.latched[b] |= w
-
-    def pl_load(self):
-        """A bitstream download: the converter restarts with every step attenuator at
-        0 dB; the cards are not touched (amplifier state persists)."""
-        self.pl_loads += 1
-        for b in self.dsa:
-            self.dsa[b] = 0.0
-        self.update('PL load %d' % self.pl_loads)
-
-    def constructor(self, amps_off=False):
-        """What the fake soc constructor does: like RFQickSoc216V1 it writes the
-        attenuators 31.75 dB, DC In gain -6 dB and the bias outputs 0 V and clears the
-        flags; unlike the library it leaves the amplifier switches alone unless
-        amps_off (the bad case)."""
-        for p in self.adc_att:
-            self.adc_att[p] = ATT_MAX_FAKE
-        for p in self.dac_att:
-            self.dac_att[p] = [ATT_MAX_FAKE, ATT_MAX_FAKE]
-        for p in self.gain:
-            self.gain[p] = -6.0
-        self.bias = [0.0] * 8
-        for p in self.dac_dc:
-            self.dac_dc[p] = True
-        if amps_off:
-            for p in self.amp:
-                self.amp[p] = False
-        for b in self.latched:
-            self.latched[b] = 0
-        self.update('constructor')
-
-    def flags(self, block, clear):
-        self.update('flags read')
-        w = self.latched.get(block, 0)
-        if clear:
-            self.latched[block] = 0
-        return w
-
-
-ATT_MAX_FAKE = 31.75
-
-
-class FakeRfHw:
-    """rf.RfFrontEnd adapter over FakeRfHardware (the counterpart of rf.LibraryRfHw)."""
-
-    def __init__(self, hw, soc):
-        self.hw = hw
-        self.soc = soc
-
-    def layout(self):
-        return json.loads(json.dumps(self.hw.layout))
-
-    def adc_blocks(self):
-        return [(n, int(c['index'][0]), int(c['index'][1])) for n, c in sorted(self.soc['rf']['adcs'].items())]
-
-    def constructor_written(self):
-        return {'dac': {p: [ATT_MAX_FAKE, ATT_MAX_FAKE] for p in self.hw.dac_att},
-                'adc': {p: ATT_MAX_FAKE for p in self.hw.adc_att}}
-
-    def _need(self, side, port, kinds):
-        k = self.hw.kind(side, port)
-        if k not in kinds:
-            raise RuntimeError('%s port %d does not have a %s signal chain' % (side.upper(), port, '/'.join(kinds)))
-
-    def dsa_set(self, name, att):
-        self.hw.calls.append(('dsa_set', name, att))
-        self.hw.dsa[name] = float(np.round(att))
-        self.hw.update('dsa_set')
-        return self.hw.dsa[name]
-
-    def dsa_get(self, name):
-        return self.hw.dsa[name]
-
-    def flags(self, tile, block, clear):
-        return self.hw.flags('%d%d' % (tile, block), clear)
-
-    def adc_rf_on(self, port, att):
-        self._need('adc', port, ('rf_in',))
-        self.hw.calls.append(('adc_rf_on', port, att))
-        self.hw.amp[port] = True
-        self.hw.adc_att[port] = float(np.round(att / 0.25) * 0.25)
-        self.hw.update('adc_rf_on')
-        return self.hw.adc_att[port]
-
-    def adc_dc_on(self, port, gain):
-        self._need('adc', port, ('dc_in',))
-        self.hw.calls.append(('adc_dc_on', port, gain))
-        self.hw.amp[port] = True
-        self.hw.gain[port] = float(round(gain))
-        self.hw.update('adc_dc_on')
-        return self.hw.gain[port]
-
-    def adc_off(self, port):
-        self._need('adc', port, ('rf_in', 'dc_in'))
-        self.hw.calls.append(('adc_off', port))
-        self.hw.amp[port] = False
-        if self.hw.kind('adc', port) == 'rf_in':
-            self.hw.adc_att[port] = ATT_MAX_FAKE
-        self.hw.update('adc_off')
-
-    def adc_amp_read(self, port):
-        if self.hw.kind('adc', port) not in ('rf_in', 'dc_in'):
-            return None
-        return bool(self.hw.amp.get(port))
-
-    def adc_gain_read(self, port):
-        return self.hw.gain.get(port)
-
-    def dac_rf(self, port, a1, a2):
-        self._need('dac', port, ('rf_out',))
-        self.hw.calls.append(('dac_rf', port, a1, a2))
-        self.hw.dac_att[port] = [float(np.round(a1 / 0.25) * 0.25), float(np.round(a2 / 0.25) * 0.25)]
-        return tuple(self.hw.dac_att[port])
-
-    def dac_dc(self, port, on):
-        self._need('dac', port, ('dc_out',))
-        self.hw.calls.append(('dac_dc', port, on))
-        self.hw.dac_dc[port] = bool(on)
-
-    def dac_dc_read(self, port):
-        return self.hw.dac_dc.get(port) if self.hw.kind('dac', port) == 'dc_out' else None
-
-    def filter_set(self, side, port, f):
-        from .rf import filter_steps_for
-        self._need(side, port, ('rf_in',) if side == 'adc' else ('rf_out',))
-        self.hw.calls.append(('filter', side, port, dict(f)))
-        # the steps the library's set_filter computes (its ADMV8818 table)
-        hpf, lpf = filter_steps_for(f)
-        hb, hs = (0, 0) if hpf < 0 else (1 + hpf // 16, hpf % 16)
-        lb, ls = (0, 0) if lpf < 0 else (1 + lpf // 16, lpf % 16)
-        self.hw.filters[(side, port)] = {'WR0_SW': 0xC0 + (hb << 3) + lb, 'WR0_FILTER': (hs << 4) + ls}
-
-    def filter_read(self, side, port):
-        return dict(self.hw.filters[(side, port)])
-
-    def bias_set(self, i, v):
-        self.hw.calls.append(('bias', i, v))
-        self.hw.bias[i] = float(v)
-        return float(v)
-
-    def bias_get(self, i):
-        return self.hw.bias[i]
-
-
 def fake_soc_factory_from_hwh(inject=None, rf_hardware=None):
     """Factory for FakeBackend: a fake image's .hwh file is the soccfg as JSON.
-    An image with 'fake_rf' {'layout', 'constructor_amps_off'} has RF cards, which
-    live in rf_hardware (shared across loads)."""
+    An image with 'fake_rf' {'layout'} has RF cards: rf_hardware (a qick.rfbox_fake.FakeQickBox,
+    shared across loads) gives the FakeSoc the RFQickSoc216V1 attributes, as its constructor would."""
     def factory(bitfile, download):
         hwh = os.path.splitext(bitfile)[0] + '.hwh'
         with open(hwh) as f:
@@ -918,16 +705,8 @@ def fake_soc_factory_from_hwh(inject=None, rf_hardware=None):
         if delay:
             time.sleep(delay)
         if frf and rf_hardware is not None:
-            rf_hardware.constructor(amps_off=bool(frf.get('constructor_amps_off', False)))
+            rf_hardware.make_soc(cfg=soc.get_cfg(), target=soc, download=False)
             soc.fake_rf = rf_hardware
-            soc['extra_description'].append("\nQICK box daughter cards detected:")
-            for side, label in (('adc', 'ADC'), ('dac', 'DAC')):
-                for slot, card in enumerate(frf['layout'][side]):
-                    if card is None:
-                        soc['extra_description'].append("\t%s slot %d: No card detected" % (label, slot))
-                    else:
-                        soc['extra_description'].append("\t%s slot %d: %s card has ports %s"
-                                                        % (label, slot, card['name'], card['ports']))
         return soc
     return factory
 
@@ -936,27 +715,28 @@ class FakeBackend(QickSocBackend):
     """QickSocBackend over FakeSoc. Fake images: the .hwh is JSON with 'fake_soccfg'
     (and optionally 'fake_clocks_reprogrammed', 'fake_load_delay_s', 'fake_rf'); the
     .bit is any bytes. Per-job injections come from run['fake']. The fake RF cards
-    (FakeRfHardware) are self.rf_hardware and keep their state across loads."""
+    (qick.rfbox_fake.FakeQickBox) are self.rf_hardware and keep their state across loads."""
     is_fake = True
 
     def __init__(self, inject=None, poll_interval=0.0002, rf_threshold_db=10.0):
-        self.rf_hardware = FakeRfHardware(threshold_db=rf_threshold_db)
+        from ..rfbox_fake import FakeQickBox
+        self.rf_hardware = FakeQickBox(layout=FAKE_RF_LAYOUT, threshold_db=rf_threshold_db)
         super().__init__(soc_factory=fake_soc_factory_from_hwh(inject, self.rf_hardware), poll_interval=poll_interval)
 
     def _make_rf(self, soc):
         from .rf import RfFrontEnd
+        from .. import rfbox
         if soc.fake_rf is None:
             return None
-        return RfFrontEnd(FakeRfHw(soc.fake_rf, soc), soc.get_cfg())
+        return RfFrontEnd(rfbox.attach(soc))
 
     def _constructor_note(self):
-        return {'source': 'fake board: FakeRfHardware.constructor (attenuators 31.75 dB, DC In gain -6 dB, bias 0 V, '
-                          'flags cleared; amplifier switches left as they were unless the image sets '
-                          'constructor_amps_off). The library constructor is described in rf.LIBRARY_CONSTRUCTOR.',
-                'forced': {'bias_volts': [0.0] * 8, 'bias_enabled': True, 'rf_out_att_db': [31.75, 31.75],
-                           'rf_in_att_db': 31.75, 'dc_out_powered': True, 'dc_in_gain_db': -6,
-                           'rf_in_amp_on': 'not forced (the bad case: left as it was)',
-                           'filters': 'not forced', 'rf_adc_att_db': 'not forced (0 after the PL load)'}}
+        from ..rfbox import LIBRARY_CONSTRUCTOR
+        note = dict(LIBRARY_CONSTRUCTOR)
+        note['fake'] = ('fake board (qick.rfbox_fake): the constructor sequence above over fake chips; the GPIO '
+                        'defaults write does not land (amplifier state kept across loads, as measured on an rfbv2 '
+                        'box) and the attenuator writes made with the card deselected are lost')
+        return note
 
     def run(self, prog, run, stop_event, deadline=None):
         self.soc.fake_set_inject(run.get('fake'))
