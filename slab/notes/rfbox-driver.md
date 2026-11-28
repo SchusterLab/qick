@@ -308,9 +308,11 @@ code, so their results can differ from rfbox's for the same fc / bw:
   request between 2 and 18 GHz**, because `FilterADMV8818._freq2step` matches
   the table's `bypass` entry first. 0.2.431 and 0.2.449+ are not affected, and
   raw-step calls (`set_filter_raw`, `rfb_set_*_filter_raw`) are unaffected.
-  This fault was found and checked on the released PyPI packages by the
-  measurement side; this repository's history does not contain those
-  versions. A box on such a version that drives its filters through the
+  Found on a real box (filter registers left at bypass after a library
+  band-pass call) and traced in the released PyPI packages, each version
+  downloaded and its `rfboard.py` read: 0.2.431 fine, 0.2.432 first faulty,
+  0.2.447 last faulty, 0.2.449 fine. The fault is in upstream's history too
+  (`main` of this fork contains the 0.2.436 commit). A box on such a version that drives its filters through the
   library's frequency calls has every filter in bypass, which matches the
   users' "filters did not act". rfbox is unaffected because it writes the
   registers.

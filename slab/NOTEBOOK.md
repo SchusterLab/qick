@@ -31,11 +31,12 @@ both files parse with the 3.8 grammar.
   covers both. A filter that reads back registers that do not decode gives
   `value: null` (the client's `filter_read: None`); that is the chip not
   answering, not a missing block.
-- Recorded from the measurement side: qick 0.2.432-0.2.447 write bypass for
-  every frequency-form filter request (`_freq2step` matches `bypass` first).
-  Their box runs 0.2.436, which accounts for "the filters did not act" through
-  the library. Not checked here: this repository's history does not contain
-  those releases.
+- qick 0.2.432-0.2.447 write bypass for every frequency-form filter request
+  (`_freq2step` matches the table's `bypass` entry first). The measurement side
+  saw the registers stay at bypass on a box running 0.2.436; I then checked the
+  released PyPI packages one by one (0.2.431 fine, 0.2.432 first faulty, 0.2.447
+  last faulty, 0.2.449 fine). The 0.2.436 version commit is in this fork's
+  history (87045790).
 
 ## 2026-11-27: rfbox 0.2, from the measurement side's integration against `slab-rfbox-0.1` (branch `lab/rf-driver`)
 
