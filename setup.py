@@ -19,6 +19,10 @@ def get_version(rel_path):
     lab = here / "qick_lib/qick/LAB_VERSION"
     if lab.exists():
         version += "." + lab.read_text().strip()
+    # Schuster Lab fork: a variant branch labels itself (PEP 440 local version)
+    variant = here / "qick_lib/qick/LAB_VARIANT"
+    if variant.exists() and variant.read_text().strip():
+        version += "+" + variant.read_text().strip()
     return version
 
 # Get the long description from the README file
@@ -182,7 +186,7 @@ setup(
     # If there are data files included in your packages that need to be
     # installed, specify them here.
     package_data={  # Optional
-        'qick': ['*.bit', '*.hwh', 'VERSION', 'LAB_VERSION', 'LAB_RELEASE.md', 'lab_firmware.json',
+        'qick': ['*.bit', '*.hwh', 'VERSION', 'LAB_VERSION', 'LAB_VARIANT', 'LAB_RELEASE.md', 'lab_firmware.json',
                  'ipq_pynq_utils/ipq_pynq_utils/data/*.json',
                  'ipq_pynq_utils/ipq_pynq_utils/data/*.txt',
                  'ipq_pynq_utils/ipq_pynq_utils/data/*.h',

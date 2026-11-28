@@ -20,6 +20,13 @@ def get_version():
     if os.path.exists(labpath):
         with open(labpath) as lab_file:
             version += '.' + lab_file.read().strip()
+    # Schuster Lab fork: a variant branch labels itself (PEP 440 local version, e.g. 0.2.450.1+weighted)
+    variantpath = os.path.join(os.path.dirname(__file__), 'LAB_VARIANT')
+    if os.path.exists(variantpath):
+        with open(variantpath) as variant_file:
+            variant = variant_file.read().strip()
+        if variant:
+            version += '+' + variant
     return version
 
 __version__ = get_version()
