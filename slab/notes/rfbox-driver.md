@@ -479,6 +479,24 @@ and the setup and its calibration are theirs.
   - the low-pass section costs 3-6 dB in band on both cards;
   - the setting now used is high-pass only, fc 5.9 GHz on both cards, which
     reads back 5.97 GHz (step 26).
+- **RF In high-pass and ADC aliasing (same box, readout at 6.9 GHz):**
+  - the RF-ADC samples at 2457.6 MS/s, so a 6.9-7.0 GHz readout sits in
+    Nyquist zone 6. Noise at 2 fs + f_dig (about 5.3 GHz) lands on the same
+    digital frequency as the tone, and no digital filter can remove it;
+  - with the RF In high-pass at 5.97 GHz (step 26), a 5338.0 MHz tone arrived
+    15 dB above an in-band 6900 MHz tone: the high-pass rejected it by only
+    8.6 dB relative to bypass. The 3 fs + f_dig partner (7795.6 MHz) arrived
+    21 dB below in-band. Most of the idle noise was this alias;
+  - raising the high-pass corner improved tone/noise at 6900 MHz by +3.0 dB
+    at 6.22 GHz, +5.4 at 6.48 and +8.4 at 6.60; 6.74 gave only +5.9. The
+    band-pass 6.6-7.25 was about 0.3 dB below the 6.60 high-pass. With the
+    6.60 high-pass the noise referred to the feedline was about 7-10 K,
+    matching the cold amplifier's expectation;
+  - rule: for a readout in a high Nyquist zone, list the alias partners
+    (k fs +- f_dig) and put the RF In high-pass corner within about 0.4 GHz
+    below the readout band, so the 2 fs + f_dig partner is rejected.
+    Bypassing the RF Out filter does not matter for this; the noise comes
+    in through the fridge input.
 
 ## Loopback checklist (hardware)
 
