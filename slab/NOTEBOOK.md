@@ -3,6 +3,31 @@
 Running log for the lab fork. Newest entry first. Record dead ends as well as
 results, and say where each number came from.
 
+## 2026-11-28: clock-plan study for a future ZCU216 firmware
+
+- Question (Dave): which clocks make the generator, readout and tProc
+  domains integer or small-rational multiples, with several plans selectable
+  from software to move the bad frequencies.
+- Result: one family from the stock 245.76 MHz reference, changing only the
+  tile PLL feedback divider N:
+  - B = 7.68 N MHz; DAC 32 B, ADC 8 B, G 2 B, R = I = B;
+  - tProc T = 1.5 B, C = B/2;
+  - primary N = 39 (DAC unchanged, ADC 2396.16 MS/s, T 449.28 MHz), alternates
+    N = 37 and 38;
+  - common period 3 tProc cycles instead of 28.
+- Note and tables: [notes/clock-plan.md](notes/clock-plan.md). Script:
+  `slab/tools/clock_plan.py` (stdlib + numpy).
+- Datasheet values: DS926, PG269, UG1437, TI datasheets and the embeddedsw
+  `rfdc` driver, fetched from the web. The DS926 URAM table rendered badly:
+  check its column mapping against the PDF.
+- Found while reading:
+  - The `clk_core` MMCM is fed by DAC tile 2 and reset only by `pl_resetn0`.
+  - So `configure_sample_rates()` on DAC tile 2 may leave the tProc core in
+    reset (untested).
+  - The full-speed generator clock (WNS +3 ps), not the tProc, limits timing
+    in the 2026-11-27 build.
+- Not done: any build or measurement.
+
 ## 2026-11-28: lab version numbers and release notes in the package
 
 At Dave's request, lab releases are numbered `<upstream>.<lab>`: the first is
