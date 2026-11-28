@@ -3,6 +3,32 @@
 Running log for the lab fork. Newest entry first. Record dead ends as well as
 results, and say where each number came from.
 
+## 2026-11-28: QICK box detection, one class for both boxes and eval boards (branch `lab/box-detect`)
+
+Dave's decision: one ZCU216 firmware (the QICK-box, RF board v2 variant) on boxes and bare eval boards, and one
+library class that detects the box and its cards. Design, evidence and a board checklist:
+[notes/box-detection.md](notes/box-detection.md). Not run on a board; 52 off-board tests in
+`slab/tests/test_box_detect.py` against a new bus-level fake (`FakeRfBoardHW`), with the library's own card and
+chip drivers running over it under a pynq stand-in.
+
+- Entry point: `QickSoc.__new__` returns `qick.qickbox.QickBoxSoc` when the `.hwh` has the RF-board control IPs,
+  so users keep writing `QickSoc(...)`. In a box it is a full `RFQickSoc216V1` (plus rfbox's Pyro methods); without
+  one it behaves as `QickSoc`.
+- Presence test: the library reads one register (`GPIO >> 4`) and takes 0, which a floating line low also gives,
+  for a DC In card. The probe here reads nine MCP23S08 registers with dummy bytes 0x00 and 0xFF, requires the
+  datasheet reset pattern (IPOL, GPINTEN, INTCON 0; ID pins inputs; unimplemented IOCON bits 0), then confirms
+  with a DEFVAL write-then-read (no external effect while GPINTEN = 0) and restores it. No write to an expander
+  output, attenuator, bias DAC or bias switch happens before that; the tests check the order on the bus log.
+- Firmware gate (requested by Dave during the work; the firmware side is a parallel task): presence input read
+  first with the gate closed and trusted alone; else open the gate, probe, close again without a box; stock images
+  without a gate fall back to the probe. Names are placeholders, configurable.
+- Eval-board pins: the rfbv2 image drives all of its ADCIO/DACIO outputs from bitstream load (no tristate, a
+  2 MHz clock always running), so the probe only toggles lines already driven. UG1390 puts these pins on header
+  strips of the XM650/XM655 cards; what else connects to them was not established (pin figure not readable).
+- Found: `RFQickSoc216V1` links a readout on ADC tile 0 to the wrong card and fails on tile 3; QickBoxSoc links
+  them to no card.
+- Also: `soc['fw_identity']` on every QickSoc (optional `fw_id_gpio` word, lab build by manifest hash or ID).
+
 ## 2026-11-28: lab version numbers and release notes in the package
 
 At Dave's request, lab releases are numbered `<upstream>.<lab>`: the first is

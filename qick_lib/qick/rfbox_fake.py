@@ -741,3 +741,311 @@ class FakeQickBox(object):
                     else:
                         desc.append('\t%s slot %d: %s card has ports %s'
                                     % (label, slot, card.NAME, [c.global_ch for c in card.chains]))
+
+
+# =====================================================================================================================
+# Bus level (lab box detection): the RF-board firmware's control IPs as the library sees them (spi.send_receive_m,
+# AXI GPIO channels), with the chips answering byte by byte. Used by the qick.rfbox_detect and qick.qickbox tests.
+#
+#     hw = FakeRfBoardHW(layout=None)                       # a bare ZCU216 eval board running the RF-board image
+#     hw = FakeRfBoardHW(layout={'adc': [None, None, 'rf_in', None], 'dac': ['rf_out', None, 'dc_out', None]})
+#     hw = FakeRfBoardHW(layout=..., gate=True, presence=True, fw_id=0x5AB00001)
+#     soc = hw.make_holder()                                # ip_dict + rfb_control hierarchy + top-level IPs
+#     hw.log                                                # every SPI transaction and GPIO write, in order
+#     hw.power_writes()                                     # indices of entries that could reach power or bias
+#
+# What it models (and from where):
+#   - MCP23S08 (Microchip DS21919): opcode 0100 0 A1 A0 R/W, A1/A0 ignored while IOCON.HAEN = 0; reset values IODIR
+#     0xFF, every other register 0x00; GPIO reads the pin levels (pins 4-7: the card ID straps; outputs: OLAT);
+#     writes to GPIO land in OLAT; IOCON bits 7, 6, 0 unimplemented (read 0). The chip drives SO only during the
+#     data bytes of a read;
+#   - ADMV8818: 16-bit address with bit 15 = read; SDO driven only once ADI_SPI_CONFIG_A has SDO active (bits 4/3).
+#     Power-up value 0x00 is assumed (3-wire, so a read before the library's 0x3C write sees a floating line);
+#     PRODUCT_ID 0x8818 in 0x005/0x004;
+#   - LMH6401 (DC In gain), PE43705 (write-only), DAC11001 (main-board bias, 32-bit frames, read in the next frame);
+#   - chip selects as the firmware wires them (qick_tprocv2_216_rfbv2_standard): filter_spi's 4 SS bits are SEL0-2
+#     (chip on the card) and CSn (bit 3); brd_sel_gpio's 4 bits are the card number and an enable (bit 3);
+#   - a data line nobody drives reads `floating` ('low' 0x00, 'high' 0xFF, 'echo' = the byte the master sends at
+#     the same time, 'noise' = pseudo-random): on a bare eval board, and in a box `box_floating` (empty slot);
+#   - firmware with an output gate (gate=True): until the gate bit is set nothing reaches the board (reads see the
+#     floating line); a presence input (presence=True/False, needs no gate) reads 1 when a box is there.
+# Not modelled: timing, the 3.3 V / 1.8 V translators, what the bias switch does to the outputs.
+# =====================================================================================================================
+import random as _random
+
+_MCP_RESET = {0x00: 0xFF, 0x01: 0, 0x02: 0, 0x03: 0, 0x04: 0, 0x05: 0, 0x06: 0, 0x07: 0, 0x08: 0, 0x0A: 0}
+_DAC_CS = 4        # GpioMCP23S08 ch_en on DAC cards
+_ADC_CS = 2        # on ADC cards
+
+
+class BusMCP23S08(object):
+    def __init__(self, card_id, iodir=0xFF, broken_reads=False):
+        self.regs = dict(_MCP_RESET)
+        self.regs[0x00] = iodir
+        self.card_id = card_id
+        self.broken_reads = broken_reads      # the first DC In version: SPI reads do not come back
+
+    def _gpio(self):
+        iodir, olat = self.regs[0x00], self.regs[0x0A]
+        pins = (self.card_id & 0xF) << 4      # 4-7: ID straps; 0-3 as inputs read 0
+        v = 0
+        for b in range(8):
+            v |= (pins if iodir & (1 << b) else olat) & (1 << b)
+        return v
+
+    def read(self, reg):
+        if reg == 0x09:
+            return self._gpio()
+        if reg == 0x05:
+            return self.regs[0x05] & 0x3E
+        return self.regs.get(reg, 0)
+
+    def xfer(self, data):
+        """{byte index: driven value} for the bytes this chip drives; applies writes."""
+        if len(data) < 3 or (data[0] & 0xF8) != 0x40:
+            return {}
+        reg = data[1]
+        if data[0] & 1:
+            if self.broken_reads:
+                return {}
+            return dict((i, self.read((reg + i - 2) % 0x0B)) for i in range(2, len(data)))
+        for i in range(2, len(data)):
+            r = (reg + i - 2) % 0x0B
+            if r == 0x09:
+                r = 0x0A
+            if r in self.regs and r not in (0x07, 0x08):
+                self.regs[r] = data[i]
+        return {}
+
+
+class BusADMV8818(object):
+    def __init__(self, sdo_active=False):
+        self.regs = {0x000: 0x18 if sdo_active else 0x00, 0x001: 0, 0x003: 0x01, 0x004: 0x18, 0x005: 0x88,
+                     0x020: 0, 0x021: 0}
+
+    def xfer(self, data):
+        if len(data) < 3:
+            return {}
+        addr = ((data[0] & 0x7F) << 8) | data[1]
+        if data[0] & 0x80:
+            if not self.regs[0x000] & 0x18:
+                return {}
+            return {2: self.regs.get(addr, 0)}
+        if addr == 0x000:
+            self.regs[0x000] = data[2] & 0x7E      # soft-reset bits self-clear
+        elif addr in self.regs and addr not in (0x003, 0x004, 0x005):
+            self.regs[addr] = data[2]
+        return {}
+
+
+class BusLMH6401(object):
+    def __init__(self):
+        self.regs = {0x00: 0x03, 0x01: 0x00, 0x02: 0x20, 0x04: 0, 0x05: 0}
+
+    def xfer(self, data):
+        if len(data) < 2:
+            return {}
+        reg = data[0] & 0x7F
+        if data[0] & 0x80:
+            return {1: self.regs.get(reg, 0)}
+        if reg in self.regs and reg not in (0x00, 0x01):
+            self.regs[reg] = data[1]
+        return {}
+
+
+class BusCard(object):
+    def __init__(self, side, slot, kind, card_id=None, iodir=0xFF, broken_reads=False, admv_sdo_active=False):
+        self.side, self.slot, self.kind = side, slot, kind
+        cid = card_id if card_id is not None else ID_OF[side].get(kind, EMPTY_ID)
+        self.mcp = BusMCP23S08(cid, iodir=iodir, broken_reads=broken_reads)
+        self.chips = {(_DAC_CS if side == 'dac' else _ADC_CS): self.mcp}
+        if kind in ('rf_out', 'rf_in'):
+            for ch in range(4 if side == 'dac' else 2):
+                self.chips[ch] = BusADMV8818(sdo_active=admv_sdo_active)
+        if kind == 'dc_in':
+            for ch in range(2):
+                self.chips[ch] = BusLMH6401()
+        self.att = {}                          # PE43705 address -> step (write-only)
+
+
+class FakeBusGpioChannel(object):
+    def __init__(self, hw, ip, n, inputs=None):
+        self.hw, self.ip, self.n, self.value, self.inputs = hw, ip, n, 0, inputs
+
+    def write(self, val, mask):
+        self.value = (self.value & ~mask) | (val & mask)
+        self.hw.log.append({'op': 'gpio_write', 'ip': self.ip, 'ch': self.n, 'val': val, 'mask': mask,
+                            'value': self.value})
+
+    def read(self):
+        return self.inputs() if self.inputs is not None else self.value
+
+
+class FakeBusGpio(object):
+    def __init__(self, hw, ip, ch1_inputs=None, ch2_inputs=None):
+        self.ip = ip
+        self.channel1 = FakeBusGpioChannel(hw, ip, 1, inputs=ch1_inputs)
+        self.channel2 = FakeBusGpioChannel(hw, ip, 2, inputs=ch2_inputs)
+
+
+class FakeBusSpi(object):
+    """qick.drivers.hardware.spi as its users see it: SPI_SSR, config(), en_level(), send_receive_m()."""
+
+    def __init__(self, hw, name, data_width=8):
+        self.hw, self.name, self.data_width = hw, name, data_width
+        self.SPI_SSR = 0
+        self.configs = []
+
+    def config(self, **kw):
+        self.configs.append(kw)
+
+    def en_level(self, nch=4, chlist=(0,), en_l="high"):      # as hardware.spi.en_level
+        if en_l == "high":
+            ch_en = 0
+            for c in chlist:
+                ch_en |= (1 << c)
+        else:
+            ch_en = 2 ** nch - 1
+            for c in chlist:
+                ch_en &= ~(1 << c)
+        return ch_en
+
+    def send_receive_m(self, data, ch_en, cs_t="pulse"):
+        return self.hw._xfer(self.name, bytes(data), int(ch_en))
+
+
+class FakeBusHolder(object):
+    """Stands in for the pynq overlay: ip_dict, the rfb_control hierarchy and top-level IPs."""
+
+
+class FakeRfBoardHW(object):
+    def __init__(self, layout=None, floating='low', box_floating='high', gate=False, presence=None, fw_id=None,
+                 previous_init=False, broken=(), ids=None, seed=1, gate_name='rfb_gate_gpio',
+                 presence_name='rfb_presence_gpio', presence_on_gate_ch2=False):
+        self.box = layout is not None
+        self.layout = _norm_layout(layout) if self.box else None
+        self.floating, self.box_floating = floating, box_floating
+        self.has_gate = bool(gate)
+        self.presence_wired = presence
+        self.rng = _random.Random(seed)
+        self.log = []
+        self.cards = {}
+        self.bias = {}                 # DAC11001 index -> [(cmd, data bytes)]
+        self._bias_pending = {}
+        if self.box:
+            for side in ('dac', 'adc'):
+                for slot, kind in enumerate(self.layout[side]):
+                    if kind:
+                        self.cards[(0 if side == 'dac' else 4) + slot] = BusCard(
+                            side, slot, kind, card_id=(ids or {}).get((side, slot)),
+                            iodir=0xF0 if previous_init else 0xFF, broken_reads=(side, slot) in set(broken),
+                            admv_sdo_active=previous_init)
+        self.spis = dict((n, FakeBusSpi(self, n, w)) for n, w in (('filter_spi', 8), ('attn_spi', 16),
+                                                                  ('bias_spi', 32)))
+        self.brd_sel_gpio = FakeBusGpio(self, 'brd_sel_gpio')
+        self.bias_gpio = FakeBusGpio(self, 'bias_gpio')
+
+        def pres():
+            return 1 if (self.box and self.presence_wired) else 0
+        self.gate_gpio = None
+        self.presence_gpio = None
+        if self.has_gate:
+            self.gate_gpio = FakeBusGpio(self, gate_name, ch2_inputs=pres if presence_on_gate_ch2 else None)
+        if presence is not None and not presence_on_gate_ch2:
+            self.presence_gpio = FakeBusGpio(self, presence_name, ch1_inputs=pres)
+        self.gate_name, self.presence_name = gate_name, presence_name
+        self.fw_id_gpio = None if fw_id is None else FakeBusGpio(self, 'fw_id_gpio', ch1_inputs=lambda: fw_id)
+
+    # -- state --
+    def gate_open(self):
+        return (not self.has_gate) or bool(self.gate_gpio.channel1.value & 1)
+
+    def selected(self):
+        w = self.brd_sel_gpio.channel1.value
+        return (w & 7) if w & 8 else None
+
+    def card(self, side, slot):
+        return self.cards.get((0 if side == 'dac' else 4) + slot)
+
+    def _float(self, mosi_byte):
+        mode = self.box_floating if self.box else self.floating
+        if mode == 'low':
+            return 0x00
+        if mode == 'high':
+            return 0xFF
+        if mode == 'echo':
+            return mosi_byte
+        return self.rng.randrange(256)
+
+    def _xfer(self, spi, data, ch_en):
+        driven, chip = {}, None
+        board = self.selected()
+        if self.box and self.gate_open():
+            card = self.cards.get(board) if board is not None else None
+            if spi == 'filter_spi':
+                if card is not None and not (ch_en & 8):
+                    c = card.chips.get(ch_en & 7)
+                    if c is not None:
+                        chip = type(c).__name__[3:]
+                        driven = c.xfer(data)
+            elif spi == 'attn_spi':
+                if card is not None and ch_en:
+                    chip = 'PE43705'
+                    card.att[data[1] if len(data) > 1 else None] = data[0]
+            elif spi == 'bias_spi' and ch_en < 8 and len(data) == 4:
+                chip = 'DAC11001'
+                cmd = data[3]
+                if ch_en in self._bias_pending:
+                    reg = self._bias_pending.pop(ch_en)
+                    last = [v for c, v in self.bias.get(ch_en, []) if c == reg]
+                    driven = dict(enumerate(last[-1])) if last else {}
+                elif cmd & 0x80:
+                    self._bias_pending[ch_en] = cmd & 0x7F
+                else:
+                    self.bias.setdefault(ch_en, []).append((cmd, bytes(data[:3])))
+        inp = bytes(driven.get(i, self._float(b)) for i, b in enumerate(data))
+        self.log.append({'op': 'spi', 'spi': spi, 'board': board, 'cs': ch_en, 'out': data, 'in': inp,
+                         'chip': chip, 'gate_open': self.gate_open()})
+        return inp
+
+    # -- what the tests look at --
+    def spi_log(self, spi=None):
+        return [e for e in self.log if e['op'] == 'spi' and (spi is None or e['spi'] == spi)]
+
+    @staticmethod
+    def is_power_write(e):
+        """A log entry that could reach card power, an amplifier rail, an attenuator, a bias output or the bias
+        switch: any attenuator or bias-DAC frame, a bias_gpio write, or an MCP23S08-shaped write to a register
+        other than DEFVAL (IODIR / GPIO / OLAT drive pins) at an expander's chip select."""
+        if e['op'] == 'gpio_write':
+            return e['ip'] == 'bias_gpio'
+        if e['spi'] in ('attn_spi', 'bias_spi'):
+            return True
+        d = e['out']
+        if e['spi'] == 'filter_spi' and len(d) >= 3 and (d[0] & 0xF9) == 0x40 and e['cs'] in (_DAC_CS, _ADC_CS):
+            return d[1] != 0x03
+        return False
+
+    def power_writes(self):
+        return [i for i, e in enumerate(self.log) if self.is_power_write(e)]
+
+    def make_holder(self, holder=None, hierarchy=True):
+        """Attach the IPs to `holder` (default a new FakeBusHolder) the way a pynq overlay exposes them."""
+        h = holder if holder is not None else FakeBusHolder()
+        ctl = FakeBusHolder() if hierarchy else h
+        ip_dict = {}
+        prefix = 'rfb_control/' if hierarchy else ''
+        for n, obj in (('brd_sel_gpio', self.brd_sel_gpio), ('filter_spi', self.spis['filter_spi']),
+                       ('attn_spi', self.spis['attn_spi']), ('bias_spi', self.spis['bias_spi']),
+                       ('bias_gpio', self.bias_gpio)):
+            setattr(ctl, n, obj)
+            ip_dict[prefix + n] = {'type': 'fake'}
+        if hierarchy:
+            h.rfb_control = ctl
+        for obj, name in ((self.gate_gpio, self.gate_name), (self.presence_gpio, self.presence_name),
+                          (self.fw_id_gpio, 'fw_id_gpio')):
+            if obj is not None:
+                setattr(h, name, obj)
+                ip_dict[name] = {'type': 'fake'}
+        h.ip_dict = ip_dict
+        return h

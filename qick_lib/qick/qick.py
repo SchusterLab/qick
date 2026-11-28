@@ -943,8 +943,24 @@ class QickSoc(Overlay, QickConfig):
     #phase_resolution_bits = 32
     #gain_resolution_signed_bits = 16
 
+    def __new__(cls, *args, **kwargs):
+        # Schuster Lab fork: QickSoc(bitfile) on a QICK-box (RF board v2) image returns a qick.qickbox.QickBoxSoc,
+        # which detects the box and its cards (slab/notes/box-detection.md). rfbox=False keeps a plain QickSoc.
+        if cls is QickSoc:
+            bitfile = args[0] if args else kwargs.get('bitfile')
+            rfbox = kwargs.get('rfbox')
+            if bitfile is not None and rfbox is not False:
+                from . import rfbox_detect
+                opts = rfbox if isinstance(rfbox, dict) else None
+                if rfbox_detect.hwh_has_rfb(os.path.splitext(str(bitfile))[0] + '.hwh', opts):
+                    from .qickbox import QickBoxSoc
+                    cls = QickBoxSoc
+        base_new = super(QickSoc, cls).__new__
+        return base_new(cls) if base_new is object.__new__ else base_new(cls, *args, **kwargs)
+
     # Constructor.
-    def __init__(self, bitfile=None, download=True, no_tproc=False, no_rf=False, force_init_clks=False, clk_output=None, external_clk=None, dac_sample_rates=None, adc_sample_rates=None, **kwargs):
+    def __init__(self, bitfile=None, download=True, no_tproc=False, no_rf=False, force_init_clks=False, clk_output=None, external_clk=None, dac_sample_rates=None, adc_sample_rates=None, rfbox=None, **kwargs):
+        # rfbox (lab fork): options for QICK-box detection, used by qick.qickbox.QickBoxSoc; ignored here
         if bitfile is None:
             bitfile = bitfile_path()
 
@@ -1064,6 +1080,14 @@ class QickSoc(Overlay, QickConfig):
             #self.tnet = self.qick_net_0
             self._streamer = DataStreamer(self)
             self.autoproxy.extend([self.streamer, self.tproc])
+
+        # Schuster Lab fork: which firmware this is (fw_id_gpio word, lab build by manifest); never fails the load
+        try:
+            from . import rfbox_detect
+            self['fw_identity'] = rfbox_detect.firmware_identity(self, bitfile)
+            self['extra_description'].extend(rfbox_detect.describe_firmware(self['fw_identity']))
+        except Exception as e:
+            logger.warning("firmware identity not determined: %s", e)
 
     @property
     def tproc(self):

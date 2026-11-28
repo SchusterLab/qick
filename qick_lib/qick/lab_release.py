@@ -41,6 +41,22 @@ def _sha256(path):
     return h.hexdigest()
 
 
+def identify_fw_id(fw_id):
+    """Return the manifest entry whose "fw_id" (the 32-bit build ID the firmware reports, as int or hex string)
+    equals fw_id, or None."""
+    for build in firmware():
+        v = build.get('fw_id')
+        if v is None:
+            continue
+        try:
+            v = int(v, 0) if isinstance(v, str) else int(v)
+        except ValueError:
+            continue
+        if v == int(fw_id):
+            return build
+    return None
+
+
 def identify(path):
     """Return the manifest entry whose bitstream (.bit) or hardware description (.hwh) matches the file, or None.
 
