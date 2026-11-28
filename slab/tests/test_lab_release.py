@@ -8,7 +8,13 @@ def test_version_is_upstream_plus_lab():
     up = open(os.path.join(ROOT, 'qick_lib/qick/VERSION')).read().strip()
     lab = open(os.path.join(ROOT, 'qick_lib/qick/LAB_VERSION')).read().strip()
     assert re.fullmatch(r'\d+', lab)
-    assert lr.version() == up + '.' + lab
+    variant = os.path.join(ROOT, 'qick_lib/qick/LAB_VARIANT')
+    suffix = ''
+    if os.path.exists(variant) and open(variant).read().strip():
+        name = open(variant).read().strip()
+        assert re.fullmatch(r'[a-z0-9]+([.][a-z0-9]+)*', name), 'variant name must be a PEP 440 local label'
+        suffix = '+' + name
+    assert lr.version() == up + '.' + lab + suffix
 
 def test_notes_name_this_version():
     v = lr.version()

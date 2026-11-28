@@ -49,6 +49,23 @@ install this fork on a PC, install the same commit on the board.
 | `main` | Upstream `main` plus lab changes. This is what the lab installs. | Upstream comes in by merge. Never rewritten or force-pushed. |
 | `feat/<topic>` | A change meant to go back upstream. | Branch from `upstream/main`, not from `main`, so the pull request carries only that change. |
 | `lab/<topic>` | A change the lab wants that upstream may not. | Branch from `main`, merge back into `main`. |
+| `variant/<name>` | A customised lab version kept for a person or group (different code, defaults or firmware sources). | Branch from `main`; merge `main` into it regularly, never the reverse. A fix that everyone needs goes to `main` on a `lab/` branch first. |
+
+### Variants
+
+Most customisation needs no branch:
+- **Firmware:** a variant is a named preset in the lab design generator
+  (`firmware/projects/slab_tprocv2_216/make_bd.py --variant <name>`): buffer
+  type and sizes, program memory, and so on. Adding one is adding one entry
+  there; every build records its variant.
+- **Library:** behaviour that differs between setups belongs in options or
+  configuration, not in a fork of the code.
+
+A `variant/<name>` branch is for changes that cannot be expressed that way.
+It carries a file `qick_lib/qick/LAB_VARIANT` holding its name, so its
+version reads e.g. `0.2.450.1+weighted` (a PEP 440 local version: pip treats
+it as `0.2.450.1` plus a label). It is kept current by merging `main` into
+it; its release notes list what it changes relative to `main`.
 
 A change that is useful to everyone goes on a `feat/` branch, is opened as a
 pull request against `openquantumhardware/qick`, and is merged into `main` here

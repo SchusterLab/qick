@@ -19,6 +19,12 @@ script does this), so `.0` always means unreleased. Not yet done: the firmware
 itself does not carry the version (a constant register or the bitstream's
 USR_ACCESS word would let the library read it from the loaded image).
 
+Variants (Dave: a main lab version plus variants people can customise):
+firmware variants are named presets of the lab design generator, on `main`;
+code variants are `variant/<name>` branches that merge `main` in and label
+their version `+<name>` through `qick_lib/qick/LAB_VARIANT`. Rules in
+`slab/README.md`.
+
 ## 2026-11-26: first runs of the lab images on a board; larger-memory weighted build
 
 Builds (Vivado 2024.1, same recipe as 11-25, source `main` at the tag
