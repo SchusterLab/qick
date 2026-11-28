@@ -15,7 +15,12 @@ def get_version():
     versionpath = os.path.join(os.path.dirname(__file__), 'VERSION')
     with open(versionpath) as version_file:
         version = version_file.read().strip()
-        return version
+    # Schuster Lab fork: append the lab release number (slab/README.md, "Versions")
+    labpath = os.path.join(os.path.dirname(__file__), 'LAB_VERSION')
+    if os.path.exists(labpath):
+        with open(labpath) as lab_file:
+            version += '.' + lab_file.read().strip()
+    return version
 
 __version__ = get_version()
 

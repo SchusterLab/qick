@@ -23,6 +23,7 @@ if git remote get-url origin >/dev/null 2>&1; then
     git merge --ff-only origin/main
 fi
 
+oldver=$(cat qick_lib/qick/VERSION)
 new=$(git rev-list --count main..upstream/main)
 if [ "$new" -eq 0 ]; then
     echo "Already up to date with upstream/main ($(cat qick_lib/qick/VERSION))."
@@ -35,6 +36,12 @@ else
         exit 1
     fi
     echo "Now at upstream $(cat qick_lib/qick/VERSION)."
+    # A new upstream number starts a new lab series: 0 = not yet a lab release on this base.
+    if [ "$(cat qick_lib/qick/VERSION)" != "$oldver" ] && [ -f qick_lib/qick/LAB_VERSION ]; then
+        echo 0 > qick_lib/qick/LAB_VERSION
+        git commit -q -m "Lab version: new upstream base $(cat qick_lib/qick/VERSION), lab counter reset to 0" qick_lib/qick/LAB_VERSION
+        echo "Lab counter reset: version is now $(cat qick_lib/qick/VERSION).0 until the next lab release."
+    fi
 fi
 
 echo "Lab differences from upstream:"

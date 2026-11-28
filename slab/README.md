@@ -14,9 +14,30 @@ To pin an experiment to an exact version, use a commit hash:
 
     pip install git+https://github.com/SchusterLab/qick@<commit>
 
-The package version reported by `qick.__version__` is upstream's number
-(`major.minor.PR`). It does not tell you which lab changes are present. Use the
-commit hash for that.
+## Versions
+
+`qick.__version__` is upstream's number with the lab release number appended:
+`0.2.450.1` is the first lab release on upstream 0.2.450. The lab number is
+in `qick_lib/qick/LAB_VERSION`; upstream's `VERSION` is never edited.
+
+- `<upstream>.0` means upstream plus lab changes not yet released.
+  `slab/sync-upstream.sh` resets the counter to 0 whenever a merge changes
+  upstream's number.
+- Between releases, `main` reports the last release's number although it may
+  have newer lab commits; pin by tag or commit hash when it matters.
+- Each release ships its notes and the matching firmware builds inside the
+  package: `qick/LAB_RELEASE.md` and `qick/lab_firmware.json`, read with
+  `qick.lab_release.notes()`, `.firmware()`, and `.identify(bitfile)` (which
+  finds a build by the sha256 of its `.bit` or `.hwh`).
+
+To make a release:
+1. Increase `qick_lib/qick/LAB_VERSION` by one.
+2. Add a section `## <version> (<date>)` to `qick_lib/qick/LAB_RELEASE.md`:
+   what changed for users, and which firmware goes with it.
+3. Add each new firmware build to `qick_lib/qick/lab_firmware.json` with its
+   sha256s and whether it has run on a board.
+4. Run `slab/tests/`, commit, tag `slab-<version>` (annotated), and push
+   `main` and the tag.
 
 The library on the board and the library on the PC have to match. If you
 install this fork on a PC, install the same commit on the board.

@@ -14,7 +14,12 @@ def get_version(rel_path):
     """
     qick_lib/qick/VERSION is a text file containing only the version number.
     """
-    return (here / rel_path).read_text().strip()
+    version = (here / rel_path).read_text().strip()
+    # Schuster Lab fork: append the lab release number (slab/README.md, "Versions")
+    lab = here / "qick_lib/qick/LAB_VERSION"
+    if lab.exists():
+        version += "." + lab.read_text().strip()
+    return version
 
 # Get the long description from the README file
 long_description = (here / 'README.md').read_text(encoding='utf-8')
@@ -177,7 +182,7 @@ setup(
     # If there are data files included in your packages that need to be
     # installed, specify them here.
     package_data={  # Optional
-        'qick': ['*.bit', '*.hwh', 'VERSION',
+        'qick': ['*.bit', '*.hwh', 'VERSION', 'LAB_VERSION', 'LAB_RELEASE.md', 'lab_firmware.json',
                  'ipq_pynq_utils/ipq_pynq_utils/data/*.json',
                  'ipq_pynq_utils/ipq_pynq_utils/data/*.txt',
                  'ipq_pynq_utils/ipq_pynq_utils/data/*.h',

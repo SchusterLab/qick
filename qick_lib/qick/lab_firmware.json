@@ -1,0 +1,41 @@
+{
+  "comment": "Lab firmware builds and the lab library release they were made for. Identify a bitfile with qick.lab_release.identify(path).",
+  "builds": [
+    {
+      "name": "slab_tprocv2_216_2026-11-25_overflow-fix",
+      "board": "ZCU216",
+      "release": "0.2.450.1",
+      "source": "branch lab/tproc-overflow, commit bad1a662",
+      "vivado": "2024.1",
+      "timing": "WNS +0.003 ns, WHS +0.010 ns",
+      "bit_sha256": "e20611d4cedcc8e47f51be4f33f9bd15d95472d5fe92ef967d66fd11434855a7",
+      "hwh_sha256": "b5afbb834918ec96e5369361e5db6055dd4b6e9373dd8bedff341ce7d0a3c7c3",
+      "summary": "Stock tProc v2 standard design with weighted readout buffers (N_WGT 13), weight-loading DMA, FIFO_GUARD 8 with lost-push flags (tProc revision 29), TIME_SYNC_PERIOD 28.",
+      "status": "ran on a lab board"
+    },
+    {
+      "name": "slab_tprocv2_216_2026-11-26_weighted-large",
+      "board": "ZCU216",
+      "release": "0.2.450.1",
+      "source": "main at f0370014 (tag slab-0.2.450-1), block-design sizes changed by hand",
+      "vivado": "2024.1",
+      "timing": "WNS +0.009 ns, WHS +0.010 ns",
+      "bit_sha256": "9f3cec7501f51989924c0fdf30894967e6ec09649be2953b0f910940770408ed",
+      "hwh_sha256": "d9fe92f5fa86f882b68b651885e1dd29a7e1c482fdba98b63cf1163da485be85",
+      "summary": "As overflow-fix, plus tProc PMEM_AW 14 (16384 program words); weighted buffers 0 and 1 N_BUF 14, N_WGT 14; buffers 2-9 N_WGT 13.",
+      "status": "ran on a lab board"
+    },
+    {
+      "name": "slab_tprocv2_216_2026-11-27_plain-large",
+      "board": "ZCU216",
+      "release": "0.2.450.1",
+      "source": "main at f0370014 (tag slab-0.2.450-1), block-design sizes changed by hand",
+      "vivado": "2024.1",
+      "timing": "WNS +0.003 ns, WHS +0.008 ns after three polish passes",
+      "bit_sha256": "a004d9c44946b914bbccecf7e1f9270df5a163a965df156bd1d1ed144e0b751c",
+      "hwh_sha256": "76de82c6e439709aa41820e9b72a449160049fe9059f7152330b27eedfbefaf7",
+      "summary": "Stock tProc v2 standard design (axis_avg_buffer 1.2, no weights), TIME_SYNC_PERIOD 28, PMEM_AW 14, N_BUF 15 on avg buffers 0 and 1.",
+      "status": "not run on a board"
+    }
+  ]
+}
