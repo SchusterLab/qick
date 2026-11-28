@@ -51,7 +51,7 @@ from contextlib import contextmanager
 from numbers import Integral, Real
 
 API_VERSION = 1
-RFBOX_VERSION = '0.2'
+RFBOX_VERSION = '0.3'
 
 
 def _file_sha256():
@@ -82,6 +82,12 @@ SETTLE_MAX_S = 10.0
 # ADMV8818 band edges (state 0 and state 15 of each band, MHz), FilterADMV8818.freq2steps (qick >= 0.2.4xx)
 FILTER_BANDS = {'LPF': [[2050, 3850], [3350, 7250], [7000, 13000], [12550, 18850]],
                 'HPF': [[1750, 3550], [3400, 7250], [6600, 12600], [12500, 19900]]}
+FILTER_TABLE_VERSION = 'admv8818-nominal-1'
+FILTER_TABLE_SOURCE = ('ADMV8818 datasheet corner of state 0 and state 15 of each of the four bands per section (MHz), '
+                       'as qick FilterADMV8818.freq2steps lists them (qick 0.2.4xx, drivers/hardware.py); the 16 '
+                       'states of a band are taken evenly spaced between them, as the library does. Nominal, not '
+                       'measured; no per-card correction is applied here')
+FILTER_RULE = 'rfbox-never-narrower-1'
 
 DATASHEET = {
     'PE43705': {'what': 'step attenuator, RF Out (att1, att2 per channel) and RF In (one per channel)',
@@ -233,22 +239,185 @@ def filter_step_freq(section, step):
 
 
 def filter_step(section, f_ghz):
-    """The step whose cutoff is nearest f (GHz), as FilterADMV8818._freq2step (0.2.4xx) picks it."""
+    """The step whose cutoff is nearest f (GHz), as FilterADMV8818._freq2step (0.2.449+) picks it. For comparison
+    with the library only: rfbox resolves frequency requests with filter_resolve (FILTER_RULE), not with this."""
     return min(range(64), key=lambda s: abs(filter_step_freq(section, s) - f_ghz))
 
 
-def filter_steps_for(f):
-    """(hpf, lpf) steps for a filter request ({ftype, fc, bw} GHz or {hpf, lpf}); -1 is bypass."""
-    if 'hpf' in f or 'lpf' in f:
-        return f.get('hpf', -1), f.get('lpf', -1)
-    ft = f['ftype']
+# ---- the deterministic rule (FILTER_RULE) --------------------------------------------------------------------------
+# High-pass section: the corner must be at or below the requested lower edge (the passband is never narrower than
+# asked); of those, the highest corner. Low-pass section: the corner must be at or above the requested upper edge; of
+# those, the lowest. The four bands of a section overlap; inside an overlap the LOWER band is used as far as the
+# corner stays monotone in the request: low-pass band b serves every edge up to its state-15 corner; high-pass band b
+# serves edges below the highest corner of band b+1 that lies inside band b (_HPF_SWITCH). An edge below the lowest
+# high-pass corner, or above the highest low-pass corner, bypasses that section. Pure arithmetic on FILTER_BANDS: the
+# same request gives the same registers on every qick version.
+_EPS_MHZ = 1e-6
+
+
+def _corner_mhz(section, step):
+    f0, f15 = FILTER_BANDS[section][step // 16]
+    return f0 + (f15 - f0) * (step % 16) / 15.0
+
+
+def _band_step_mhz(section, band):
+    f0, f15 = FILTER_BANDS[section][band]
+    return (f15 - f0) / 15.0
+
+
+def _hpf_switch():
+    out = []
+    for b in range(3):
+        top = FILTER_BANDS['HPF'][b][1]
+        out.append(max(c for c in (_corner_mhz('HPF', 16 * (b + 1) + k) for k in range(16)) if c <= top + _EPS_MHZ))
+    return out
+
+
+_HPF_SWITCH = _hpf_switch()      # MHz: high-pass band b+1 is used from _HPF_SWITCH[b] up
+
+
+def _rule_band(section, t):
+    """The band (0-3) the rule uses for an edge at t MHz, or None (that section bypassed)."""
+    B = FILTER_BANDS[section]
+    if section == 'HPF':
+        if t < B[0][0] - _EPS_MHZ:
+            return None
+        b = 0
+        while b < 3 and t >= _HPF_SWITCH[b] - _EPS_MHZ:
+            b += 1
+        return b
+    for b in range(4):
+        if t <= B[b][1] + _EPS_MHZ:
+            return b
+    return None
+
+
+def _rule_step(section, t):
+    b = _rule_band(section, t)
+    if b is None:
+        return None
+    steps = [16 * b + k for k in range(16)]
+    if section == 'HPF':
+        return max(x for x in steps if _corner_mhz('HPF', x) <= t + _EPS_MHZ)
+    return min(x for x in steps if _corner_mhz('LPF', x) >= t - _EPS_MHZ)
+
+
+def _section_note(section, t, step):
+    """Warnings for one section's resolution (t MHz)."""
+    out = []
+    name = 'high-pass' if section == 'HPF' else 'low-pass'
+    if step is None:
+        lim = FILTER_BANDS['HPF'][0][0] if section == 'HPF' else FILTER_BANDS['LPF'][3][1]
+        out.append('%s edge %.4g GHz is %s the %s range (%.4g GHz): that section is bypassed'
+                   % (name, t / 1000.0, 'below' if section == 'HPF' else 'above', name, lim / 1000.0))
+        return out
+    b = step // 16
+    d = _band_step_mhz(section, b)
+    gap = abs(_corner_mhz(section, step) - t)
+    if gap > d / 2 + _EPS_MHZ:
+        out.append('%s edge %.4g GHz fell between steps: the corner used is %.4g GHz, %.0f MHz away (more than half '
+                   'the %.0f MHz step of band %d)' % (name, t / 1000.0, _corner_mhz(section, step) / 1000.0, gap, d,
+                                                      b + 1))
+    for dt, word in ((-d, 'lower'), (d, 'higher')):
+        nb = _rule_band(section, t + dt)
+        if nb != b:
+            out.append('%s edge %.4g GHz is within one step (%.0f MHz) of a band boundary: a request that much %s '
+                       'would use %s; band changes can change the in-band loss'
+                       % (name, t / 1000.0, d, word, 'bypass' if nb is None else 'band %d' % (nb + 1)))
+    return out
+
+
+def _edges(f):
+    ft = f.get('ftype')
     if ft == 'lowpass':
-        return -1, filter_step('LPF', f['fc'])
+        return None, f['fc']
     if ft == 'highpass':
-        return filter_step('HPF', f['fc']), -1
+        return f['fc'], None
     if ft == 'bandpass':
-        return filter_step('HPF', f['fc'] - f['bw'] / 2), filter_step('LPF', f['fc'] + f['bw'] / 2)
-    return -1, -1
+        return f['fc'] - f['bw'] / 2.0, f['fc'] + f['bw'] / 2.0
+    return None, None
+
+
+def _section_info(section, step):
+    if step is None:
+        return {'step': None, 'band': 0, 'state': 0, 'ghz': None}
+    return {'step': step, 'band': 1 + step // 16, 'state': step % 16, 'ghz': _corner_mhz(section, step) / 1000.0}
+
+
+def filter_resolve(f, fc=None, bw=None):
+    """Exactly what set / apply write for a filter: f is a filter ({ftype, fc, bw} in GHz, or the explicit form
+    {hpf: step|None, lpf: step|None}), or a type name with fc (and bw). Pure, no hardware. Returns
+    {requested, explicit {hpf, lpf}, hpf / lpf {step, band, state, ghz}, edges_ghz, regs, rule, table, warnings}."""
+    if isinstance(f, str):
+        f = dict((k, v) for k, v in (('ftype', f), ('fc', fc), ('bw', bw)) if v is not None)
+    req = _filter(f, 'filter')
+    if 'hpf' in req:
+        h, l = req['hpf'], req['lpf']
+        lo = hi = None
+        rule = 'explicit'
+        warn = []
+    else:
+        lo, hi = _edges(req)
+        h = None if lo is None else _rule_step('HPF', lo * 1000.0)
+        l = None if hi is None else _rule_step('LPF', hi * 1000.0)
+        rule = FILTER_RULE
+        warn = (_section_note('HPF', lo * 1000.0, h) if lo is not None else []) + \
+            (_section_note('LPF', hi * 1000.0, l) if hi is not None else [])
+    return {'requested': dict(req), 'explicit': {'hpf': h, 'lpf': l},
+            'hpf': _section_info('HPF', h), 'lpf': _section_info('LPF', l),
+            'edges_ghz': {'low': lo, 'high': hi},
+            'regs': filter_regs(-1 if h is None else h, -1 if l is None else l),
+            'rule': rule, 'table': FILTER_TABLE_VERSION, 'warnings': warn}
+
+
+def canonical_filter(f):
+    """The explicit form {hpf, lpf} (None = bypass) a filter resolves to."""
+    return dict(filter_resolve(f)['explicit'])
+
+
+def filter_candidates(section_or_type, fc, bw=None, n=3):
+    """The steps near a request, with nominal corners, for choosing an explicit setting. section_or_type: 'hpf' /
+    'lpf' (fc is that section's edge) or a filter type (lowpass, highpass, bandpass: the edges follow from fc, bw).
+    Returns {request, resolved (filter_resolve, or for a section the step the rule picks), hpf: [...], lpf: [...]}
+    where each list has up to n steps below and n above the edge across all bands, sorted by corner."""
+    st = str(section_or_type)
+    if st.lower() in ('hpf', 'lpf'):
+        sec = st.upper()
+        t = _num(fc, 'fc') * 1000.0
+        edges = {sec: t}
+        step = _rule_step(sec, t)
+        resolved = {'section': sec, 'edge_ghz': t / 1000.0, 'step': _section_info(sec, step),
+                    'rule': FILTER_RULE, 'table': FILTER_TABLE_VERSION, 'warnings': _section_note(sec, t, step)}
+        chosen = {sec: step}
+    else:
+        resolved = filter_resolve(st, fc, bw)
+        lo, hi = resolved['edges_ghz']['low'], resolved['edges_ghz']['high']
+        edges = {}
+        if lo is not None:
+            edges['HPF'] = lo * 1000.0
+        if hi is not None:
+            edges['LPF'] = hi * 1000.0
+        chosen = {'HPF': resolved['explicit']['hpf'], 'LPF': resolved['explicit']['lpf']}
+    out = {'request': {'section_or_type': st, 'fc': fc, 'bw': bw}, 'resolved': resolved, 'hpf': None, 'lpf': None,
+           'table': FILTER_TABLE_VERSION}
+    for sec, t in edges.items():
+        allsteps = sorted(range(64), key=lambda x: (_corner_mhz(sec, x), x))
+        below = [x for x in allsteps if _corner_mhz(sec, x) <= t + _EPS_MHZ][-n:]
+        above = [x for x in allsteps if _corner_mhz(sec, x) > t + _EPS_MHZ][:n]
+        lst = []
+        for x in below + above:
+            e = _section_info(sec, x)
+            e['offset_mhz'] = _corner_mhz(sec, x) - t
+            e['chosen'] = x == chosen.get(sec)
+            lst.append(e)
+        out[sec.lower()] = lst
+    return out
+
+
+def filter_steps_for(f):
+    """(hpf, lpf) steps (-1 = bypass) for a filter, by filter_resolve."""
+    e = filter_resolve(f)['explicit']
+    return (-1 if e['hpf'] is None else e['hpf']), (-1 if e['lpf'] is None else e['lpf'])
 
 
 def filter_regs(hpf, lpf):
@@ -275,7 +444,9 @@ def decode_filter(regs):
     lpf = -1 if lb == 0 else (lb - 1) * 16 + ls
     out = {'hpf': hpf, 'lpf': lpf,
            'hpf_ghz': None if hpf < 0 else filter_step_freq('HPF', hpf),
-           'lpf_ghz': None if lpf < 0 else filter_step_freq('LPF', lpf)}
+           'lpf_ghz': None if lpf < 0 else filter_step_freq('LPF', lpf),
+           'explicit': {'hpf': None if hpf < 0 else hpf, 'lpf': None if lpf < 0 else lpf},
+           'table': FILTER_TABLE_VERSION}
     if hpf < 0 and lpf < 0:
         out.update(ftype='bypass', fc=None, bw=None)
     elif hpf < 0:
@@ -323,12 +494,15 @@ def _filter(f, field, allow_raw=True):
     if allow_raw and ('hpf' in f or 'lpf' in f):
         bad = sorted(set(f) - {'hpf', 'lpf'})
         if bad:
-            raise _bad(field, 'raw filter has only hpf and lpf, not %s' % ', '.join(bad))
+            raise _bad(field, 'the explicit filter form has only hpf and lpf, not %s' % ', '.join(bad))
         out = {}
         for k in ('hpf', 'lpf'):
-            v = f.get(k, -1)
-            if isinstance(v, bool) or not isinstance(v, Integral) or not -1 <= v <= 63:
-                raise _bad(field + '.' + k, '%r: -1 (bypass) or 0 .. 63' % (v,))
+            v = f.get(k)
+            if v is None or (isinstance(v, Integral) and not isinstance(v, bool) and v == -1):
+                out[k] = None
+                continue
+            if isinstance(v, bool) or not isinstance(v, Integral) or not 0 <= v <= 63:
+                raise _bad(field + '.' + k, '%r: a step 0 .. 63 (band * 16 + state) or null (bypass)' % (v,))
             out[k] = int(v)
         return out
     bad = sorted(set(f) - {'ftype', 'fc', 'bw'})
@@ -595,7 +769,9 @@ def filter_written(regs):
     return {'WR0_SW': sw, 'WR0_FILTER': filt, 'hpf_band': hb, 'hpf_state': hs, 'lpf_band': lb, 'lpf_state': ls,
             'hpf_step': dec.get('hpf'), 'lpf_step': dec.get('lpf'),
             'hpf_ghz': dec.get('hpf_ghz'), 'lpf_ghz': dec.get('lpf_ghz'),
-            'table': 'rfbox FILTER_BANDS (the 0.2.4xx library table; band 0 = bypass)'}
+            'explicit': {'hpf': dec.get('hpf') if (dec.get('hpf') or -1) >= 0 else None,
+                         'lpf': dec.get('lpf') if (dec.get('lpf') or -1) >= 0 else None},
+            'table': FILTER_TABLE_VERSION}
 
 
 def _no_answer(regs):
@@ -636,7 +812,7 @@ def normalize(rf):
         if 'filter' not in g:
             raise _bad(w, 'no filter (give {ftype: bypass} for none)')
         out['gens'][ch] = {'att': [_att(a[0], w + '.att[0]'), _att(a[1], w + '.att[1]')],
-                           'filter': _filter(g['filter'], w + '.filter', allow_raw=False)}
+                           'filter': _filter(g['filter'], w + '.filter')}
         if _filter_verify(g, w) is False:
             out['gens'][ch]['filter_verify'] = False
     for k, r in (rf.get('ros') or {}).items():
@@ -660,7 +836,7 @@ def normalize(rf):
                 raise _bad(w, 'no att (the RF In attenuator, dB)')
             if 'filter' not in r:
                 raise _bad(w, 'no filter (give {ftype: bypass} for none)')
-            one = {'att': _att(r['att'], w + '.att'), 'filter': _filter(r['filter'], w + '.filter', allow_raw=False),
+            one = {'att': _att(r['att'], w + '.att'), 'filter': _filter(r['filter'], w + '.filter'),
                    'adc_att': adc_att}
             if _filter_verify(r, w) is False:
                 one['filter_verify'] = False
@@ -719,9 +895,41 @@ def plain(spec):
     return out
 
 
+def canonical(spec):
+    """A normalized description with every filter in the explicit form {hpf, lpf} it resolves to (filter_resolve):
+    stored this way it gives the same chip state on every qick and rfbox version with this table."""
+    out = {'gens': {}, 'ros': {}, 'bias': dict((k, dict(v)) for k, v in spec['bias'].items()),
+           'cards': None if spec.get('cards') is None else dict((s, dict(c)) for s, c in spec['cards'].items())}
+    for sec in ('gens', 'ros'):
+        for k, v in spec[sec].items():
+            v = dict(v)
+            if 'filter' in v:
+                v['filter'] = canonical_filter(v['filter'])
+            out[sec][k] = v
+    return out
+
+
+def canonical_description(description):
+    """A description (normalize's format) back as plain data with every filter in its explicit form: what a client
+    stores to get the same chip state forever. Its spec_hash equals the original's."""
+    return plain(canonical(normalize(description)))
+
+
 def spec_hash(spec):
-    """The same hash qick_rf.spec_hash gives for a description in its format."""
+    """Version-2 hash ('h2:' + 12 hex) of a description, computed on its canonical form: two descriptions whose
+    filters resolve to the same steps hash equal. spec_hash_v1 is the old (qick_rf, rfbox 0.1/0.2) hash."""
+    return 'h2:' + hashlib.sha256(json.dumps(plain(canonical(spec)), sort_keys=True).encode()).hexdigest()[:12]
+
+
+def spec_hash_v1(spec):
+    """The hash qick_rf.spec_hash (and rfbox 0.1 / 0.2 spec_hash) gives: on the description as written."""
     return hashlib.sha256(json.dumps(plain(spec), sort_keys=True).encode()).hexdigest()[:12]
+
+
+def hash_matches(spec, h):
+    """Whether a stored hash (either version) is the hash of this description."""
+    h = str(h)
+    return h == spec_hash(spec) if h.startswith('h2:') else h == spec_hash_v1(spec)
 
 
 _CARD = re.compile(r'(ADC|DAC) slot (\d+): (?:No card detected|(.+?) card has ports \[([\d, ]*)\])')
@@ -1314,31 +1522,46 @@ class RfBox(object):
               'adc_att': {}, 'bias': {}, 'limits': self.limits, 'readback': READBACK}
         for (side, port), p in sorted(self._ports().items()):
             d = {'kind': p['kind'], 'slot': p['slot'], 'card_ch': p['card_ch']}
-            try:
-                if side == 'adc':
-                    d['block'] = adc_block_of_port(port)
-                    if p['kind'] in ('rf_in', 'dc_in'):
-                        v, reg = self._amp_read(p, cache)
-                        d['amp'] = _val(v, 'read', raw=reg,
-                                        note='the expander pin (commanded state), not the rail')
-                    if p['kind'] == 'rf_in':
-                        d['att'] = self._written_rec(('ro_att', port))
-                        d['filter'] = self._filter_state(p)
-                    if p['kind'] == 'dc_in':
-                        d['gain'] = self._try(lambda: _val(self._gain_read(p), 'read'))
-                else:
-                    if p['kind'] == 'rf_out':
-                        d['att'] = self._written_rec(('dac_att', port))
-                        v, reg = self._net_read(p, 'powerup', cache)
-                        d['supply'] = _val(None if v is None else bool(v), 'read', raw=reg,
-                                           net=getattr(p['chain'], 'powerup', None), shared_with=self._pair(p),
-                                           note='the expander pin (commanded state), not the rail')
-                        d['filter'] = self._filter_state(p)
-                    if p['kind'] == 'dc_out':
-                        v, reg = self._amp_read(p, cache)
-                        d['powered'] = _val(v, 'read', raw=reg)
-            except Exception as e:      # noqa: BLE001
-                d['error'] = _exc(e)
+
+            # each field on its own: a failing GPIO read must not hide the filter (rfbox 0.1/0.2 lost every field
+            # after the first failure of a port)
+            def field(key, fn):
+                try:
+                    d[key] = fn()
+                except Exception as e:      # noqa: BLE001
+                    d[key] = _val(None, 'error', error=_exc(e))
+                    d.setdefault('errors', []).append('%s: %s' % (key, _exc(e)))
+
+            def amp_rec(p=p):
+                v, reg = self._amp_read(p, cache)
+                return _val(v, 'read', raw=reg, note='the expander pin (commanded state), not the rail')
+
+            def supply_rec(p=p):
+                v, reg = self._net_read(p, 'powerup', cache)
+                return _val(None if v is None else bool(v), 'read', raw=reg, net=getattr(p['chain'], 'powerup', None),
+                            shared_with=self._pair(p), note='the expander pin (commanded state), not the rail')
+
+            def powered_rec(p=p):
+                v, reg = self._amp_read(p, cache)
+                return _val(v, 'read', raw=reg)
+            if side == 'adc':
+                d['block'] = adc_block_of_port(port)
+                if p['kind'] in ('rf_in', 'dc_in'):
+                    field('amp', amp_rec)
+                if p['kind'] == 'rf_in':
+                    field('att', lambda: self._written_rec(('ro_att', port)))
+                    field('filter', lambda: self._filter_state(p))
+                if p['kind'] == 'dc_in':
+                    field('gain', lambda: _val(self._gain_read(p), 'read'))
+            else:
+                if p['kind'] == 'rf_out':
+                    field('att', lambda: self._written_rec(('dac_att', port)))
+                    field('supply', supply_rec)
+                    field('filter', lambda: self._filter_state(p))
+                if p['kind'] == 'dc_out':
+                    field('powered', powered_rec)
+            if d.get('errors'):
+                d['error'] = '; '.join(d['errors'])
             st['%s_ports' % side][str(port)] = d
         for name, t, b in self.adc_blocks():
             st['adc_att'][name] = self._try(lambda: _val(self._dsa_get(name), 'read'))
@@ -1550,8 +1773,9 @@ class RfBox(object):
         if op == 'filter':
             side, port = t
             p = ports[(side, port)]
+            res = filter_resolve(v)
             h, l = filter_steps_for(v)
-            regs = filter_regs(h, l)
+            regs = res['regs']
             verify = s.get('verify', True)
             self._filter_write(p, regs)
             got, err = None, None
@@ -1570,7 +1794,9 @@ class RfBox(object):
             setting['source'] = 'decoded from the registers' if dec else 'registers not decodable'
             setting['last_request'] = dict(v)
             extra.update(requested=dict(v), applied=decode_filter(regs), written=filter_written(regs), verified=ok,
-                         filter_verify=verify)
+                         filter_verify=verify, resolved=res)
+            for wn in res['warnings']:
+                extra.setdefault('warnings', []).append('%s: %s' % (s['what'], wn))
             if not ok:
                 msg = 'filter of %s port %d %s after writing %s' % (
                     side.upper(), port, ('could not be read back (%s)' % err) if err else 'reads %s' % got, regs)
@@ -1685,6 +1911,8 @@ class RfBox(object):
             entry.update(extra)
             if extra.get('warning'):
                 rec.setdefault('warnings', []).append(extra['warning'])
+            for wn in extra.get('warnings') or []:
+                rec.setdefault('warnings', []).append(wn)
             return entry
         except Exception as e:      # noqa: BLE001
             entry['error'] = _exc(e)
@@ -2067,7 +2295,8 @@ class RfBox(object):
         with self.lock:
             bad = self.problems(spec)
             lay = self._layout_locked(read_ids=False)
-            rec = {'hash': spec_hash(spec), 'identity': dict(self.identity), 'by': by,
+            rec = {'hash': spec_hash(spec), 'hash_v1': spec_hash_v1(spec), 'canonical': plain(canonical(spec)),
+                   'identity': dict(self.identity), 'by': by,
                    'cards': layout_text(lay), 'gens': {}, 'ros': {}, 'bias': {}, 'warnings': [], 'order': []}
             if bad:
                 rec['state'] = self._try(self._get_locked)
@@ -2105,6 +2334,8 @@ class RfBox(object):
                 rec['gens'][str(g)] = {'att': e['result']['set'], 'filter': dict(s['filter']),
                                        'filter_applied': rec['order'][-3].get('applied'),
                                        'filter_written': rec['order'][-3].get('written'),
+                                       'filter_explicit': (rec['order'][-3].get('resolved') or {}).get('explicit'),
+                                       'filter_read': (rec['order'][-3].get('result') or {}).get('read'),
                                        'filter_verified': rec['order'][-3].get('verified'), 'dac': c['dac'],
                                        'port': c['port'], 'supply_on': e2['result']['supply_on'],
                                        'supply_shared_with': [a['dac_port'] for a in e2.get('affects', [])]}
@@ -2136,6 +2367,8 @@ class RfBox(object):
                     one['filter'] = dict(s['filter'])
                     one['filter_applied'] = rec['order'][-1].get('applied')
                     one['filter_written'] = rec['order'][-1].get('written')
+                    one['filter_explicit'] = (rec['order'][-1].get('resolved') or {}).get('explicit')
+                    one['filter_read'] = (rec['order'][-1].get('result') or {}).get('read')
                     one['filter_verified'] = rec['order'][-1].get('verified')
                     if not s.get('amp', True):
                         run('adc_off', c['port'], None, '%s amplifier off' % what)
@@ -2382,7 +2615,7 @@ def _reply_raise(fn, *a, **kw):
 
 def version_info():
     return {'rfbox_version': RFBOX_VERSION, 'rfbox_sha256': RFBOX_SHA256, 'rfbox_api': API_VERSION,
-            'file': globals().get('__file__')}
+            'file': globals().get('__file__'), 'filter_table': FILTER_TABLE_VERSION, 'filter_rule': FILTER_RULE}
 
 
 def check_reply(reply):
@@ -2409,6 +2642,15 @@ class RfBoxSocMixin(object):
 
     def rfbox_version(self):
         return _reply_raise(version_info)
+
+    def rfbox_filter_resolve(self, f, fc=None, bw=None):
+        return _reply_raise(filter_resolve, f, fc, bw)
+
+    def rfbox_canonical(self, description):
+        return _reply_raise(canonical_description, description)
+
+    def rfbox_filter_candidates(self, section_or_type, fc, bw=None, n=3):
+        return _reply_raise(filter_candidates, section_or_type, fc, bw, n)
 
     def rfbox_set(self, settings, settle_s=SETTLE_DEFAULT_S, protect=True, by='rfbox_set'):
         return _reply(lambda: attach(self).set(settings, settle_s=settle_s, protect=protect, by=by))

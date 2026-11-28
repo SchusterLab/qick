@@ -16,7 +16,8 @@ from .. import rfbox as B
 from ..rfbox import (ATT_MAX, ATT_STEP, DSA_MAX, GAIN_MIN, GAIN_MAX, BIAS_MAX, FTYPES, F_MIN, F_MAX,  # noqa: F401
                      SETTLE_DEFAULT_S, SETTLE_MAX_S, OVR_VOLTAGE, OVR_RANGE, SUBADC_RANGE, KINDS, FILTER_BANDS,
                      LIMIT_KEYS, ITEM_KEYS, LIBRARY_CONSTRUCTOR, decode_flags, flag_list, filter_step_freq,
-                     filter_step, filter_steps_for, decode_filter, adc_block_of_port, adc_port_of_block)
+                     filter_step, filter_steps_for, filter_resolve, filter_candidates, decode_filter,
+                     adc_block_of_port, adc_port_of_block)
 from .protocol import RequestError
 
 

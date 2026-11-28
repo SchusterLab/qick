@@ -121,6 +121,7 @@ class FakeMCP23S08(_Chip):
     def read_reg(self, reg):
         if not self._on():
             return 0xFF
+        self.box._fault('gpio_read', self.side, self.slot)
         s = self.box.slots[(self.side, self.slot)]
         if reg in ('GPIO_REG', 'OLAT_REG'):
             return ((s['id'] << 4) | (s['gpio'] & 0x0F)) if reg == 'GPIO_REG' else s['gpio']

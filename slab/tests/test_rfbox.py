@@ -323,7 +323,8 @@ DESC = {'gens': {0: {'att': [10, 12.5], 'filter': {'ftype': 'lowpass', 'fc': 8.0
 def test_normalize_and_hash_match_qick_rf():
     spec = R.normalize(DESC)
     assert spec['ros'][0]['adc_att'] == 27                      # qick_rf default
-    assert R.spec_hash(spec) == 'e46435e582e4'                  # computed with qick_rf.py for the same input
+    assert R.spec_hash_v1(spec) == 'e46435e582e4'               # computed with qick_rf.py for the same input
+    assert R.spec_hash(spec).startswith('h2:') and R.hash_matches(spec, 'e46435e582e4')
     for bad, where in [({'bias': {0: {'volts': 0.5}}}, 'rf.bias.0'),
                        ({'ros': {0: {'att': 6, 'filter': {'ftype': 'x'}}}}, 'rf.ros.0.filter'),
                        ({'gens': {0: {'att': [1, 2, 3]}}}, 'rf.gens.0')]:
@@ -450,12 +451,12 @@ def test_identity_carries_version_and_file_hash(board):
     import hashlib
     box, soc, rf = board
     sha = hashlib.sha256(open(os.path.join(LIB, 'rfbox.py'), 'rb').read()).hexdigest()
-    assert R.RFBOX_VERSION == '0.2' and R.RFBOX_SHA256 == sha
+    assert R.RFBOX_VERSION == '0.3' and R.RFBOX_SHA256 == sha
     for d in (rf.identity, rf.get()['identity'], rf.get()):
-        assert d['rfbox_version'] == '0.2' and d['rfbox_sha256'] == sha
+        assert d['rfbox_version'] == R.RFBOX_VERSION and d['rfbox_sha256'] == sha
     assert rf.identity['rfbox_api'] == R.API_VERSION
     v = R.Local(soc).rfbox_version()
-    assert v['rfbox_version'] == '0.2' and v['rfbox_sha256'] == sha
+    assert v['rfbox_version'] == R.RFBOX_VERSION and v['rfbox_sha256'] == sha
 
 
 def test_helpers_raise_instead_of_returning_failure(board):
@@ -520,7 +521,8 @@ def test_filter_no_answer_opt_out_proceeds(board, mode):
     box, soc, rf = board
     box.filter_mode[('adc', 4)] = mode
     rec = rf.set([{'ro': 0, 'filter': {'ftype': 'lowpass', 'fc': 4}, 'filter_verify': False}])
-    assert rec['ok'] and len(rec['warnings']) == 1 and 'not verified' in rec['warnings'][0]
+    nv = [w for w in rec['warnings'] if 'not verified' in w]
+    assert rec['ok'] and len(nv) == 1
     step = rec['order'][0]
     assert step['verified'] is False and step['filter_verify'] is False
     if mode == 'raise':
@@ -631,3 +633,163 @@ def test_soc_class_locks_rfb_methods_and_forgets_writes():
     a = rf.get()['adc_ports']['4']['att']
     assert a['source'] == 'unknown' and 'rfb_set_ro_rf' in a['why'] and a['previous']['value'] == 20.0
     assert cls.rfb_set_ro_rf._rfbox_locked and not hasattr(_LibSoc.rfb_set_ro_rf, '_rfbox_locked')
+
+
+# ---- round 3: deterministic filters -------------------------------------------------------------------------------
+GRID = [0.5 + 0.0025 * i for i in range(int((20.0 - 0.5) / 0.0025) + 1)]      # GHz, 2.5 MHz apart
+
+
+def _corner(sec, r):
+    return r[sec]['ghz']
+
+
+def test_filter_rule_monotone_and_never_narrower():
+    last_h = last_l = -1.0
+    for f in GRID:
+        h = R.filter_resolve('highpass', f)
+        c = 0.0 if h['hpf']['step'] is None else h['hpf']['ghz']
+        assert c >= last_h - 1e-12, f                 # monotone
+        assert c <= f + 1e-9                          # never narrower: corner at or below the lower edge
+        assert h['explicit']['lpf'] is None           # high-pass only touches the high-pass section
+        last_h = c
+        l = R.filter_resolve('lowpass', f)
+        c = 1e9 if l['lpf']['step'] is None else l['lpf']['ghz']
+        assert c >= last_l - 1e-12, f
+        assert c >= f - 1e-9
+        assert l['explicit']['hpf'] is None
+        last_l = c
+
+
+def test_filter_rule_band_overlaps_prefer_lower_band_consistently():
+    # low-pass: band b serves every edge up to its state-15 corner
+    assert R.filter_resolve('lowpass', 7.25)['lpf']['band'] == 2
+    assert R.filter_resolve('lowpass', 7.2501)['lpf']['band'] == 3
+    # high-pass: band b+1 from its highest corner inside band b (7.0 GHz for bands 2 -> 3)
+    assert R.filter_resolve('highpass', 6.999)['hpf']['band'] == 2
+    assert R.filter_resolve('highpass', 7.0)['hpf'] == {'step': 33, 'band': 3, 'state': 1, 'ghz': 7.0}
+    assert R._HPF_SWITCH == [3400.0, 7000.0, 12500.0]
+    # a request next to a boundary says so
+    assert any('band boundary' in w for w in R.filter_resolve('lowpass', 7.3)['warnings'])
+    # the same request always gives the same registers
+    assert len(set(str(R.filter_resolve('bandpass', 6.65, 1.5)['regs']) for _ in range(5))) == 1
+
+
+def test_filter_round_trip_and_explicit_form():
+    reachable = {'HPF': set(), 'LPF': set()}
+    for f in GRID:
+        h = R.filter_resolve('highpass', f)['explicit']['hpf']
+        l = R.filter_resolve('lowpass', f)['explicit']['lpf']
+        if h is not None:
+            reachable['HPF'].add(h)
+        if l is not None:
+            reachable['LPF'].add(l)
+    for sec, typ, key in (('HPF', 'highpass', 'hpf'), ('LPF', 'lowpass', 'lpf')):
+        for step in range(64):
+            corner = R.filter_step_freq(sec, step)
+            got = R.filter_resolve(typ, corner)[key]
+            if step in reachable[sec]:
+                assert got['step'] == step                      # step -> corner -> the same step
+            else:
+                # steps inside a band overlap that the lower-band preference skips (HPF 14, 15, 31, 32, 47;
+                # LPF 16, 17, 32, 48, 49): only the explicit form reaches them; the rule gives a reachable step on
+                # the never-narrower side
+                assert got['step'] in reachable[sec]
+                assert (got['ghz'] <= corner + 1e-9) if sec == 'HPF' else (got['ghz'] >= corner - 1e-9)
+        for step in range(64):                                  # every step is reachable in the explicit form
+            r = R.filter_resolve({key: step})
+            assert r['explicit'][key] == step and r['rule'] == 'explicit'
+            assert R.decode_filter(r['regs'])['explicit'][key] == step
+    assert len(reachable['HPF']) > 50 and len(reachable['LPF']) > 50
+
+
+def test_filter_bypass_and_out_of_range_sections():
+    b = R.filter_resolve('bypass')
+    assert b['explicit'] == {'hpf': None, 'lpf': None} and b['regs'] == {'WR0_SW': 0xC0, 'WR0_FILTER': 0}
+    assert R.filter_resolve({'hpf': None, 'lpf': None})['regs'] == b['regs']
+    assert R.filter_resolve({'hpf': -1, 'lpf': -1})['explicit'] == {'hpf': None, 'lpf': None}
+    r = R.filter_resolve('highpass', 1.0)
+    assert r['explicit']['hpf'] is None and 'bypassed' in r['warnings'][0]
+    r = R.filter_resolve('lowpass', 19.5)
+    assert r['explicit']['lpf'] is None and 'bypassed' in r['warnings'][0]
+    with pytest.raises(R.RfboxError):
+        R.filter_resolve({'hpf': 64})
+
+
+def test_filter_examples_from_the_field():
+    hp = R.filter_resolve('highpass', 5.9)
+    assert hp['explicit'] == {'hpf': 25, 'lpf': None} and hp['hpf']['ghz'] == pytest.approx(5.71)
+    assert R.filter_step('HPF', 5.9) == 26                       # the library's nearest step (reads 5.97 GHz)
+    keep = R.filter_resolve({'hpf': 26, 'lpf': None})
+    assert keep['hpf']['ghz'] == pytest.approx(5.9667, abs=1e-4) and not keep['warnings']
+    a = R.filter_resolve('bandpass', 6.6, 1.4)['explicit']
+    b = R.filter_resolve('bandpass', 6.65, 1.5)['explicit']
+    assert a == b                                               # one state, not a band jump
+
+
+def test_filter_candidates():
+    c = R.filter_candidates('hpf', 5.9, n=2)
+    assert [e['step'] for e in c['hpf']] == [24, 25, 26, 27]
+    assert [e['chosen'] for e in c['hpf']].count(True) == 1
+    assert all(c['hpf'][i]['ghz'] <= c['hpf'][i + 1]['ghz'] for i in range(3))
+    c = R.filter_candidates('bandpass', 6.65, 1.5)
+    assert c['hpf'] and c['lpf'] and c['resolved']['explicit'] == R.filter_resolve('bandpass', 6.65, 1.5)['explicit']
+    assert R.filter_candidates('lowpass', 8.0)['hpf'] is None
+    loc = R.Local(make()[1])
+    assert loc.rfbox_filter_resolve('highpass', 5.9)['explicit']['hpf'] == 25
+    assert loc.rfbox_filter_candidates('lpf', 8.0)['lpf']
+    with pytest.raises(ValueError):
+        loc.rfbox_filter_resolve('notch', 5.0)
+
+
+def test_record_and_get_report_explicit_steps_and_table(board):
+    box, soc, rf = board
+    rec = rf.set([{'ro': 0, 'filter': {'ftype': 'highpass', 'fc': 5.9}}])
+    st = rec['order'][0]
+    assert st['resolved']['explicit'] == {'hpf': 25, 'lpf': None} and st['resolved']['table'] == R.FILTER_TABLE_VERSION
+    assert st['written']['explicit'] == {'hpf': 25, 'lpf': None} and st['written']['table'] == R.FILTER_TABLE_VERSION
+    assert any('fell between steps' in w for w in rec['warnings'])
+    f = rf.get()['adc_ports']['4']['filter']
+    assert f['value']['explicit'] == {'hpf': 25, 'lpf': None} and f['value']['table'] == R.FILTER_TABLE_VERSION
+    rec = rf.set([{'ro': 0, 'filter': {'hpf': 26, 'lpf': None}}])
+    assert box.filters[('adc', 4)] == {'WR0_SW': 0xC0 | (2 << 3), 'WR0_FILTER': 10 << 4}
+
+
+def test_canonical_description_and_hash():
+    d1 = {'ros': {0: {'att': 10, 'filter': {'ftype': 'bandpass', 'fc': 6.6, 'bw': 1.4}}}}
+    d2 = {'ros': {0: {'att': 10, 'filter': {'ftype': 'bandpass', 'fc': 6.65, 'bw': 1.5}}}}
+    s1, s2 = R.normalize(d1), R.normalize(d2)
+    assert R.spec_hash(s1) == R.spec_hash(s2) and R.spec_hash_v1(s1) != R.spec_hash_v1(s2)
+    c = R.canonical_description(d1)
+    assert c['ros']['0']['filter'] == {'hpf': 25, 'lpf': 33}
+    assert R.spec_hash(R.normalize(c)) == R.spec_hash(s1)          # storing the explicit form keeps the hash
+    assert R.hash_matches(s1, R.spec_hash(s1)) and R.hash_matches(s1, R.spec_hash_v1(s1))
+    assert not R.hash_matches(s1, R.spec_hash_v1(s2))
+    box, soc, rf = make()
+    rec = rf.apply(d1)
+    assert rec['canonical'] == c and rec['hash'] == R.spec_hash(s1) and rec['hash_v1'] == R.spec_hash_v1(s1)
+    assert rf.check(c, rec) == [] and rf.check(d2, rec) == []      # same chip state
+    assert R.Local(soc).rfbox_canonical(d1) == c
+
+
+def test_filter_blocks_always_present(board):
+    box, soc, rf = board
+    # one failing GPIO read on a card must not hide the filter of its port (rfbox 0.1/0.2 dropped it)
+    box.fail('gpio_read', side='adc', port=2, times=1000)
+    box.fail('gpio_read', side='dac', port=0, times=1000)
+    st = rf.get()
+    box.faults.clear()
+    for sec, port in (('adc_ports', '4'), ('dac_ports', '0')):
+        d = st[sec][port]
+        assert 'filter' in d and d['filter']['source'] == 'read' and 'error' in d, (sec, d)
+        assert (d.get('amp') or d.get('supply'))['source'] == 'error'
+    # apply: re-applying the same state, and a request that bypasses one section, keep every filter block
+    desc = {'gens': {0: {'att': [10, 10], 'filter': {'ftype': 'highpass', 'fc': 5.9}}},
+            'ros': {0: {'att': 10, 'filter': {'ftype': 'bandpass', 'fc': 6.65, 'bw': 1.5}}}}
+    for _ in range(2):
+        rec = rf.apply(desc)
+        for one in (rec['ros']['0'], rec['gens']['0']):
+            for k in ('filter_applied', 'filter_written', 'filter_explicit', 'filter_read'):
+                assert one.get(k) is not None, k
+        assert rec['gens']['0']['filter_explicit'] == {'hpf': 25, 'lpf': None}
+        for sec, port in (('adc_ports', '4'), ('dac_ports', '0')):
+            assert rec['state'][sec][port]['filter']['value'] is not None

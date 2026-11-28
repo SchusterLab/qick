@@ -1438,7 +1438,8 @@ def test_rf_filter_decoded(board_factory):
               {'gen': 0, 'filter': {'ftype': 'lowpass', 'fc': 8.0}}], settle_s=0)
     fs = c.rf_get()['adc_ports']['4']['filter_setting']
     assert fs['source'] == 'decoded from the registers' and fs['ftype'] == 'bandpass'
-    assert fs['hpf'] == RF.filter_step('HPF', 5.5) and fs['lpf'] == RF.filter_step('LPF', 6.5)
+    res = RF.filter_resolve({'ftype': 'bandpass', 'fc': 6.0, 'bw': 1.0})      # rfbox's rule, not the library's nearest
+    assert fs['hpf'] == res['explicit']['hpf'] and fs['lpf'] == res['explicit']['lpf']
     assert abs(fs['fc'] - 6.0) < 0.3 and abs(fs['bw'] - 1.0) < 0.3
     assert fs['last_request'] == {'ftype': 'bandpass', 'fc': 6.0, 'bw': 1.0}
     g = c.rf_get()['dac_ports']['0']['filter_setting']
