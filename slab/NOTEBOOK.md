@@ -3,6 +3,45 @@
 Running log for the lab fork. Newest entry first. Record dead ends as well as
 results, and say where each number came from.
 
+## 2026-11-27: rfbox, a front-end driver for the QICK box (branch `lab/rf-driver`)
+
+Against the fake box only; nothing here has run on a board. 43 tests in
+`slab/tests/test_rfbox.py`, 178 in `slab/tests/` pass. Note:
+`slab/notes/rfbox-driver.md` (API, readback per chip, upstream hazards with
+file:line, loopback checklist, migration table from the measurement side's
+`qick_rf.py`).
+
+- `qick/rfbox.py` replaces both the board server's RF code and the
+  measurement side's `board_side/qick_rf.py` (same description format and
+  hash; every qick_rf function has an rfbox equivalent). It works from
+  `adc_cards` / `dac_cards`, chains and chip objects, which 0.2.360 and 0.2.450
+  both have; the `rfb_*` port methods, `adc_chains` and the raw filter setter
+  are 0.2.4xx only.
+- Read from the library, not measured: the card constructor's nested
+  `init_filter` selection means only chain 0 of each card gets its 31.75 dB
+  attenuator write while selected; `add_MCP` writes the GPIO defaults
+  mirrored (DC In power-downs written 0); the RF Out rails are shared by
+  ports 0/2 and 1/3 and `enable_rf` switches the rail before the
+  attenuators; filter and RF-ADC attenuator `rfb_*` calls clear every ADC's
+  interrupts. Full list in the note.
+- Corrections to the round-3 board server RF code: the RF Out rail pin is
+  readable (same expander as the RF In rails); the constructor does not leave
+  every attenuator at 31.75 dB; RF In `att` does not need `amp: true` (that was
+  the `rfb_*` call's limitation); a DSA whose current value is unknown is now
+  raised first, not last; readout ports follow the ADC name as the library
+  does (round 3 used `rf.adcs[name].index`; equal on a ZCU216).
+  `test_ro_map_uses_converter_index` became `test_ro_map_port_follows_the_name`,
+  `att` alone left the refusal list, the stuck-switch test uses the fake's
+  `stuck` set, and bias readbacks compare within the DAC11001 LSB.
+- Fake (`qick/rfbox_fake.py`): what it takes from measurement (DSA 0 dB
+  after a load, amplifier left on through start-up, DSA reads back integer
+  dB) and what is a model (the over-range threshold) is listed in its
+  docstring.
+- Open for the hardware people: whether the GPIO defaults write lands; whether
+  attenuator writes with the card deselected land anywhere; which RF Out
+  channels really share a rail; ID of an empty slot (0 or 15); DSA readback
+  during over-voltage; whether the AXI bias switch can be read.
+
 ## 2026-11-26: board server, third round: from the engine side's client run (branch `lab/board-server`)
 
 All against the fake board; additive on the wire. 78 tests in
