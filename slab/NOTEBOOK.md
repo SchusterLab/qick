@@ -3,6 +3,22 @@
 Running log for the lab fork. Newest entry first. Record dead ends as well as
 results, and say where each number came from.
 
+## 2026-11-28: lab version numbers and release notes in the package
+
+At Dave's request, lab releases are numbered `<upstream>.<lab>`: the first is
+`0.2.450.1`, the same library code as the earlier tag `slab-0.2.450-1`. The lab
+number lives in `qick_lib/qick/LAB_VERSION`, so upstream's `VERSION` stays
+untouched and syncs do not conflict; `__init__.py` and `setup.py` append it
+(checked: `qick.__version__` and the built wheel both read `0.2.450.1`). Dave
+also asked that the library always ship with a description of the firmware it
+goes with: release notes (`LAB_RELEASE.md`) and a manifest of lab firmware
+builds with their sha256s (`lab_firmware.json`) are package data, read with
+`qick.lab_release`; `identify(bitfile)` names the build a file came from.
+Counter rule chosen: it restarts at 0 on each new upstream number (the sync
+script does this), so `.0` always means unreleased. Not yet done: the firmware
+itself does not carry the version (a constant register or the bitstream's
+USR_ACCESS word would let the library read it from the loaded image).
+
 ## 2026-11-26: first runs of the lab images on a board; larger-memory weighted build
 
 Builds (Vivado 2024.1, same recipe as 11-25, source `main` at the tag
