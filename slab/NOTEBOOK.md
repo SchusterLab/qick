@@ -3,6 +3,33 @@
 Running log for the lab fork. Newest entry first. Record dead ends as well as
 results, and say where each number came from.
 
+## 2026-11-27: rfbox 0.2, from the measurement side's integration against `slab-rfbox-0.1` (branch `lab/rf-driver`)
+
+Against the fake box only. 59 tests in `slab/tests/test_rfbox.py`, 194 in
+`slab/tests/` pass; both files parse with the Python 3.8 grammar. The tag
+`slab-rfbox-0.1` is left where it was.
+
+- The identity and `get()` carry `rfbox_version` ("0.2") and `rfbox_sha256`
+  (of the file as loaded). The mixin has `rfbox_version()`.
+- `labdev_*` and every `rfbox_*` call except `set` / `apply` / `apply_safe`
+  now raise on failure. In 0.1, `labdev_ro_off` returned the refusal dict,
+  which is truthy. The note has the full table of which calls return data and
+  which raise.
+- `adc_dsa` accepts any value in 0-27 dB and rounds it as qick_rf did;
+  `record=True` gives requested, applied and read. `clear_flags` takes a list
+  of blocks.
+- Filters: on the users' box the filters did not act and may not answer, and
+  the strict readback refused at the filter step. Strict stays the default;
+  `filter_verify: false` per channel lets the write stand with a warning and
+  marks it written-not-verified in `get()`. `filter_probe` gives raw register
+  reads with the selects used. Every filter step records the band, state and
+  nominal corners written, because older libraries (0.2.360, 0.2.436) choose
+  states with different code than rfbox's table.
+- `soc_class` (and the board server's RF soc class) wraps every `rfb_*`
+  method in the rfbox lock and invalidates what rfbox remembers writing.
+- Field numbers from the users (old driver, their setup) recorded in the note
+  under "Measured on hardware by the users".
+
 ## 2026-11-27: rfbox, a front-end driver for the QICK box (branch `lab/rf-driver`)
 
 Against the fake box only; nothing here has run on a board. 43 tests in

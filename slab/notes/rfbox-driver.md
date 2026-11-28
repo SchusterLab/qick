@@ -32,7 +32,11 @@ box = rfbox.attach(soc)           # one RfBox per soc object, cached on it
 
 | Call | What it does |
 |---|---|
-| `box.identity` | `{id, created, pid, soc, rfbox_api, qick_version}`. `id` is new for every soc object, so it changes on every server restart and image load |
+| `box.identity` | `{id, created, pid, soc, rfbox_api, rfbox_version, rfbox_sha256, qick_version}`. `id` is new for every soc object, so it changes on every server restart and image load. `rfbox_version` is `RFBOX_VERSION` ("0.2"); `rfbox_sha256` is the sha256 of the rfbox.py file as loaded, computed once at import (None if the file cannot be read). `get()` carries both at top level as well |
+| `rfbox.version_info()`, mixin `rfbox_version()` | `{rfbox_version, rfbox_sha256, rfbox_api, file}` |
+| `box.filter_probe(side, port, deselected=False)` | Raw reads of every ADMV8818 register of one RF In (`'adc'`) or RF Out (`'dac'`) port, each with its value or read error, plus the card select (board id, the AXI GPIO value 0x8 + id) and the chip select (`ch_en`, `cs_t`) used, the PRODUCT_ID and a verdict. Reads only. `deselected=True` also reads with no card selected |
+| `with rfbox.locked(soc):` | The rfbox lock of that soc (re-entrant, the same object as `box.lock`), for code outside rfbox that drives the cards |
+| `box.forget(why)` | Mark everything rfbox remembers writing (attenuators, filters, bias switch) unknown |
 | `box.get(flags=True)` | Full state as plain JSON data. Reading never clears a flag |
 | `box.layout(read_ids=True)` | Cards per slot (kind, library class, ID read now, ports), generator / readout / ADC block → port, slot, card channel, rail |
 | `box.set(items, settle_s=0.2, protect=True)` | Validate everything, then apply in the safe order with readback. Afterwards clear the ADC flags, wait, and read them |
@@ -40,16 +44,34 @@ box = rfbox.attach(soc)           # one RfBox per soc object, cached on it
 | `box.apply(description, others='leave'\|'safe')` | Declarative, in qick_rf's format and order (below) |
 | `box.check(description, record)` / `check_applied` | Every reason the board no longer holds a description, including a new identity |
 | `box.apply_safe(items=None)`, `box.before_load()` | Safe state; all amplifiers off before a load |
-| `box.clear_flags(settle_s=0)`, `box.flags()` | Read and clear / only read the ADC interrupt words |
+| `box.clear_flags(settle_s=0, blocks=None)`, `box.flags()` | Read and clear / only read the ADC interrupt words. `blocks` is a list of ADC block names (default: every block of the firmware); the record has `cleared`, `not_cleared` (read failed) and `blocks` |
 | `box.set_limits(table)`, `box.limits` | The limits table every later `set` / `apply` is checked against |
 | `rfbox.soc_class(RFQickSoc216V1)` | Served soc class with `rfbox_*` and `labdev_*` methods (plain data in and out, safe under Pyro's pickle serializer) |
 | `rfbox.Local(soc)` | The same methods on a soc in a notebook |
 | `rfbox.check_reply(reply)` | Client side: raises `Refused` again from a refusal reply |
 
-The mixin returns a refusal as data, `{'ok': False, 'refused': msg, 'code', 'record'}`,
-and a bad request as a builtin `ValueError('<code>: <message>')`. A Pyro client
-may not have rfbox installed, so it cannot be relied on to unpickle custom
-exceptions.
+A Pyro client may not have rfbox installed, so it cannot be relied on to
+unpickle custom exceptions. The mixin therefore uses builtin exceptions only.
+Which calls return a refusal as data and which raise:
+
+| Call | Success | Refusal (`Refused`) | Bad request |
+|---|---|---|---|
+| `rfbox_set`, `rfbox_apply`, `rfbox_apply_safe` | the record | **returned as data**: `{'ok': False, 'refused': msg, 'code', 'record'}` (truthy: test `ok`, or pass it through `check_reply`, which raises `Refused`) | `ValueError('<code>: ...')` |
+| `rfbox_get`, `rfbox_layout`, `rfbox_identity`, `rfbox_version`, `rfbox_clear_flags`, `rfbox_limits`, `rfbox_filter_probe` | the data | `RuntimeError('<code>: ...')` | `ValueError` |
+| `rfbox_check` | a list of reasons; **empty means the board holds the description** | `RuntimeError` | `ValueError` |
+| `labdev_adc_dsa`, `labdev_adc_flags`, `labdev_ro_off`, `labdev_filter_regs` | the value (`labdev_ro_off`: `True`) | `RuntimeError('<code>: ...')` (since 0.2; 0.1 returned the refusal dict, which is truthy) | `ValueError` |
+
+In-process, the module helpers `adc_dsa`, `adc_flags`, `ro_off` and
+`filter_registers` raise `Refused` or `RfboxError` and never return a
+failure. `RfBox.set`, `apply` and `apply_safe` raise `Refused`, with the record
+attached. Only the three `rfbox_*` record calls above turn a refusal into data.
+
+`adc_dsa(soc, block, att=None, record=False)` (and `labdev_adc_dsa`) takes any
+number from 0 to 27 dB and rounds it to the chip's 1 dB step with `round()`, as
+qick_rf did. It returns the value read back, or with `record=True`
+`{block, requested, applied, read, step_db, note}`. `set` items and
+descriptions still require whole dB for `adc_att`, so a request there is never
+silently changed.
 
 ### Values and their sources
 
@@ -115,6 +137,83 @@ index. There are no channel names and no calibration.
   (`adc_flags`) when a flag is set.
 - **Shared rails.** Every RF Out rail change lists the paired channel in
   `affects` with its state before and after.
+
+### Filters that do not read back
+
+By default a filter write is verified: WR0_SW and WR0_FILTER are read back,
+and if they differ from what was written or cannot be read, `set` and `apply`
+stop at that step with `Refused('readback')`. In `apply`, that is before the
+readout's amplifier is switched on. On a box whose ADMV8818s do not answer,
+that refuses every application.
+
+The opt-out is per channel: `filter_verify: false` next to the filter, in a
+`set` item (`{'ro': 0, 'filter': {...}, 'filter_verify': False}`) or in a
+description channel (`ros.R` or `gens.G`). With it:
+
+- the write stands and the sequence goes on;
+- the step has `verified: false`, `readback` (the registers read) or
+  `readback_error`, and a `warning` that is also collected into the record's
+  `warnings`. A read of all 0x00 or all 0xFF is called out as "the chip does
+  not seem to answer";
+- `get()` reports that filter as
+  `{'source': 'written', 'verified': False, 'readback': 'differs'|'failed', 'regs_written', 'raw', ...}`,
+  with the value decoded from what was written;
+- `check()` compares the description with what rfbox wrote, not with the
+  registers.
+
+`filter_verify: true` is the default and is not stored, so descriptions
+without the key keep their hash. `get()` never raises on a filter read: a
+failure is `source: 'error'` (nothing written by rfbox) or the
+written-not-verified record above.
+
+For diagnosis, `filter_probe('adc', 4)` reads ADI_SPI_CONFIG_A, CHIPTYPE,
+PRODUCT_ID_L/H, WR0_SW and WR0_FILTER one by one and says which card select
+and chip select it used.
+
+### Which filter state is written
+
+rfbox computes WR0_SW / WR0_FILTER from its own table (`FILTER_BANDS`, the
+band edges of the 0.2.4xx library's `FilterADMV8818`, nearest of 16 states per
+band) and writes the registers directly, with the same result on every library
+version. Older libraries choose states with different code: 0.2.360's
+`_freq2band` / `_freq2bits` use span/16 steps, and the measurement side's box
+runs 0.2.436. So the same fc / bw given to `rfb_set_ro_filter` /
+`rfb_set_gen_filter` on such a library can select a different state from
+rfbox's. Any comparison between the two must use what was actually written.
+Every filter step records it in `written`:
+
+```
+{'WR0_SW', 'WR0_FILTER', 'hpf_band', 'hpf_state', 'lpf_band', 'lpf_state',
+ 'hpf_step', 'lpf_step', 'hpf_ghz', 'lpf_ghz', 'table'}
+```
+
+Band 0 is bypass, and `*_ghz` are the nominal corners from rfbox's table.
+`apply` copies the step's `written` and `verified` into
+`ros.R.filter_written` / `gens.G.filter_written`. The mapping from registers to
+band and state is the one `set_filter_raw` uses (`0xC0 | hpf_band << 3 |
+lpf_band`, `hpf_state << 4 | lpf_state`) and was checked against the library
+code. The corner frequencies are datasheet-nominal, not measured.
+
+### Locking against the library's own methods
+
+All of rfbox's hardware access holds one re-entrant lock per soc
+(`box.lock`, `rfbox.locked(soc)`). The library's `rfb_*` methods and other
+helpers do not take it. `soc_class(base)` (and `lock_rfb_methods(cls)`, which
+the board server now applies to its `RFQickSoc216V1` class) wraps every
+`rfb_*` method of the resulting class so that:
+
+- it holds the lock;
+- unless it is an `rfb_get_*` reader, everything rfbox remembers writing is
+  afterwards marked `unknown`, with `why` naming the method and `previous` the
+  old record. This matters for the attenuators, which cannot be read back.
+  Readable values (DSA, expander pins, filters, gain, bias) are re-read by
+  `get()` anyway.
+
+The base class is not modified. Code that reaches the chips without an `rfb_*`
+method (chain objects, `soc.rf`, other helpers) still bypasses the lock unless
+it uses `with rfbox.locked(soc):`. Afterwards it should call
+`attach(soc).forget('why')`. `prepare_round` / `cleanup_round` (which clear ADC
+interrupts) are not wrapped.
 
 ### Limits table
 
@@ -231,6 +330,21 @@ every load record. Summary:
   (measured), and at 0 dB an RF In amplifier alone drives the ADC over range.
 - **0.2.4xx only**: tile restart and interrupt clear.
 
+## Measured on hardware by the users
+
+These were reported by the measurement side, measured through the older driver
+(qick_rf / the library's `rfb_*` calls). They are not a validation of rfbox,
+and the setup and its calibration are theirs.
+
+- **RF Out attenuators:** the output attenuation was 4-7 % above the commanded
+  dB at 6.9 GHz.
+- **RF-ADC step attenuator:** its steps are about 0.4 dB larger than the
+  nominal 1 dB.
+- **RF In chain:** on that setup it compresses when the readout attenuator is
+  set below 28 dB.
+- **Filters:** they did not act on one box, and may not answer on the SPI
+  read (see "Filters that do not read back" and checklist step 9).
+
 ## Loopback checklist (hardware)
 
 Each line is: set, measure, confirm. Use a loopback from RF Out to RF In
@@ -307,5 +421,9 @@ repositories pin it.
 - **Over-range physics:** an amplifier on with the DSA below `threshold_db`
   latches over-range. DSA 0 and attenuator 0 also latch over-voltage. The
   threshold is a model value.
-- **Fault injection:** `box.fail(chip, ...)`, `box.stuck`, `box.inject`.
+- **Fault injection:** `box.fail(chip, ...)`, `box.stuck`, `box.inject`,
+  `box.filter_mode[(side, port)] = 'zero' | 'ones' | 'raise'` (a filter chip
+  that reads 0x00 or 0xFF, or whose read fails; writes still land).
+- **Description lines:** card lines are added to `extra_description` only if
+  the cfg does not already have them.
 - **Assertions:** `box.select_conflicts` counts interleaved selections.
