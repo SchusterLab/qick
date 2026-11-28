@@ -269,6 +269,9 @@ class FakeBoardSelection(object):
         self.box = box
 
     def enable(self, board_id=0):
+        if self.box.selected is not None and self.box.selected != board_id:
+            # another card is selected: two threads interleaving on the shared SPI / selection GPIO
+            self.box.select_conflicts += 1
         self.box.selected = board_id
 
     def disable(self):
@@ -537,6 +540,7 @@ class FakeQickBox(object):
         self.library = library
         self.ids = dict(ids or {})
         self.selected = None
+        self.select_conflicts = 0
         self.slots = {}
         self._att, self._filters, self._gain = {}, {}, {}
         self._bias = [0] * 8
