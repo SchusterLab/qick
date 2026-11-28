@@ -390,6 +390,23 @@ def test_module_helpers(board):
     assert R.ro_off(soc, 0) is True and box.amp[4] is False and box.att('adc', 4) == 31.75
 
 
+def test_qick_rf_names(board):
+    box, soc, rf = board
+    regs = R.filter_registers(soc, 'ro', 0)
+    assert (regs['PRODUCT_ID_H'], regs['PRODUCT_ID_L']) == (0x88, 0x18) and regs['WR0_SW'] == 0xC0
+    assert R.filter_registers(soc, 'gen', 1)['WR0_FILTER'] == 0
+    with pytest.raises(R.RfboxError):
+        R.filter_registers(soc, 'gen', 2)              # generator 2 is on the DC Out card
+    assert R.has_helpers(R.Local(soc)) and not R.has_helpers(soc)
+    assert R.layout(soc.get_cfg())['adc'][2]['kind'] == 'rf_in'      # the constructor's description lines
+    assert R.flags(R.OVR_VOLTAGE)['over_voltage']
+    for n in ('normalize', 'plain', 'spec_hash', 'layout_text', 'channels', 'problems', 'adc_dsa', 'adc_flags',
+              'ro_off', 'Local', 'Refused', 'FTYPES', 'F_MIN', 'F_MAX', 'KINDS', 'NAMES', 'OVR_VOLTAGE',
+              'OVR_RANGE', 'SUBADC_RANGE', 'IDLE_WAIT_S', 'ATT_MAX', 'ATT_STEP', 'ADC_ATT_MAX',
+              'ADC_ATT_DEFAULT', 'BIAS_MAX', 'FILTER_REGS'):
+        assert hasattr(R, n), n
+
+
 def test_mixin_replies_are_plain_data():
     box = F.FakeQickBox()
     soc = box.make_soc()

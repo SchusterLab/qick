@@ -2098,6 +2098,38 @@ def ro_off(soc, ro_ch):
     return attach(soc).ro_off(int(ro_ch))
 
 
+FILTER_REGS = ('ADI_SPI_CONFIG_A', 'CHIPTYPE', 'PRODUCT_ID_L', 'PRODUCT_ID_H', 'WR0_SW', 'WR0_FILTER')
+
+
+def filter_registers(soc, kind, ch):
+    """qick_rf.filter_regs: the ADMV8818 registers of generator (kind 'gen') or readout ('ro') `ch`, read from the
+    chip: {name: value}. Reads only. PRODUCT_ID 0x8818 when the chip answers (all 0x00 or 0xFF: it does not)."""
+    box = attach(soc)
+    with box.lock:
+        m = box.gen_map() if str(kind) == 'gen' else box.ro_map()
+        c = m.get(int(ch))
+        if c is None:
+            raise _bad('ch', 'the firmware has no %s %r' % ('generator' if str(kind) == 'gen' else 'readout', ch))
+        side = 'dac' if str(kind) == 'gen' else 'adc'
+        p = box._need(side, c['port'], ('rf_out',) if side == 'dac' else ('rf_in',), '%s %d' % (kind, int(ch)))
+        with box._sel(p['board_id']):
+            return dict((r, int(p['chain'].filter.read_reg(r))) for r in FILTER_REGS)
+
+
+def has_helpers(soc):
+    """Whether a (remote) soc offers the rfbox_* / labdev_* methods (soc_class, or qick_pyro_server.py's labdev_*)."""
+    for n in ('labdev_adc_dsa', 'labdev_adc_flags', 'labdev_ro_off'):
+        try:
+            if not callable(getattr(soc, n, None)):
+                return False
+        except Exception:      # noqa: BLE001  (a Pyro proxy that cannot fetch its metadata)
+            return False
+    return True
+
+
+layout = cfg_layout           # qick_rf.layout(cfg)
+
+
 def _plainify(obj):
     return json.loads(json.dumps(obj, default=lambda o: float(o) if isinstance(o, Real) else str(o)))
 
@@ -2160,6 +2192,9 @@ class RfBoxSocMixin(object):
 
     def labdev_ro_off(self, ro_ch):
         return _reply(ro_off, self, ro_ch)
+
+    def labdev_filter_regs(self, kind, ch):
+        return _reply(filter_registers, self, kind, ch)
 
 
 def soc_class(base):

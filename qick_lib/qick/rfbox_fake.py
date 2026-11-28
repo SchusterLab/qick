@@ -220,7 +220,8 @@ class FakeADMV8818(_Chip):
     def read_reg(self, reg):
         if not self._on():
             return 0xFF
-        return int(self._regs().get(reg, 0))
+        fixed = {'PRODUCT_ID_L': 0x18, 'PRODUCT_ID_H': 0x88, 'CHIPTYPE': 0x01}
+        return int(fixed[reg] if reg in fixed else self._regs().get(reg, 0))
 
 
 class FakeLMH6401(_Chip):
