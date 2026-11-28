@@ -27,7 +27,9 @@ soc (soc._rfbox_lock); calls made to the soc's rfb_* methods by other code do no
     box.set([{"ro": 0, "adc_att": 27}, {"ro": 0, "att": 10, "amp": True}])   # validated, ordered, verified
     box.apply({"gens": {...}, "ros": {...}, "bias": {...}, "cards": {...}})  # declarative (qick_rf's format)
     box.apply_safe()                  # ADC attenuators 27 dB, amplifiers off, attenuators 31.75 dB; bias untouched
-    box.clear_flags(); box.limits / box.set_limits(table); box.check_applied(description, record)
+    box.clear_flags(blocks=None); box.limits / box.set_limits(table); box.check_applied(description, record)
+    box.filter_probe('adc', 4)        # raw ADMV8818 register reads with the selects used (diagnosis)
+    with rfbox.locked(soc): ...       # the same re-entrant lock, for code outside rfbox that drives the cards
 Over Pyro: soc_class(RFQickSoc216V1) adds rfbox_* methods to the served soc (RfBoxSocMixin), which return plain
 dicts and turn a refusal into {"ok": False, "refused": ...} (check_reply raises it again on the client).
 
@@ -36,6 +38,7 @@ driver wrote since the soc was constructed; the chip cannot be read), "assumed" 
 believed to have written; not confirmed), "unknown", or "error". Nothing here has been run on a board: see
 slab/notes/rfbox-driver.md for the hardware checklist.
 """
+import functools
 import hashlib
 import json
 import os
@@ -48,6 +51,18 @@ from contextlib import contextmanager
 from numbers import Integral, Real
 
 API_VERSION = 1
+RFBOX_VERSION = '0.2'
+
+
+def _file_sha256():
+    try:
+        with open(__file__, 'rb') as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except Exception:      # noqa: BLE001  (frozen, zipped, or __file__ not set)
+        return None
+
+
+RFBOX_SHA256 = _file_sha256()     # of this file as loaded, computed once at import
 
 # ---- nominal datasheet tables -----------------------------------------------------------------------------------------
 ATT_MAX, ATT_STEP = 31.75, 0.25          # PE43705 step attenuators (RF Out: two per channel, RF In: one)
@@ -350,7 +365,8 @@ def _filter_applied(req):
 
 
 # ---- rf_set settings (the board server's vocabulary) ---------------------------------------------------------------------
-ITEM_KEYS = {'ro', 'gen', 'adc', 'bias', 'adc_att', 'filter', 'att', 'amp', 'gain', 'volts', 'dc', 'supply'}
+ITEM_KEYS = {'ro', 'gen', 'adc', 'bias', 'adc_att', 'filter', 'filter_verify', 'att', 'amp', 'gain', 'volts', 'dc',
+             'supply'}
 
 
 def check_items(settings, allow_empty=False):
@@ -370,7 +386,9 @@ def check_items(settings, allow_empty=False):
         {"gen": G, "filter": {...}}              RF Out filter
         {"gen": G, "dc": true|false}             DC Out powered up / down
         {"bias": I, "volts": V}                  main-board bias output 0-7
-    A filter is {ftype, fc, bw} (GHz) or {hpf, lpf} (raw steps, -1 = bypass)."""
+    A filter is {ftype, fc, bw} (GHz) or {hpf, lpf} (raw steps, -1 = bypass). "filter_verify": false next to a
+    filter lets the write stand when the registers do not read back what was written (a chip that does not
+    answer): the record carries a warning with what was read, get() marks the filter written-not-verified."""
     if not isinstance(settings, list) or (not settings and not allow_empty):
         raise _bad('settings', 'a non-empty list of settings')
     out = []
@@ -395,7 +413,8 @@ def check_items(settings, allow_empty=False):
             if isinstance(v, bool) or not isinstance(v, Integral) or v < 0 or (t == 'bias' and v > 7):
                 raise _bad(w + '.' + t, '%r is not a channel number' % (v,))
             n[t] = int(v)
-        allowed = {'ro': {'adc_att', 'filter', 'att', 'amp', 'gain'}, 'gen': {'filter', 'att', 'dc', 'supply'},
+        allowed = {'ro': {'adc_att', 'filter', 'filter_verify', 'att', 'amp', 'gain'},
+                   'gen': {'filter', 'filter_verify', 'att', 'dc', 'supply'},
                    'adc': {'adc_att'}, 'bias': {'volts'}}[t]
         keys = set(it) - {t}
         if not keys:
@@ -407,6 +426,13 @@ def check_items(settings, allow_empty=False):
             n['adc_att'] = _dsa(it['adc_att'], w + '.adc_att')
         if 'filter' in it:
             n['filter'] = _filter(it['filter'], w + '.filter')
+        if 'filter_verify' in it:
+            if not isinstance(it['filter_verify'], bool):
+                raise _bad(w + '.filter_verify', 'true or false')
+            if 'filter' not in it:
+                raise _bad(w + '.filter_verify', 'only next to a filter')
+            if it['filter_verify'] is False:
+                n['filter_verify'] = False
         if t == 'gen':
             if 'att' in it:
                 a = it['att']
@@ -553,6 +579,32 @@ def _chan(k, what, top=64):
     return n
 
 
+def _filter_verify(d, w):
+    v = d.get('filter_verify', True)
+    if not isinstance(v, bool):
+        raise _bad(w + '.filter_verify', 'true or false (false: a filter that does not read back is not refused)')
+    return v
+
+
+def filter_written(regs):
+    """What a WR0_SW / WR0_FILTER pair sets: the registers, band and state of each section, and their nominal
+    corner frequencies from rfbox's table (FILTER_BANDS, the 0.2.4xx library's)."""
+    sw, filt = int(regs['WR0_SW']), int(regs['WR0_FILTER'])
+    hb, lb, hs, ls = (sw >> 3) & 7, sw & 7, (filt >> 4) & 15, filt & 15
+    dec = decode_filter(regs) or {}
+    return {'WR0_SW': sw, 'WR0_FILTER': filt, 'hpf_band': hb, 'hpf_state': hs, 'lpf_band': lb, 'lpf_state': ls,
+            'hpf_step': dec.get('hpf'), 'lpf_step': dec.get('lpf'),
+            'hpf_ghz': dec.get('hpf_ghz'), 'lpf_ghz': dec.get('lpf_ghz'),
+            'table': 'rfbox FILTER_BANDS (the 0.2.4xx library table; band 0 = bypass)'}
+
+
+def _no_answer(regs):
+    if not isinstance(regs, dict) or not regs:
+        return False
+    vals = set(int(v) for v in regs.values())
+    return vals <= {0} or vals <= {0xFF}
+
+
 def normalize(rf):
     """The description checked and in canonical form (qick_rf.normalize, extended):
         gens: {G: {att: [A1, A2], filter: {...}}}   RF Out generator
@@ -576,7 +628,7 @@ def normalize(rf):
                 raise _bad(w, 'a DC Out generator has only dc: true|false')
             out['gens'][ch] = {'dc': g['dc']}
             continue
-        if not isinstance(g, dict) or sorted(set(g) - {'att', 'filter'}):
+        if not isinstance(g, dict) or sorted(set(g) - {'att', 'filter', 'filter_verify'}):
             raise _bad(w, 'a generator has att: [A1, A2] and filter: {...} (or dc: true|false on DC Out)')
         a = g.get('att')
         if not isinstance(a, (list, tuple)) or len(a) != 2:
@@ -585,9 +637,11 @@ def normalize(rf):
             raise _bad(w, 'no filter (give {ftype: bypass} for none)')
         out['gens'][ch] = {'att': [_att(a[0], w + '.att[0]'), _att(a[1], w + '.att[1]')],
                            'filter': _filter(g['filter'], w + '.filter', allow_raw=False)}
+        if _filter_verify(g, w) is False:
+            out['gens'][ch]['filter_verify'] = False
     for k, r in (rf.get('ros') or {}).items():
         ch, w = _chan(k, 'rf.ros'), 'rf.ros.%s' % k
-        if not isinstance(r, dict) or sorted(set(r) - {'att', 'filter', 'adc_att', 'amp', 'gain'}):
+        if not isinstance(r, dict) or sorted(set(r) - {'att', 'filter', 'filter_verify', 'adc_att', 'amp', 'gain'}):
             raise _bad(w, 'a readout has att, filter, adc_att and amp (RF In) or gain, adc_att, amp (DC In)')
         amp = r.get('amp', True)
         if not isinstance(amp, bool):
@@ -595,7 +649,7 @@ def normalize(rf):
         adc_att = _att(ADC_ATT_DEFAULT if r.get('adc_att') is None else r['adc_att'], w + '.adc_att',
                        ADC_ATT_MAX, 1, what='the RF-ADC attenuator takes whole dB')
         if r.get('gain') is not None:
-            if set(r) & {'att', 'filter'}:
+            if set(r) & {'att', 'filter', 'filter_verify'}:
                 raise _bad(w, 'gain is for a DC In readout; att and filter are for RF In')
             g = _num(r['gain'], w + '.gain')
             if not GAIN_MIN <= g <= GAIN_MAX or g != int(g):
@@ -608,6 +662,8 @@ def normalize(rf):
                 raise _bad(w, 'no filter (give {ftype: bypass} for none)')
             one = {'att': _att(r['att'], w + '.att'), 'filter': _filter(r['filter'], w + '.filter', allow_raw=False),
                    'adc_att': adc_att}
+            if _filter_verify(r, w) is False:
+                one['filter_verify'] = False
         if amp is False:
             one['amp'] = False
         out['ros'][ch] = one
@@ -831,8 +887,13 @@ def _soc_attr(soc, name, factory):
 
 
 def soc_lock(soc):
-    """The one lock around every hardware access of this module to this soc (SPI and board selection are shared)."""
+    """The one lock around every hardware access of this module to this soc (SPI and board selection are shared).
+    Re-entrant. Code outside rfbox that drives the cards should hold it too: `with rfbox.locked(soc): ...`; a class
+    built with soc_class / lock_rfb_methods takes it in every rfb_* method."""
     return _soc_attr(soc, '_rfbox_lock', threading.RLock)
+
+
+locked = soc_lock                 # with rfbox.locked(soc): ... (the same RLock as attach(soc).lock)
 
 
 def attach(soc, **kwargs):
@@ -881,7 +942,8 @@ class RfBox(object):
         self._xrfdc = xrfdc
         self.limits = check_limits_table(limits) if limits else None
         self.identity = {'id': uuid.uuid4().hex[:16], 'created': time.time(), 'pid': os.getpid(),
-                         'soc': '%x' % id(soc), 'rfbox_api': API_VERSION}
+                         'soc': '%x' % id(soc), 'rfbox_api': API_VERSION, 'rfbox_version': RFBOX_VERSION,
+                         'rfbox_sha256': RFBOX_SHA256}
         self.library = _library_info(soc)
         self.identity['qick_version'] = self.library['qick_version']
         self._written = {}           # ('ro_att', port) | ('dac_att', port) | ('filter', side, port) | 'bias_enabled'
@@ -1005,9 +1067,11 @@ class RfBox(object):
                 raise RuntimeError('XRFdc_IntrClr(%d, %d): status %d' % (tile, block, st))
         return word
 
-    def _flags_all(self, clear=False):
+    def _flags_all(self, clear=False, blocks=None):
         out = {}
         for name, t, b in self.adc_blocks():
+            if blocks is not None and name not in blocks:
+                continue
             try:
                 e = decode_flags(self._flags_word(t, b, clear))
             except Exception as ex:      # noqa: BLE001
@@ -1126,15 +1190,39 @@ class RfBox(object):
                                                                         'was constructed')
 
     def _filter_state(self, p):
+        """Never raises: a failed or disagreeing readback is data."""
+        last = self._written.get(('filter', p['side'], p['port']))
+        regs, err = None, None
         try:
             regs = self._filter_read(p)
         except Exception as e:      # noqa: BLE001
-            return _val(None, 'error', error=_exc(e))
-        dec = decode_filter(regs)
+            err = _exc(e)
+        wregs = last.get('regs') if last is not None and last.get('source') == 'written' else None
+        if wregs is not None and regs != wregs:
+            out = _val(decode_filter(wregs), 'written', by=last.get('by'), verified=False, regs_written=dict(wregs),
+                       raw=regs, readback='failed' if err else 'differs',
+                       why=('the registers could not be read back (%s)' % err) if err else
+                       'the registers read back differ from what this driver wrote')
+            if err:
+                out['readback_error'] = err
+            if _no_answer(regs):
+                out['note'] = 'the registers read all 0x%02x: the chip does not seem to answer' % list(regs.values())[0]
+            out['last_request'] = last['value']
+            return out
+        if err:
+            out = _val(None, 'error', error=err)
+            if last is not None:
+                out['last_request'] = last['value']
+            return out
+        try:
+            dec = decode_filter(regs)
+        except Exception:      # noqa: BLE001
+            dec = None
         out = _val(dec, 'read', raw=regs)
         if dec is None:
             out['why'] = 'the registers do not decode to a setting set_filter_raw can write'
-        last = self._written.get(('filter', p['side'], p['port']))
+        if _no_answer(regs):
+            out['note'] = 'the registers read all 0x%02x: the chip may not be answering' % list(regs.values())[0]
         if last is not None:
             out['last_request'] = last['value']
         return out
@@ -1220,7 +1308,8 @@ class RfBox(object):
 
     def _get_locked(self, flags=True):
         cache = {}
-        st = {'rfbox': API_VERSION, 'identity': dict(self.identity), 'time': time.time(), 'library': self.library,
+        st = {'rfbox': API_VERSION, 'rfbox_version': RFBOX_VERSION, 'rfbox_sha256': RFBOX_SHA256,
+              'identity': dict(self.identity), 'time': time.time(), 'library': self.library,
               'layout': self._layout_locked(read_ids=True, reg_cache=cache), 'adc_ports': {}, 'dac_ports': {},
               'adc_att': {}, 'bias': {}, 'limits': self.limits, 'readback': READBACK}
         for (side, port), p in sorted(self._ports().items()):
@@ -1333,7 +1422,8 @@ class RfBox(object):
                 p = self._need('dac', c['port'], ('rf_out',), what, w + '.gen')
                 if 'filter' in it:
                     once(('filter', 'dac', p['port']), w)
-                    step('filters', 'filter', ('dac', p['port']), it['filter'], '%s filter' % what)
+                    step('filters', 'filter', ('dac', p['port']), it['filter'], '%s filter' % what,
+                         verify=it.get('filter_verify', True))
                 # att without supply: the rail goes on in the same step, after the attenuators (as
                 # DacRfChain216.enable_rf does, in the safer order)
                 implicit = 'att' in it and 'supply' not in it
@@ -1361,7 +1451,8 @@ class RfBox(object):
                 if 'filter' in it:
                     p = self._need('adc', c['port'], ('rf_in',), what, w + '.ro')
                     once(('filter', 'adc', p['port']), w)
-                    step('filters', 'filter', ('adc', p['port']), it['filter'], '%s filter' % what)
+                    step('filters', 'filter', ('adc', p['port']), it['filter'], '%s filter' % what,
+                         verify=it.get('filter_verify', True))
                 amp = it.get('amp')
                 if amp is not None or 'att' in it or 'gain' in it:
                     kinds = ('rf_in',) if 'att' in it else ('dc_in',) if 'gain' in it else ('rf_in', 'dc_in')
@@ -1461,16 +1552,36 @@ class RfBox(object):
             p = ports[(side, port)]
             h, l = filter_steps_for(v)
             regs = filter_regs(h, l)
+            verify = s.get('verify', True)
             self._filter_write(p, regs)
-            self._wr(('filter', side, port), dict(v), by)
-            got = self._filter_read(p)
-            dec = decode_filter(got)
+            got, err = None, None
+            try:
+                got = self._filter_read(p)
+            except Exception as e:      # noqa: BLE001
+                err = _exc(e)
+            ok = err is None and got == regs
+            self._written[('filter', side, port)] = _val(dict(v), 'written', by=by, at=time.time(), regs=dict(regs),
+                                                        verified=ok)
+            try:
+                dec = decode_filter(got) if got is not None else None
+            except Exception:      # noqa: BLE001
+                dec = None
             setting = dict(dec or {})
             setting['source'] = 'decoded from the registers' if dec else 'registers not decodable'
             setting['last_request'] = dict(v)
-            extra.update(requested=dict(v), applied=decode_filter(regs), verified=got == regs)
-            if got != regs:
-                raise _VerifyError('filter of %s port %d reads %s after writing %s' % (side.upper(), port, got, regs))
+            extra.update(requested=dict(v), applied=decode_filter(regs), written=filter_written(regs), verified=ok,
+                         filter_verify=verify)
+            if not ok:
+                msg = 'filter of %s port %d %s after writing %s' % (
+                    side.upper(), port, ('could not be read back (%s)' % err) if err else 'reads %s' % got, regs)
+                if _no_answer(got):
+                    msg += ' (all 0x%02x: the chip does not seem to answer)' % list(got.values())[0]
+                if verify:
+                    raise _VerifyError(msg + '; give filter_verify: false to let the write stand')
+                extra['readback'] = got
+                if err:
+                    extra['readback_error'] = err
+                extra['warning'] = msg + ': filter_verify is false, the write stands, not verified'
             return {'read': got, 'setting': setting, 'steps_requested': [h, l]}, extra
         if op == 'dac_dc':
             p = ports[('dac', t)]
@@ -1572,6 +1683,8 @@ class RfBox(object):
         try:
             entry['result'], extra = self._do(s, by)
             entry.update(extra)
+            if extra.get('warning'):
+                rec.setdefault('warnings', []).append(extra['warning'])
             return entry
         except Exception as e:      # noqa: BLE001
             entry['error'] = _exc(e)
@@ -1629,7 +1742,8 @@ class RfBox(object):
             if check and self.limits:
                 check_limits(items, self.limits, self.ro_map())
             steps = self._plan(items)
-            rec = {'order': [], 'actions': [], 'problems': [], 'by': by, 'identity': self.identity['id'],
+            rec = {'order': [], 'actions': [], 'problems': [], 'warnings': [], 'by': by,
+                   'identity': self.identity['id'],
                    'flags_latched_before': flag_list(self._flags_all(clear=True))}
             for s in steps:
                 self._run(rec, s, by)
@@ -1678,14 +1792,98 @@ class RfBox(object):
         with self.lock:
             return self._flags_all(clear=clear)
 
-    def clear_flags(self, settle_s=0.0):
-        """Read and clear every ADC's flags; after settle_s read them again (not cleared)."""
+    def clear_flags(self, settle_s=0.0, blocks=None):
+        """Read and clear the flags of `blocks` (ADC block names; default every ADC block of the firmware); after
+        settle_s read them again (not cleared). The record lists the blocks cleared."""
         with self.lock:
-            before = self._flags_all(clear=True)
+            names = [b[0] for b in self.adc_blocks()]
+            if blocks is not None:
+                if isinstance(blocks, str) or not isinstance(blocks, (list, tuple)):
+                    raise _bad('blocks', 'a list of ADC block names such as ["20"]')
+                blocks = [str(b) for b in blocks]
+                bad = [b for b in blocks if b not in names]
+                if bad:
+                    raise _bad('blocks', 'the firmware has no ADC block %s (it has %s)' % (', '.join(bad),
+                                                                                       ', '.join(names)))
+            before = self._flags_all(clear=True, blocks=blocks)
             if settle_s:
                 self.sleep(settle_s)
-            after = self._flags_all(clear=False)
-            return {'flags_before': flag_list(before), 'flags_after': flag_list(after), 'settle_s': settle_s}
+            after = self._flags_all(clear=False, blocks=blocks)
+            return {'flags_before': flag_list(before), 'flags_after': flag_list(after), 'settle_s': settle_s,
+                    'cleared': sorted(n for n, e in before.items() if 'error' not in e),
+                    'not_cleared': sorted(n for n, e in before.items() if 'error' in e),
+                    'blocks': 'all' if blocks is None else sorted(blocks)}
+
+    def forget(self, why, keys=None):
+        """Mark what this driver remembers writing (attenuators, filters, the bias switch) as unknown, e.g. after
+        code outside rfbox has driven the cards (soc_class does this after every rfb_* setter)."""
+        with self.lock:
+            for k in list(self._written):
+                if keys is not None and k not in keys:
+                    continue
+                old = self._written[k]
+                if old.get('source') == 'unknown':
+                    continue
+                self._written[k] = _val(None, 'unknown', why=why, previous=old)
+
+    def filter_probe(self, side, port, deselected=False):
+        """Raw ADMV8818 register reads of one RF In ('adc') / RF Out ('dac') port for diagnosis: each register's
+        value or read error, with the card select and chip select used. Reads only. deselected=True also reads
+        with no card selected (what a chip that ignores the card select would answer)."""
+        side = str(side)
+        if side not in ('adc', 'dac'):
+            raise _bad('side', "'adc' or 'dac'")
+        with self.lock:
+            p = self._need(side, int(port), ('rf_in',) if side == 'adc' else ('rf_out',), '%s port %s'
+                           % (side.upper(), port))
+            f = p['chain'].filter
+            sel = getattr(self.soc, 'board_sel', None)
+            out = {'side': side, 'port': p['port'], 'slot': p['slot'], 'card': p['name'], 'card_ch': p['card_ch'],
+                   'chip_class': type(f).__name__,
+                   'card_select': {'board_id': p['board_id'], 'gpio_value': 0x8 | p['board_id'], 'gpio_mask': 0xF,
+                                   'how': 'BoardSelection.enable_context(%d) around each read (E/D bit 3 + board '
+                                          'id), disabled after' % p['board_id'],
+                                   'class': type(sel).__name__ if sel is not None else None},
+                   'chip_select': dict((k, _plainify(getattr(f, k))) for k in ('ch_en', 'cs_t') if hasattr(f, k)),
+                   'spi_class': type(getattr(f, 'spi', None)).__name__ if hasattr(f, 'spi') else None,
+                   'reads': []}
+
+            def read_all(selected):
+                res = []
+                for r in FILTER_REGS:
+                    e = {'reg': r}
+                    try:
+                        if selected:
+                            with self._sel(p['board_id']):
+                                v = int(f.read_reg(r))
+                        else:
+                            v = int(f.read_reg(r))
+                        e.update(value=v, hex='0x%02x' % v)
+                    except Exception as ex:      # noqa: BLE001
+                        e['error'] = _exc(ex)
+                    res.append(e)
+                return res
+            out['reads'] = read_all(True)
+            vals = dict((e['reg'], e.get('value')) for e in out['reads'])
+            pid = None if None in (vals.get('PRODUCT_ID_H'), vals.get('PRODUCT_ID_L')) else \
+                (vals['PRODUCT_ID_H'] << 8) | vals['PRODUCT_ID_L']
+            out['product_id'] = pid
+            out['answers'] = pid == 0x8818
+            got = [v for v in vals.values() if v is not None]
+            if pid == 0x8818:
+                out['verdict'] = 'PRODUCT_ID 0x8818: the chip answers'
+            elif not got:
+                out['verdict'] = 'no register could be read'
+            elif len(set(got)) == 1 and got[0] in (0, 0xFF):
+                out['verdict'] = 'every register reads 0x%02x: no answer on the data-out line' % got[0]
+            else:
+                out['verdict'] = 'PRODUCT_ID reads %s, not 0x8818' % (None if pid is None else '0x%04x' % pid)
+            last = self._written.get(('filter', side, p['port']))
+            if last is not None:
+                out['last_written'] = dict(last)
+            if deselected:
+                out['reads_deselected'] = read_all(False)
+            return out
 
     # ---- safe state ---------------------------------------------------------------------------------------------
     def default_safe_items(self):
@@ -1873,7 +2071,7 @@ class RfBox(object):
                    'cards': layout_text(lay), 'gens': {}, 'ros': {}, 'bias': {}, 'warnings': [], 'order': []}
             if bad:
                 rec['state'] = self._try(self._get_locked)
-                raise Refused('; '.join(bad), rec, 'layout')
+                raise Refused('%s. The board has: %s' % ('; '.join(bad), rec['cards']), rec, 'layout')
             before = self._get_locked(flags=False)
             gens, ros = self.gen_map(), self.ro_map()
 
@@ -1882,9 +2080,10 @@ class RfBox(object):
                 rec['changed'] = self._changed(before, rec['state'])
                 raise Refused(msg, rec, code)
 
-            def run(op, target, value, what):
-                return self._run(rec, {'phase': 'apply', 'op': op, 'target': target, 'value': value, 'what': what},
-                                 by)
+            def run(op, target, value, what, **kw):
+                st = {'phase': 'apply', 'op': op, 'target': target, 'value': value, 'what': what}
+                st.update(kw)
+                return self._run(rec, st, by)
 
             if others == 'safe':
                 listed = set(ros[r]['port'] for r in spec['ros'])
@@ -1899,11 +2098,14 @@ class RfBox(object):
                     rec['gens'][str(g)] = {'dc': s['dc'], 'powered': e['result']['powered'], 'dac': c['dac'],
                                            'port': c['port']}
                     continue
-                run('filter', ('dac', c['port']), s['filter'], '%s filter' % what)
+                run('filter', ('dac', c['port']), s['filter'], '%s filter' % what,
+                    verify=s.get('filter_verify', True))
                 e = run('dac_att', c['port'], s['att'], '%s attenuators' % what)
                 e2 = run('dac_supply', c['port'], True, '%s 5 V rail on' % what)
                 rec['gens'][str(g)] = {'att': e['result']['set'], 'filter': dict(s['filter']),
-                                       'filter_applied': rec['order'][-3].get('applied'), 'dac': c['dac'],
+                                       'filter_applied': rec['order'][-3].get('applied'),
+                                       'filter_written': rec['order'][-3].get('written'),
+                                       'filter_verified': rec['order'][-3].get('verified'), 'dac': c['dac'],
                                        'port': c['port'], 'supply_on': e2['result']['supply_on'],
                                        'supply_shared_with': [a['dac_port'] for a in e2.get('affects', [])]}
             for r in sorted(spec['ros']):
@@ -1929,9 +2131,12 @@ class RfBox(object):
                         one.update(gain=e['result']['gain'], amp=False)
                         continue
                 else:
-                    run('filter', ('adc', c['port']), s['filter'], '%s filter' % what)
+                    run('filter', ('adc', c['port']), s['filter'], '%s filter' % what,
+                        verify=s.get('filter_verify', True))
                     one['filter'] = dict(s['filter'])
                     one['filter_applied'] = rec['order'][-1].get('applied')
+                    one['filter_written'] = rec['order'][-1].get('written')
+                    one['filter_verified'] = rec['order'][-1].get('verified')
                     if not s.get('amp', True):
                         run('adc_off', c['port'], None, '%s amplifier off' % what)
                         e = run('ro_att', c['port'], s['att'], '%s RF In attenuator' % what)
@@ -2017,11 +2222,9 @@ class RfBox(object):
                         out.append('readout %d: the amplifier reads %s, the description has %s'
                                    % (r, 'on' if on else 'off', 'on' if s.get('amp', True) else 'off'))
                     if 'filter' in s:
-                        want = filter_regs(*filter_steps_for(s['filter']))
-                        regs = self._filter_read(p)
-                        if regs != want:
-                            out.append('readout %d: the filter registers read %s, the description gives %s'
-                                       % (r, regs, want))
+                        bad_f = self._filter_check(p, s)
+                        if bad_f:
+                            out.append('readout %d: %s' % (r, bad_f))
                     if 'att' in s:
                         w = self._written.get(('ro_att', c['port'])) or {}
                         if w.get('source') != 'written' or w.get('value') != s['att']:
@@ -2044,11 +2247,9 @@ class RfBox(object):
                         if self._amp_read(p)[0] is not s['dc']:
                             out.append('generator %d: DC Out power differs from the description' % g)
                         continue
-                    regs = self._filter_read(p)
-                    want = filter_regs(*filter_steps_for(s['filter']))
-                    if regs != want:
-                        out.append('generator %d: the filter registers read %s, the description gives %s'
-                                   % (g, regs, want))
+                    bad_f = self._filter_check(p, s)
+                    if bad_f:
+                        out.append('generator %d: %s' % (g, bad_f))
                     if self._net_read(p, 'powerup')[0] != 1:
                         out.append('generator %d: the 5 V rail pin of DAC port %d reads off' % (g, c['port']))
                     w = self._written.get(('dac_att', c['port'])) or {}
@@ -2067,6 +2268,18 @@ class RfBox(object):
                     out.append('bias %d cannot be read (%s)' % (b, _exc(e)))
         return out
 
+    def _filter_check(self, p, s):
+        want = filter_regs(*filter_steps_for(s['filter']))
+        if s.get('filter_verify', True) is False:
+            w = self._written.get(('filter', p['side'], p['port'])) or {}
+            if w.get('source') != 'written' or w.get('regs') != want:
+                return 'the filter was not written %s by this driver (filter_verify false: not read back)' % want
+            return None
+        regs = self._filter_read(p)
+        if regs != want:
+            return 'the filter registers read %s, the description gives %s' % (regs, want)
+        return None
+
     def check_applied(self, description, record=None):
         """qick_rf.check_applied: the first reason from check(), or None."""
         r = self.check(description, record)
@@ -2074,16 +2287,28 @@ class RfBox(object):
 
 
 # ---- module-level helpers on a soc (qick_rf compatibility) -----------------------------------------------------------
-def adc_dsa(soc, blockname, att=None):
-    """Set (att given) and read the RF-ADC step attenuator of ADC block `blockname` ("20": tile 2, block 0)."""
+def adc_dsa(soc, blockname, att=None, record=False):
+    """Set (att given) and read the RF-ADC step attenuator of ADC block `blockname` ("20": tile 2, block 0).
+    att is any number in 0 .. 27 dB, rounded to the chip's 1 dB step as qick_rf did. Returns the value read back
+    (float), or with record=True {block, requested, applied, read}."""
     box = attach(soc)
     blockname = str(blockname)
     with box.lock:
         if blockname not in [b[0] for b in box.adc_blocks()]:
             raise _bad('blockname', 'the firmware has no RF-ADC block %s' % blockname)
+        req = applied = None
         if att is not None:
-            box._dsa_set(blockname, _dsa(att, 'att'))
-        return box._dsa_get(blockname)
+            req = _num(att, 'att')
+            if not 0 <= req <= DSA_MAX:
+                raise _bad('att', '%g dB is outside 0 .. %d dB' % (req, DSA_MAX))
+            applied = float(round(req))
+            box._dsa_set(blockname, applied)
+        got = box._dsa_get(blockname)
+        if record:
+            return {'block': blockname, 'requested': req, 'applied': applied, 'read': got,
+                    'step_db': 1, 'note': None if req is None or req == applied
+                    else 'rounded to the 1 dB step of the RF-ADC attenuator'}
+        return got
 
 
 def adc_flags(soc, tile, block, clear=True):
@@ -2144,6 +2369,22 @@ def _reply(fn, *a, **kw):
         raise ValueError('%s: %s' % (e.code, e))
 
 
+def _reply_raise(fn, *a, **kw):
+    """Run fn for a remote caller, failures raised as builtin exceptions (never returned as data): a bad request
+    as ValueError, a refusal as RuntimeError('<code>: <message>')."""
+    try:
+        return _plainify(fn(*a, **kw))
+    except Refused as e:
+        raise RuntimeError('%s: %s' % (e.code, e))
+    except RfboxError as e:
+        raise ValueError('%s: %s' % (e.code, e))
+
+
+def version_info():
+    return {'rfbox_version': RFBOX_VERSION, 'rfbox_sha256': RFBOX_SHA256, 'rfbox_api': API_VERSION,
+            'file': globals().get('__file__')}
+
+
 def check_reply(reply):
     """Client side: raise Refused for a reply that carries a refusal (soc.rfbox_set / rfbox_apply over Pyro)."""
     if isinstance(reply, dict) and reply.get('ok') is False and 'refused' in reply:
@@ -2152,16 +2393,22 @@ def check_reply(reply):
 
 
 class RfBoxSocMixin(object):
-    """Methods a served soc gains (soc_class): plain data in and out, safe for Pyro's pickle and for JSON."""
+    """Methods a served soc gains (soc_class): plain data in and out, safe for Pyro's pickle and for JSON.
+    rfbox_set, rfbox_apply and rfbox_apply_safe return a refusal as data ({"ok": false, "refused", "code",
+    "record"}: use check_reply); every other method raises on failure (ValueError for a bad request, RuntimeError
+    for a refusal) and returns only results."""
 
     def rfbox_get(self, flags=True):
-        return _reply(lambda: attach(self).get(flags=flags))
+        return _reply_raise(lambda: attach(self).get(flags=flags))
 
     def rfbox_layout(self, read_ids=True):
-        return _reply(lambda: attach(self).layout(read_ids=read_ids))
+        return _reply_raise(lambda: attach(self).layout(read_ids=read_ids))
 
     def rfbox_identity(self):
-        return _reply(lambda: attach(self).identity)
+        return _reply_raise(lambda: attach(self).identity)
+
+    def rfbox_version(self):
+        return _reply_raise(version_info)
 
     def rfbox_set(self, settings, settle_s=SETTLE_DEFAULT_S, protect=True, by='rfbox_set'):
         return _reply(lambda: attach(self).set(settings, settle_s=settle_s, protect=protect, by=by))
@@ -2172,38 +2419,81 @@ class RfBoxSocMixin(object):
     def rfbox_apply_safe(self, items=None, settle_s=SETTLE_DEFAULT_S):
         return _reply(lambda: attach(self).apply_safe(items, settle_s=settle_s))
 
-    def rfbox_clear_flags(self, settle_s=0.0):
-        return _reply(lambda: attach(self).clear_flags(settle_s))
+    def rfbox_clear_flags(self, settle_s=0.0, blocks=None):
+        return _reply_raise(lambda: attach(self).clear_flags(settle_s, blocks))
 
     def rfbox_check(self, description, record=None):
-        return _reply(lambda: attach(self).check(description, record))
+        """The list of reasons the board no longer holds the description: empty when it does."""
+        return _reply_raise(lambda: attach(self).check(description, record))
 
     def rfbox_limits(self, table=None, replace=False):
         """The limits table; with replace=True install `table` (None removes it)."""
         box = attach(self)
-        return _reply(lambda: box.set_limits(table) if replace else box.limits)
+        return _reply_raise(lambda: box.set_limits(table) if replace else box.limits)
 
-    # qick_rf / qick_pyro_server.py helpers, same signatures
-    def labdev_adc_dsa(self, blockname, att=None):
-        return _reply(adc_dsa, self, blockname, att)
+    def rfbox_filter_probe(self, side, port, deselected=False):
+        return _reply_raise(lambda: attach(self).filter_probe(side, port, deselected))
+
+    # qick_rf / qick_pyro_server.py helpers, same signatures; failures raise
+    def labdev_adc_dsa(self, blockname, att=None, record=False):
+        return _reply_raise(adc_dsa, self, blockname, att, record)
 
     def labdev_adc_flags(self, tile, block, clear=True):
-        return _reply(adc_flags, self, tile, block, clear)
+        return _reply_raise(adc_flags, self, tile, block, clear)
 
     def labdev_ro_off(self, ro_ch):
-        return _reply(ro_off, self, ro_ch)
+        return _reply_raise(ro_off, self, ro_ch)
 
     def labdev_filter_regs(self, kind, ch):
-        return _reply(filter_registers, self, kind, ch)
+        return _reply_raise(filter_registers, self, kind, ch)
+
+
+def _stale(soc, name):
+    try:
+        box = soc.__dict__.get('_rfbox')
+    except AttributeError:
+        box = None
+    if box is None:
+        box = _BY_ID.get((id(soc), '_rfbox'))
+    if box is not None:
+        box.forget('%s was called outside rfbox: what rfbox wrote may have been changed' % name)
+
+
+def _locked_rfb(name, fn):
+    @functools.wraps(fn)
+    def wrapper(self, *a, **kw):
+        with soc_lock(self):
+            try:
+                return fn(self, *a, **kw)
+            finally:
+                if not name.startswith('rfb_get'):
+                    _stale(self, name)
+    wrapper._rfbox_locked = True
+    return wrapper
+
+
+def lock_rfb_methods(cls):
+    """Wrap every rfb_* method of cls (in place, on a subclass made for it) so that it holds the rfbox lock of the
+    soc and, unless it is an rfb_get_* reader, marks rfbox's remembered writes (attenuators, filters) unknown
+    afterwards. Returns cls."""
+    for name in dir(cls):
+        if not name.startswith('rfb_'):
+            continue
+        fn = getattr(cls, name, None)
+        if not callable(fn) or getattr(fn, '_rfbox_locked', False) or isinstance(fn, type):
+            continue
+        setattr(cls, name, _locked_rfb(name, fn))
+    return cls
 
 
 def soc_class(base):
-    """base (e.g. qick.rfboard.RFQickSoc216V1) with the rfbox_* and labdev_* methods added, for a Pyro server."""
+    """base (e.g. qick.rfboard.RFQickSoc216V1) with the rfbox_* and labdev_* methods added, for a Pyro server. Every
+    rfb_* method of the class takes the rfbox lock (lock_rfb_methods)."""
     class RfBoxSoc(RfBoxSocMixin, base):
         pass
     RfBoxSoc.__name__ = base.__name__
     RfBoxSoc.__qualname__ = getattr(base, '__qualname__', base.__name__)
-    return RfBoxSoc
+    return lock_rfb_methods(RfBoxSoc)
 
 
 class Local(object):

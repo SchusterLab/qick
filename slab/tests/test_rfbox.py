@@ -443,3 +443,191 @@ def test_one_lock_serialises_card_access(board):
     for t in ts:
         t.join()
     assert not errs and box.select_conflicts == 0
+
+
+# ---- round 2 -------------------------------------------------------------------------------------------------
+def test_identity_carries_version_and_file_hash(board):
+    import hashlib
+    box, soc, rf = board
+    sha = hashlib.sha256(open(os.path.join(LIB, 'rfbox.py'), 'rb').read()).hexdigest()
+    assert R.RFBOX_VERSION == '0.2' and R.RFBOX_SHA256 == sha
+    for d in (rf.identity, rf.get()['identity'], rf.get()):
+        assert d['rfbox_version'] == '0.2' and d['rfbox_sha256'] == sha
+    assert rf.identity['rfbox_api'] == R.API_VERSION
+    v = R.Local(soc).rfbox_version()
+    assert v['rfbox_version'] == '0.2' and v['rfbox_sha256'] == sha
+
+
+def test_helpers_raise_instead_of_returning_failure(board):
+    box, soc, rf = board
+    loc = R.Local(soc)
+    rf.set([{'ro': 0, 'adc_att': 27}, {'ro': 0, 'amp': True, 'att': 10}])
+    box.stuck.add(('adc', 2))                      # the amplifier stays on: ro_off cannot confirm it off
+    with pytest.raises(RuntimeError) as e:
+        loc.labdev_ro_off(0)
+    assert type(e.value) is RuntimeError and 'readback' in str(e.value)
+    with pytest.raises(ValueError):
+        loc.labdev_ro_off(9)
+    with pytest.raises(ValueError):
+        loc.labdev_adc_dsa('99', 3)
+    with pytest.raises(ValueError):
+        loc.rfbox_clear_flags(0, ['99'])
+    # the record-returning calls keep returning refusals as data
+    box.stuck.clear()
+    rep = loc.rfbox_set([{'ro': 0, 'adc_att': 5}])
+    assert rep['ok'] is False and 'refused' in rep
+
+
+def test_adc_dsa_rounds_and_reports(board):
+    box, soc, rf = board
+    assert R.adc_dsa(soc, '20', 10.4) == 10.0
+    r = R.adc_dsa(soc, '20', 12.6, record=True)
+    assert (r['requested'], r['applied'], r['read']) == (12.6, 13.0, 13.0) and r['note']
+    assert R.Local(soc).labdev_adc_dsa('20', 26.9, True)['applied'] == 27.0
+    for bad in (-0.1, 27.4, 'x'):
+        with pytest.raises(R.RfboxError):
+            R.adc_dsa(soc, '20', bad)
+
+
+def test_clear_flags_some_blocks(board):
+    box, soc, rf = board
+    for b in ('20', '21'):
+        box.inject[b] = R.OVR_RANGE
+    box.update('t')
+    box.inject.clear()
+    rec = rf.clear_flags(blocks=['21'])
+    assert rec['cleared'] == ['21'] and rec['blocks'] == ['21']
+    st = rf.get()['flags']
+    assert st['20']['over_range'] and not st['21']['over_range']
+    assert rf.clear_flags()['cleared'] == ['20', '21']
+    assert R.Local(soc).rfbox_clear_flags(0, ['20'])['cleared'] == ['20']
+
+
+@pytest.mark.parametrize('mode', ['zero', 'ones', 'raise'])
+def test_filter_no_answer_strict_refuses(board, mode):
+    box, soc, rf = board
+    box.filter_mode[('adc', 4)] = mode
+    with pytest.raises(R.Refused) as e:
+        rf.set([{'ro': 0, 'filter': {'ftype': 'lowpass', 'fc': 4}}])
+    assert e.value.code == 'readback' and 'filter_verify' in str(e.value)
+    with pytest.raises(R.Refused) as e:
+        rf.apply({'ros': {0: {'att': 10, 'filter': {'ftype': 'lowpass', 'fc': 4}}}})
+    assert e.value.code == 'readback' and box.amp[4] is False     # stopped before the amplifier
+
+
+@pytest.mark.parametrize('mode', ['zero', 'ones', 'raise'])
+def test_filter_no_answer_opt_out_proceeds(board, mode):
+    box, soc, rf = board
+    box.filter_mode[('adc', 4)] = mode
+    rec = rf.set([{'ro': 0, 'filter': {'ftype': 'lowpass', 'fc': 4}, 'filter_verify': False}])
+    assert rec['ok'] and len(rec['warnings']) == 1 and 'not verified' in rec['warnings'][0]
+    step = rec['order'][0]
+    assert step['verified'] is False and step['filter_verify'] is False
+    if mode == 'raise':
+        assert 'readback_error' in step
+    else:
+        assert step['readback']['WR0_SW'] in (0, 0xFF)
+    assert box.filters[('adc', 4)] == {'WR0_SW': step['written']['WR0_SW'],
+                                       'WR0_FILTER': step['written']['WR0_FILTER']}
+    f = rf.get()['adc_ports']['4']['filter']                    # never raises: written, not verified
+    assert f['source'] == 'written' and f['verified'] is False and f['value']['ftype'] == 'lowpass'
+    assert f['readback'] == ('failed' if mode == 'raise' else 'differs')
+    desc = {'ros': {0: {'att': 10, 'filter': {'ftype': 'lowpass', 'fc': 4}, 'filter_verify': False}}}
+    rec = rf.apply(desc)
+    assert rec['ok'] and rec['warnings'] and rec['ros']['0']['filter_verified'] is False and box.amp[4]
+    assert rf.check(desc, rec) == []
+    assert R.normalize(desc)['ros'][0]['filter_verify'] is False
+    with pytest.raises(R.RfboxError):
+        rf.set([{'ro': 0, 'filter_verify': False}])                # only next to a filter
+
+
+def test_filter_verify_true_does_not_change_the_hash():
+    d = {'ros': {0: {'att': 10, 'filter': {'ftype': 'bypass'}}}}
+    d2 = {'ros': {0: {'att': 10, 'filter': {'ftype': 'bypass'}, 'filter_verify': True}}}
+    assert R.spec_hash(R.normalize(d)) == R.spec_hash(R.normalize(d2))
+
+
+def test_filter_record_states_band_state_and_corners(board):
+    box, soc, rf = board
+    rec = rf.set([{'gen': 0, 'filter': {'ftype': 'bandpass', 'fc': 6, 'bw': 1}}])
+    w = rec['order'][0]['written']
+    for k in ('WR0_SW', 'WR0_FILTER', 'hpf_band', 'hpf_state', 'lpf_band', 'lpf_state', 'hpf_ghz', 'lpf_ghz'):
+        assert w[k] is not None, k
+    assert w['hpf_band'] >= 1 and w['lpf_band'] >= 1 and w['hpf_ghz'] < 6 < w['lpf_ghz']
+
+
+def test_filter_probe(board):
+    box, soc, rf = board
+    p = rf.filter_probe('adc', 4, deselected=True)
+    assert p['answers'] and p['product_id'] == 0x8818 and p['card_select']['board_id'] == 6
+    assert [e['reg'] for e in p['reads']] == list(R.FILTER_REGS)
+    assert all(e['value'] == 0xFF for e in p['reads_deselected'])
+    box.filter_mode[('adc', 4)] = 'ones'
+    p = rf.filter_probe('adc', 4)
+    assert not p['answers'] and 'no answer' in p['verdict']
+    box.filter_mode[('adc', 4)] = 'raise'
+    p = rf.filter_probe('adc', 4)
+    assert all('error' in e for e in p['reads']) and p['verdict'] == 'no register could be read'
+    with pytest.raises(R.RfboxError):
+        rf.filter_probe('dac', 8)                                   # DC Out: no filter
+    json.dumps(R.Local(soc).rfbox_filter_probe('dac', 0))
+
+
+def test_layout_refusal_message_has_board_layout():
+    box, soc, rf = make({'adc': [None, None, 'dc_in', None], 'dac': ['rf_out', None, None, None]})
+    with pytest.raises(R.Refused) as e:
+        rf.apply(DESC)
+    assert 'The board has:' in str(e.value) and 'ADC slot 2: DC In' in str(e.value)
+
+
+def test_fake_does_not_duplicate_card_lines():
+    box = F.FakeQickBox()
+    soc = box.make_soc()
+    cfg = soc.get_cfg()
+    n = sum('slot' in str(x) for x in cfg['extra_description'])
+    soc2 = box.make_soc(cfg=cfg)
+    assert sum('slot' in str(x) for x in soc2.get_cfg()['extra_description']) == n == 8
+
+
+def _lock_held_elsewhere(lk):
+    out = []
+    t = threading.Thread(target=lambda: out.append(lk.acquire(blocking=False)))
+    t.start()
+    t.join()
+    if out[0]:
+        lk.release()
+    return not out[0]
+
+
+class _LibSoc(F.FakeRfSoc):
+    """Stands for RFQickSoc216V1: rfb_* methods that drive the cards behind rfbox's back."""
+
+    def rfb_set_ro_rf(self, ro_ch, att):
+        self.seen_lock = _lock_held_elsewhere(R.soc_lock(self))
+        chain = self.adc_cards[2].chains[0]
+        with self.board_sel.enable_context(chain.card_num):
+            chain.attn[0].set_att(att)
+
+    def rfb_get_lo(self):
+        return 1.0
+
+
+def test_soc_class_locks_rfb_methods_and_forgets_writes():
+    cls = R.soc_class(_LibSoc)
+    box = F.FakeQickBox()
+    soc = cls(F.example_cfg())
+    box.make_soc(cfg=soc.get_cfg(), target=soc)
+    rf = R.attach(soc, sleep=lambda s: None)
+    assert R.locked(soc) is rf.lock
+    with R.locked(soc):
+        with rf.lock:                                   # re-entrant
+            rf.get()
+    rf.set([{'ro': 0, 'att': 20}])
+    assert rf.get()['adc_ports']['4']['att']['source'] == 'written'
+    soc.rfb_get_lo()
+    assert rf.get()['adc_ports']['4']['att']['source'] == 'written'     # readers do not invalidate
+    soc.rfb_set_ro_rf(0, 5)
+    assert soc.seen_lock is True and box.att('adc', 4) == 5.0
+    a = rf.get()['adc_ports']['4']['att']
+    assert a['source'] == 'unknown' and 'rfb_set_ro_rf' in a['why'] and a['previous']['value'] == 20.0
+    assert cls.rfb_set_ro_rf._rfbox_locked and not hasattr(_LibSoc.rfb_set_ro_rf, '_rfbox_locked')

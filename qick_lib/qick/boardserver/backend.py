@@ -110,6 +110,10 @@ class QickSocBackend:
                 self._bs_clocks_reprogrammed = True
                 return super().set_all_clks(*args, **kwargs)
 
+        if cls == 'RFQickSoc216V1':
+            # the library's rfb_* methods take the rfbox lock and invalidate what rfbox remembers writing
+            from ..rfbox import lock_rfb_methods
+            lock_rfb_methods(_TracedQickSoc)
         return _TracedQickSoc(bitfile=bitfile, download=download, **self.soc_kwargs)
 
     def _make_rf(self, soc):

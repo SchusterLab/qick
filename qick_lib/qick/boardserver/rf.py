@@ -78,6 +78,11 @@ def _filter_old(f):
         return None, {'source': 'unknown'}
     if f.get('source') == 'error':
         return {'error': f.get('error')}, _setting(None, f.get('last_request'))
+    if f.get('source') == 'written':
+        # the registers do not read back what rfbox wrote (or cannot be read)
+        raw = f.get('raw') if f.get('raw') is not None else {'error': f.get('readback_error')}
+        return raw, {'source': 'as written', 'request': f.get('last_request'), 'written': f.get('value'),
+                     'verified': False, 'why': f.get('why')}
     return f.get('raw'), _setting(f.get('value'), f.get('last_request'))
 
 

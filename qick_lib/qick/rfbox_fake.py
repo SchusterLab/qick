@@ -19,6 +19,7 @@ repository's tests pin this module; the interface below is kept steady:
     box.lost                            every write made while its card was not selected
     box.fail(chip, side=None, port=None, times=1, exc=None)   the next matching write raises
     box.stuck.add((side, slot))         that card's GPIO expander ignores writes
+    box.filter_mode[(side, port)] = 'zero' | 'ones' | 'raise'   that filter chip reads 0x00 / 0xFF / fails to read
     box.pl_loads
 
 What it models, and from where:
@@ -220,6 +221,13 @@ class FakeADMV8818(_Chip):
     def read_reg(self, reg):
         if not self._on():
             return 0xFF
+        mode = self.box.filter_mode.get((self.side, self.box.port(self.side, self.slot, self.ch)))
+        if mode == 'zero':
+            return 0x00
+        if mode == 'ones':
+            return 0xFF
+        if mode == 'raise':
+            raise RuntimeError('fake board: filter SPI read failed')
         fixed = {'PRODUCT_ID_L': 0x18, 'PRODUCT_ID_H': 0x88, 'CHIPTYPE': 0x01}
         return int(fixed[reg] if reg in fixed else self._regs().get(reg, 0))
 
@@ -551,6 +559,7 @@ class FakeQickBox(object):
         self.events, self.calls, self.lost = [], [], []
         self.faults = []
         self.stuck = set()
+        self.filter_mode = {}       # (side, port) -> 'zero' | 'ones' | 'raise': an ADMV8818 that does not answer
         self.pl_loads = 0
         self.soc = None
         self.configure(layout or EXAMPLE_LAYOUT)
@@ -721,7 +730,8 @@ class FakeQickBox(object):
             desc = soc['extra_description']
         except Exception:      # noqa: BLE001
             desc = None
-        if isinstance(desc, list):
+        # card lines only if the cfg does not have them yet (a cfg saved from a real or earlier fake soc does)
+        if isinstance(desc, list) and not any(R._CARD.search(str(x)) for x in desc):
             desc.append('\nQICK box daughter cards detected:')
             for side, label in (('adc', 'ADC'), ('dac', 'DAC')):
                 for slot, card in enumerate(getattr(soc, side + '_cards')):
