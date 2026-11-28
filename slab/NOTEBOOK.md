@@ -3,6 +3,40 @@
 Running log for the lab fork. Newest entry first. Record dead ends as well as
 results, and say where each number came from.
 
+## 2026-11-27: rfbox 0.3, deterministic filter settings (branch `lab/rf-driver`)
+
+Asked for directly: filter settings must be deterministic. Against the fake
+box only. 68 tests in `slab/tests/test_rfbox.py`, 203 in `slab/tests/` pass;
+both files parse with the 3.8 grammar.
+
+- Explicit form `{hpf: step|null, lpf: step|null}` is canonical, accepted
+  everywhere and reported everywhere. Frequency requests are resolved by one
+  rfbox rule ("never narrower": high-pass highest corner at or below the
+  lower edge, low-pass lowest corner at or above the upper edge, lower band
+  preferred in overlaps as far as the result stays monotone). This replaces
+  the nearest-step rule of 0.1/0.2. Checked on a 2.5 MHz grid from 0.5 to
+  20 GHz: monotone, never narrower, round trip for every step the rule picks.
+  Ten overlap steps are reachable only in the explicit form.
+- The users' high-pass fc 5.9 (step 26, 5.97 GHz under 0.2) resolves to step
+  25 (5.71 GHz) under the new rule. To keep the state, store
+  `{hpf: 26, lpf: null}`.
+- `spec_hash` is now `h2:` on the canonical form, and the old hash is
+  `spec_hash_v1`. `apply` returns the canonical description.
+- The missing `filter_read` in one instrument reply: in `get()`, all the
+  fields of a port were read inside one `try`, so a failing GPIO expander
+  read (amplifier or rail pin) dropped the filter and every later field of
+  that port. This was reproduced on the fake with an injected GPIO read fault
+  and is fixed: each field is read on its own. No code path skips a filter
+  step when the state is unchanged or a section maps to bypass, and a test now
+  covers both. A filter that reads back registers that do not decode gives
+  `value: null` (the client's `filter_read: None`); that is the chip not
+  answering, not a missing block.
+- Recorded from the measurement side: qick 0.2.432-0.2.447 write bypass for
+  every frequency-form filter request (`_freq2step` matches `bypass` first).
+  Their box runs 0.2.436, which accounts for "the filters did not act" through
+  the library. Not checked here: this repository's history does not contain
+  those releases.
+
 ## 2026-11-27: rfbox 0.2, from the measurement side's integration against `slab-rfbox-0.1` (branch `lab/rf-driver`)
 
 Against the fake box only. 59 tests in `slab/tests/test_rfbox.py`, 194 in

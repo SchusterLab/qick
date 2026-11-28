@@ -100,7 +100,8 @@ Every hardware value in `get()` is `{'value', 'source', ...}`:
 ```python
 box.set([{'ro': 0, 'adc_att': 27},                      # RF-ADC step attenuator, 0-27 dB, 1 dB
          {'ro': 0, 'att': 10, 'amp': True},             # RF In attenuator 0-31.75 dB in 0.25 dB; amplifier
-         {'ro': 0, 'filter': {'ftype': 'bandpass', 'fc': 6.0, 'bw': 1.0}},
+         {'ro': 0, 'filter': {'ftype': 'bandpass', 'fc': 6.0, 'bw': 1.0}},   # resolved by FILTER_RULE
+         {'gen': 1, 'filter': {'hpf': 26, 'lpf': None}},  # explicit steps (canonical; None = bypass)
          {'gen': 0, 'att': [6, 8], 'filter': {'ftype': 'lowpass', 'fc': 8.0}},  # RF Out att1, att2 (+ rail on)
          {'gen': 2, 'dc': True},                        # DC Out power
          {'ro': 1, 'gain': 10, 'amp': True},            # DC In gain -6..26 dB, powered up
@@ -117,7 +118,7 @@ index. There are no channel names and no calibration.
   wrong card names its slot and card, for example `readout 0 is on ADC port 4
   (ADC slot 2): DC In card, not RF In`.
 - **Quantisation.** Each step records `requested` and `applied` (attenuators
-  to 0.25 dB, filters to the nearest ADMV8818 state, bias to the 20-bit LSB) and
+  to 0.25 dB, filters by the deterministic rule below, bias to the 20-bit LSB) and
   `verified` (True / False / None when it cannot be read).
 - **Order.** Phase `reduce` first: attenuation increases, amplifiers off and
   rails off, with the RF-ADC attenuator before the RF In attenuator. Then
@@ -170,29 +171,149 @@ For diagnosis, `filter_probe('adc', 4)` reads ADI_SPI_CONFIG_A, CHIPTYPE,
 PRODUCT_ID_L/H, WR0_SW and WR0_FILTER one by one and says which card select
 and chip select it used.
 
-### Which filter state is written
+### Deterministic filter settings (0.3)
 
-rfbox computes WR0_SW / WR0_FILTER from its own table (`FILTER_BANDS`, the
-band edges of the 0.2.4xx library's `FilterADMV8818`, nearest of 16 states per
-band) and writes the registers directly, with the same result on every library
-version. Older libraries choose states with different code: 0.2.360's
-`_freq2band` / `_freq2bits` use span/16 steps, and the measurement side's box
-runs 0.2.436. So the same fc / bw given to `rfb_set_ro_filter` /
-`rfb_set_gen_filter` on such a library can select a different state from
-rfbox's. Any comparison between the two must use what was actually written.
-Every filter step records it in `written`:
+A filter setting is resolved by rfbox alone and gives the same registers on
+every qick version.
 
-```
-{'WR0_SW', 'WR0_FILTER', 'hpf_band', 'hpf_state', 'lpf_band', 'lpf_state',
- 'hpf_step', 'lpf_step', 'hpf_ghz', 'lpf_ghz', 'table'}
-```
+**The explicit form is canonical.** `{'hpf': 26, 'lpf': None}` names each
+section's step directly: step 0-63 = (band − 1) × 16 + state, with bands 1-4,
+the numbering of the library's `set_filter_raw`. `None` (JSON `null`, or −1)
+is bypass, and a missing key is bypass. It is accepted in `set` items and in
+descriptions. It is also what records and `get()` report
+(`value.explicit`, `written.explicit`, `resolved.explicit`), so it can be
+copied back to reproduce a chip state exactly.
 
-Band 0 is bypass, and `*_ghz` are the nominal corners from rfbox's table.
-`apply` copies the step's `written` and `verified` into
-`ros.R.filter_written` / `gens.G.filter_written`. The mapping from registers to
-band and state is the one `set_filter_raw` uses (`0xC0 | hpf_band << 3 |
-lpf_band`, `hpf_state << 4 | lpf_state`) and was checked against the library
-code. The corner frequencies are datasheet-nominal, not measured.
+**Frequency requests** (`{ftype, fc, bw}` in GHz) are still accepted. They are
+resolved by one rule, `FILTER_RULE = 'rfbox-never-narrower-1'`:
+
+- The edges are: low-pass, upper edge = fc; high-pass, lower edge = fc;
+  band-pass, lower edge = fc − bw/2 and upper edge = fc + bw/2; bypass, none.
+  Each edge sets only its own section, so a high-pass request leaves the
+  low-pass section in bypass, and vice versa.
+- **High-pass section:** of the steps whose nominal corner is at or below the
+  lower edge, the highest.
+- **Low-pass section:** of the steps whose nominal corner is at or above the
+  upper edge, the lowest.
+
+The passband is therefore never narrower than asked. That is the one rule a
+user can rely on without looking at the table, because an edge never moves into
+the band being measured. The cost is that the edge moves outwards by up to one
+step: 120-493 MHz depending on band.
+
+**Band overlaps.** The four bands of each section overlap, and the same
+corner is available in two bands. rfbox always prefers the **lower** band, as
+far as the corner stays monotone in the request:
+
+- low-pass band *b* serves every edge up to its state-15 corner (3.85, 7.25,
+  13.0 GHz), and the next band takes over above that;
+- high-pass band *b+1* takes over at its highest corner inside band *b*
+  (3.40, 7.00, 12.50 GHz, `_HPF_SWITCH`).
+
+Every resolution is therefore monotone in the request, and the band changes
+only at those six fixed frequencies.
+
+Whether the lower band is also the lower-loss one is **not established**. The
+table has no loss figures. The users' field result (a band change costs about
+1 dB in band) says the choice matters, not which way. The rule guarantees the
+choice is consistent, and the explicit form lets a setup that has measured both
+bands pin the better one.
+
+**Out of range.** A high-pass edge below 1.75 GHz, or a low-pass edge above
+18.85 GHz, bypasses that section, with a warning.
+
+**Steps the rule never picks.** Some overlap steps are never picked by a
+frequency request: HPF 14, 15, 31, 32, 47 and LPF 16, 17, 32, 48, 49. They are
+reachable only in the explicit form.
+
+**What the record shows.** Every filter step has:
+
+- `requested`;
+- `resolved`: `explicit`; `hpf` / `lpf` each with step, band, state and
+  nominal GHz; the edges; the registers; `rule`; `table`; and `warnings`;
+- `written`: the registers, band and state, nominal corners, `explicit` and
+  `table`.
+
+There are two warnings, both collected into `record['warnings']`:
+
+- the edge fell between steps by more than half a step ("fell between steps:
+  the corner used is ..., N MHz away");
+- a request one step lower or higher would use a different band ("within one
+  step of a band boundary").
+
+**Pure helpers.** These need no hardware or pynq, and are also on the mixin as
+`rfbox_filter_resolve` / `rfbox_filter_candidates`:
+
+- `filter_resolve(f)` or `filter_resolve(type, fc, bw)`: exactly what `set` /
+  `apply` write;
+- `filter_candidates('hpf'|'lpf'|type, fc, bw=None, n=3)`: the `n` steps below
+  and above each edge, across all bands, with nominal corners, offsets and the
+  one the rule picks;
+- `canonical_filter(f)`: the explicit form.
+
+**Examples.**
+
+| Request | Explicit form written | Nominal corners | Library nearest (0.2.449+) |
+|---|---|---|---|
+| high-pass fc 5.9 | `{'hpf': 25, 'lpf': None}` | HPF 5.71 GHz (warning: 190 MHz below the edge) | HPF 26 = 5.97 GHz |
+| `{'hpf': 26, 'lpf': None}` | `{'hpf': 26, 'lpf': None}` | HPF 5.97 GHz | — |
+| band-pass 6.6 / 1.4 | `{'hpf': 25, 'lpf': 33}` | 5.71 / 7.40 GHz (warning: next to a low-pass band boundary) | HPF 26, LPF 31 (7.25 GHz, band 2) |
+| band-pass 6.65 / 1.5 | `{'hpf': 25, 'lpf': 33}` | 5.71 / 7.40 GHz | HPF 26, LPF 33 (7.40 GHz, band 3) |
+| band-pass 6.7 / 1.6 | `{'hpf': 25, 'lpf': 34}` | 5.71 / 7.80 GHz | HPF 26, LPF 33 |
+| low-pass fc 8.0 | `{'hpf': None, 'lpf': 35}` | LPF 8.20 GHz | LPF 35 |
+
+The setting in use on the users' box is high-pass fc 5.9, which reads back
+5.97 GHz. That is step 26, chosen by the nearest-step rule of rfbox 0.1/0.2.
+**Under 0.3 the frequency form `{ftype: highpass, fc: 5.9}` resolves to step 25
+(5.71 GHz) and writes a different state.** To keep today's chip state, store
+`{'hpf': 26, 'lpf': None}`.
+
+**Canonical descriptions and the hash.** A client can store the explicit form
+and get the same chip state forever:
+
+- `canonical_description(description)` and mixin `rfbox_canonical` return the
+  description with every frequency-form filter replaced by its explicit steps;
+- `apply` always returns it as `record['canonical']`;
+- `spec_hash` is now computed on the canonical form and is versioned
+  `'h2:' + 12 hex`. Two descriptions whose filters resolve to the same steps
+  hash equal; for example 6.6/1.4 and 6.65/1.5 above both give
+  `{'hpf': 25, 'lpf': 33}`.
+
+**Compatibility.** Every description hash changes: `spec_hash` now returns
+`h2:...` where 0.1/0.2 returned the bare 12-hex qick_rf hash. That old hash is
+kept as `spec_hash_v1` and is in `apply` records as `hash_v1`.
+`hash_matches(spec, h)` accepts either version, chosen by the prefix.
+Descriptions that use `{hpf, lpf}` were refused by 0.1/0.2, so no stored
+description changes meaning.
+
+**The table** is `FILTER_BANDS`, version `FILTER_TABLE_VERSION =
+'admv8818-nominal-1'`:
+
+- the state-0 and state-15 corner of each band from the ADMV8818 datasheet, as
+  qick 0.2.4xx `FilterADMV8818.freq2steps` lists them, with the 16 states evenly
+  spaced, as the library assumes. The source is in `FILTER_TABLE_SOURCE`;
+- the table version is in every filter record and in `get()`'s filter value;
+- the driver applies no per-card measured correction. Calibration belongs in
+  the user's platform; the explicit form is what to calibrate against.
+
+**Mapping to the registers.** rfbox writes WR0_SW / WR0_FILTER itself
+(`0xC0 | hpf_band << 3 | lpf_band`, `hpf_state << 4 | lpf_state`, band 0 =
+bypass). This is the mapping of `set_filter_raw`, checked against the library
+code. The `rfb_set_*_filter` calls of older libraries choose states with other
+code, so their results can differ from rfbox's for the same fc / bw:
+
+- 0.2.360 uses `_freq2band` / `_freq2bits` with span/16 steps;
+- 0.2.449+ uses nearest-step;
+- **qick 0.2.432 to 0.2.447 inclusive write bypass for every frequency-form
+  request between 2 and 18 GHz**, because `FilterADMV8818._freq2step` matches
+  the table's `bypass` entry first. 0.2.431 and 0.2.449+ are not affected, and
+  raw-step calls (`set_filter_raw`, `rfb_set_*_filter_raw`) are unaffected.
+  This fault was found and checked on the released PyPI packages by the
+  measurement side; this repository's history does not contain those
+  versions. A box on such a version that drives its filters through the
+  library's frequency calls has every filter in bypass, which matches the
+  users' "filters did not act". rfbox is unaffected because it writes the
+  registers.
 
 ### Locking against the library's own methods
 
@@ -251,7 +372,8 @@ raises `Refused` (`rf_safe_failed`) if it cannot.
   `{gain, adc_att, amp}`;
 - DC Out generators take `{dc}`.
 
-`spec_hash` gives the same hash as qick_rf.
+`spec_hash` is the versioned `h2:` hash of the canonical form; `spec_hash_v1` gives the same hash as qick_rf
+(see "Deterministic filter settings"). Filters may be given in the explicit form.
 
 `apply` then does the following, in order:
 
@@ -311,6 +433,7 @@ rfbox avoids each of them.
 | `rfboard.py:1082`, `:1084` `rfb_get_lo` | Uses `.rfb`, which does not exist (ZCU111) |
 | `qick.py:1712` | On Gen 3 the DSA is set automatically while an over-voltage interrupt is asserted. A DSA read during over-voltage may not be the programmed value |
 | 0.2.360 `qick.py:594-628` | `RFDC.set_adc_attenuator` / `get_adc_attenuator` index tiles by the name's digits, and `set` returns None |
+| released qick 0.2.432-0.2.447 (PyPI) `FilterADMV8818._freq2step` | Matches the table's `bypass` entry first: every frequency-form filter request between 2 and 18 GHz is written as bypass. 0.2.431 and 0.2.449+ are fine; raw-step calls are unaffected (reported by the measurement side, checked on the PyPI packages) |
 | 0.2.360 `rfboard.py:868-977` | The older ADMV8818 band/state algorithm quantises differently and raises outside the bands. rfbox writes the registers directly with its own table (`FILTER_BANDS`, `filter_steps_for`), so both versions get the same state |
 
 ## What the constructor forces at load
@@ -342,8 +465,18 @@ and the setup and its calibration are theirs.
   nominal 1 dB.
 - **RF In chain:** on that setup it compresses when the readout attenuator is
   set below 28 dB.
-- **Filters:** they did not act on one box, and may not answer on the SPI
-  read (see "Filters that do not read back" and checklist step 9).
+- **Filters, through the library:** they did not act on one box. That box
+  runs qick 0.2.436, which writes bypass for every frequency request (see
+  "Deterministic filter settings").
+- **Filters, through rfbox 0.2 (rfbv2 box, through a fridge feedline):**
+  - fc/bw requests that fall between table steps either land on the same state
+    or jump to the next band, and a band jump changes the loss by about 1 dB.
+    Band-pass 6.65/1.5 and 6.7/1.6 differ from 6.6/1.4 by 1 dB at 6.9 GHz;
+    under the nearest-step rule the first two used low-pass band 3 and the
+    third band 2;
+  - the low-pass section costs 3-6 dB in band on both cards;
+  - the setting now used is high-pass only, fc 5.9 GHz on both cards, which
+    reads back 5.97 GHz (step 26).
 
 ## Loopback checklist (hardware)
 
@@ -392,7 +525,7 @@ DSA at 27 dB, and keep amplifiers off unless the line says otherwise.
 | qick_rf.py | rfbox |
 |---|---|
 | `normalize(rf)` | `rfbox.normalize(rf)` (same format, same messages; adds `amp: false`, DC In and DC Out) |
-| `plain(spec)`, `spec_hash(spec)` | `rfbox.plain`, `rfbox.spec_hash` (same hash) |
+| `plain(spec)`, `spec_hash(spec)` | `rfbox.plain`, `rfbox.spec_hash_v1` (the same hash); `rfbox.spec_hash` is the `h2:` hash of the canonical form (0.3), `rfbox.hash_matches` accepts either |
 | `layout(cfg)`, `layout_text(lay)` | `rfbox.layout(cfg)` (= `cfg_layout`), `rfbox.layout_text`; live: `box.layout()` |
 | `channels(cfg, lay)` | `rfbox.channels(cfg, lay)` |
 | `problems(spec, cfg)` | `rfbox.problems(spec, cfg)`; live: `box.problems(spec)` |
